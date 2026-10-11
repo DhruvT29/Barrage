@@ -1,0 +1,44 @@
+# ---- secrets: never commit these ----
+.jira.env
+.jira.mode
+*.token
+.env
+.env.*
+
+# ---- Rust ----
+/engine/target/
+**/*.rs.bk
+*.pdb
+
+# ---- UI (TypeScript + Vite) ----
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+npm-debug.log*
+pnpm-debug.log*
+
+# built UI is produced from /ui, not edited here
+/engine/static/
+
+# ---- Python tooling ----
+/tools/__pycache__/
+/tools/.venv/
+*.pyc
+
+# ---- local runtime state ----
+*.log
+/downloads/
+/data/
+
+# ---- editors and OS ----
+.idea/
+.vscode/*
+!.vscode/settings.json
+Thumbs.db
+desktop.ini
+.DS_Store
+
+#---- independent folders ----
+/jira
+/plans
+
