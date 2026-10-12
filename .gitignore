@@ -1,6 +1,7 @@
 # ---- secrets: never commit these ----
 .jira.env
 .jira.mode
+.github.env
 *.token
 .env
 .env.*
