@@ -14,10 +14,24 @@
          that lives inside Codes\personal and is gitignored. The token itself
          is restricted by GitHub to selected repositories, so the boundary is
          enforced server-side and survives any mistake made here.
-      2. Refuses to run if `origin` is not owned by an allowed personal owner,
-         or if the remote uses the work SSH alias. A local check on top of the
-         server-side one, so a wrong-repo call fails loudly and instantly
-         rather than returning a confusing 404.
+      2. Refuses to run if `origin` is not owned by an allow-listed personal
+         owner, or if the remote uses the work SSH alias, AND refuses if any
+         argument names a repository outside the allow-list, whether through
+         `--repo`/`-R` or an API path such as `repos/owner/name`.
+
+         Be precise about what this does and does not buy. It is a local
+         sanity check that makes a wrong-repo call fail loudly and instantly
+         instead of returning a confusing 404. **It is not a sandbox.** gh has
+         many ways to name a target and this inspects the obvious ones, so the
+         boundary that actually holds is the token's repository scope, which
+         GitHub enforces server-side. Treat this check as a guard rail, never
+         as the reason it is safe.
+
+         The first version of this script checked only `origin`, which was
+         close to useless: with `origin` pointing at one repository,
+         `gh api repos/<owner>/<other-repo>` read a different one and returned
+         HTTP 200. The header claimed protection the code did not provide,
+         which is worse than having no check at all.
       3. Passes the token via GH_TOKEN for this process only. Nothing is
          written to %APPDATA%, gh never becomes a credential helper, and work
          repos are left exactly as they were.
@@ -172,6 +186,59 @@ if ($Gh)   { $argv += $Gh }
 if ($Rest) { $argv += $Rest }
 if ($argv.Count -eq 0) {
     throw "Nothing to run. Try -Verify, or pass gh arguments, e.g. pr list"
+}
+
+function Get-NamedOwners {
+    <#
+      Every repository owner named anywhere in the arguments. Checking only
+      `origin` was the original bug: a command can name its own target and
+      bypass the remote entirely.
+    #>
+    param([string[]]$Argv)
+
+    $owners = @()
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        $a = [string]$Argv[$i]
+
+        # --repo owner/name   or   -R owner/name
+        if (($a -eq "--repo" -or $a -eq "-R") -and ($i + 1) -lt $Argv.Count) {
+            $owners += [string]$Argv[$i + 1]
+            continue
+        }
+        # --repo=owner/name
+        if ($a -like "--repo=*") {
+            $owners += $a.Substring("--repo=".Length)
+            continue
+        }
+        # REST paths: repos/owner/name, and the same inside a full API URL.
+        $m = [regex]::Match($a, '(?:^|/)repos/([^/\s]+)/([^/\s?]+)')
+        if ($m.Success) {
+            $owners += "$($m.Groups[1].Value)/$($m.Groups[2].Value)"
+            continue
+        }
+        # A github.com URL used as a repo argument.
+        $u = [regex]::Match($a, '^(?:https://|git@)github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$')
+        if ($u.Success) {
+            $owners += "$($u.Groups[1].Value)/$($u.Groups[2].Value)"
+        }
+    }
+    return $owners
+}
+
+foreach ($named in (Get-NamedOwners -Argv $argv)) {
+    if ($named -match 'github\.com-work') {
+        throw "REFUSED: argument '$named' references the work SSH alias."
+    }
+    $parts = $named.Split("/")
+    if ($parts.Count -lt 2 -or -not $parts[0]) {
+        throw "REFUSED: cannot determine the owner of '$named'. Name repositories as owner/name so the allow-list can be applied."
+    }
+    $namedOwner = $parts[0]
+    $okNamed = $false
+    foreach ($o in $owners) { if ($o -eq $namedOwner) { $okNamed = $true } }
+    if (-not $okNamed) {
+        throw "REFUSED: the arguments name '$named', whose owner '$namedOwner' is not in GITHUB_OWNERS ($($owners -join ', ')). This script only operates on allow-listed personal repositories."
+    }
 }
 
 Write-Output "gh $($argv -join ' ')   [$owner/$repo]"
