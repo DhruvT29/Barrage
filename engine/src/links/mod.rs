@@ -14,8 +14,10 @@
 //! | `measure` | throughput sampling | yes |
 //! | `watch` | poll, diff, emit events | yes |
 //!
-//! Only `model` exists so far (task 1).
+//! `model` (task 1) and `filter` (task 2) exist so far.
 
+pub mod filter;
 pub mod model;
 
+pub use filter::usable;
 pub use model::{Addr, Candidate, Link, LinkEvent, LinkId, LinkState};
