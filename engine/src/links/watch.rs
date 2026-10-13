@@ -28,6 +28,11 @@
 //! `Down`, unless it was already `Down` or never judged, since then nobody was
 //! relying on it.
 //!
+//! An event goes out only after the table showing it has been published, so
+//! whoever hears `Up(id)` and looks the link up finds it `Up`. The other order
+//! was measured on 2026-10-13: a listener on its own thread found all 60 of 60
+//! links still `Probing` when their `Up` arrived.
+//!
 //! PROBING: EVERY ADDRESS, AGAIN AND AGAIN
 //!
 //! Every link is probed when it appears and again every
@@ -36,6 +41,16 @@
 //! connected becomes `Down`. A probe is about 1 KB, so this costs next to
 //! nothing, and each address is probed on its own because IPv4 and IPv6 can
 //! fail independently.
+//!
+//! One failed probe changes nothing. The link is probed again after
+//! [`WatchConfig::retry`] and called `Down` only after
+//! [`FAILURES_FOR_DOWN`] failures in a row. On 2026-10-13 about one probe in
+//! 15 over a healthy Wi-Fi ran past 3 s, the first after a pause, while the
+//! system looked the probe host up again (one lookup took 2,026 ms against a
+//! usual 25). Calling the link `Down` on that would hide a working link for
+//! 10 s, or make phase 2 drop one mid-download. Once a link is `Down` it is
+//! probed at the normal pace again, so a dead link costs one probe per
+//! `reprobe`, not one a second.
 //!
 //! SPEED: ONCE PER INTERFACE, SHARED BY ITS ADDRESSES
 //!
@@ -133,6 +148,10 @@ pub struct WatchConfig {
     pub probe_timeout: Duration,
     /// How often every link is probed again.
     pub reprobe: Duration,
+    /// How soon a failed probe is tried again, before the link is called
+    /// `Down`. Long enough for a stalled lookup to have finished, so the
+    /// second try finds the answer remembered.
+    pub retry: Duration,
     /// How long the one speed test per interface runs. Five seconds, because
     /// a single 2 s sample ranged 22.7 to 47.1 Mbps on steady Wi-Fi, and
     /// about half a second of any budget goes on connecting.
@@ -146,6 +165,7 @@ impl WatchConfig {
             poll,
             probe_timeout: Duration::from_secs(3),
             reprobe: Duration::from_secs(10),
+            retry: Duration::from_secs(1),
             sample_budget: Duration::from_secs(5),
         }
     }
@@ -156,8 +176,11 @@ impl WatchConfig {
 /// spending mobile data.
 pub const MAX_SAMPLE_ATTEMPTS: u8 = 3;
 
+/// How many probes in a row must fail before a link is called `Down`.
+pub const FAILURES_FOR_DOWN: u8 = 2;
+
 /// Room for bursts of events before a slow subscriber starts missing some.
-const EVENT_CAPACITY: usize = 256;
+pub const EVENT_CAPACITY: usize = 256;
 
 /// A read-only view of the watcher's table.
 #[derive(Debug, Clone)]
@@ -175,7 +198,7 @@ impl LinkTable {
 ///
 /// Returns the task, a receiver for link events, and a view of the table.
 /// Events go out on a broadcast channel so later subscribers can join
-/// (task 8). A subscriber that falls more than [`EVENT_CAPACITY`] events
+/// (task 8), each only after the table showing it. A subscriber that falls more than [`EVENT_CAPACITY`] events
 /// behind misses the oldest; the table is always current regardless.
 pub fn spawn_watcher<N: Network>(
     net: Arc<N>,
@@ -195,6 +218,7 @@ pub fn spawn_watcher<N: Network>(
         reports_tx,
         reports,
         changed: false,
+        pending: Vec::new(),
     };
     (tokio::spawn(watcher.run()), events_rx, LinkTable(table_rx))
 }
@@ -214,6 +238,8 @@ struct Entry {
     link: Link,
     probing: bool,
     next_probe: Instant,
+    /// Probes failed in a row since the last one that answered.
+    failures: u8,
 }
 
 /// One interface's speed test, shared by all its addresses.
@@ -239,6 +265,8 @@ struct Watcher<N> {
     reports: mpsc::UnboundedReceiver<Report>,
     /// Whether the table differs from the copy last published.
     changed: bool,
+    /// Events waiting for the table that shows them to be published.
+    pending: Vec<LinkEvent>,
 }
 
 impl<N: Network> Watcher<N> {
@@ -254,6 +282,10 @@ impl<N: Network> Watcher<N> {
                 let copy = self.links.values().map(|e| e.link.clone()).collect();
                 self.table.send_replace(copy);
                 self.changed = false;
+            }
+            for event in self.pending.drain(..) {
+                // An error only means nobody is listening right now.
+                let _ = self.events.send(event);
             }
         }
     }
@@ -315,6 +347,7 @@ impl<N: Network> Watcher<N> {
                     link,
                     probing: false,
                     next_probe: Instant::now(),
+                    failures: 0,
                 },
             );
             self.changed = true;
@@ -349,15 +382,38 @@ impl<N: Network> Watcher<N> {
             return;
         };
         e.probing = false;
-        e.next_probe = Instant::now() + self.config.reprobe;
+        let now = Instant::now();
 
-        let (state, rtt) = match result {
-            Ok(p) => (state_for(p.verdict), Some(p.rtt)),
+        let answered = match result {
+            Ok(p) => match p.verdict {
+                ProbeVerdict::Working => Some((LinkState::Up, p.rtt)),
+                ProbeVerdict::Portal => Some((LinkState::Portal, p.rtt)),
+                ProbeVerdict::Broken => {
+                    tracing::debug!(link = %e.link.name, "probe answered, but not as the internet does");
+                    None
+                }
+            },
             Err(err) => {
                 tracing::debug!(link = %e.link.name, error = %format!("{err:#}"), "probe failed");
+                None
+            }
+        };
+        let (state, rtt) = match answered {
+            Some((state, rtt)) => {
+                e.failures = 0;
+                (state, Some(rtt))
+            }
+            None => {
+                e.failures = e.failures.saturating_add(1);
+                if e.failures < FAILURES_FOR_DOWN {
+                    // Not yet: try again soon and change nothing meanwhile.
+                    e.next_probe = now + self.config.retry;
+                    return;
+                }
                 (LinkState::Down, None)
             }
         };
+        e.next_probe = now + self.config.reprobe;
         e.link.rtt = rtt;
         self.changed = true;
 
@@ -464,22 +520,14 @@ impl<N: Network> Watcher<N> {
         });
     }
 
-    fn emit(&self, event: LinkEvent) {
-        // An error only means nobody is listening right now.
-        let _ = self.events.send(event);
+    /// Queue an event. `run` sends it once the table showing it is published.
+    fn emit(&mut self, event: LinkEvent) {
+        self.pending.push(event);
     }
 }
 
 fn is_same_link(candidate: &Candidate, link: &Link) -> bool {
     candidate.name == link.name && candidate.addr == link.addr
-}
-
-fn state_for(verdict: ProbeVerdict) -> LinkState {
-    match verdict {
-        ProbeVerdict::Working => LinkState::Up,
-        ProbeVerdict::Portal => LinkState::Portal,
-        ProbeVerdict::Broken => LinkState::Down,
-    }
 }
 
 fn event_for(state: LinkState, id: LinkId) -> Option<LinkEvent> {

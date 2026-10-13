@@ -13,16 +13,19 @@
 //! | `probe::probe` | perform the bound request | yes |
 //! | `measure` | throughput sampling | yes |
 //! | `watch` | poll, diff, emit events | yes |
+//! | `handle` | [`LinkHandle`], what the rest of the engine holds | through `watch` |
 //!
 //! Plus `bind`, which every I/O module above uses to get an HTTP client whose
 //! traffic really leaves through one chosen link.
 //!
 //! `model` (task 1), `filter` (task 2), `enumerate` (task 3), `probe` (tasks 4
-//! and 5), `bind` and `measure` (task 6) and `watch` (task 7) exist so far.
+//! and 5), `bind` and `measure` (task 6), `watch` (task 7) and `handle`
+//! (task 8) exist so far.
 
 pub(crate) mod bind;
 pub mod enumerate;
 pub mod filter;
+pub mod handle;
 pub mod measure;
 pub mod model;
 pub mod probe;
@@ -30,6 +33,7 @@ pub mod watch;
 
 pub use enumerate::enumerate;
 pub use filter::usable;
+pub use handle::LinkHandle;
 pub use measure::sample;
 pub use model::{Addr, Candidate, Link, LinkEvent, LinkId, LinkState};
 pub use probe::{Probe, ProbeVerdict, classify, probe};

@@ -108,18 +108,34 @@ fn probe_urls_are_plain_http() {
 /// on 2026-10-13, when IPv6 links were probed at an IPv4-only host.
 ///
 /// Asks for one family at a time, as `bind` does: Windows' any-family lookup
-/// returned no IPv6 addresses at all that day. Needs DNS, not IPv6
-/// connectivity, so it runs on any machine with a working link.
+/// returned no IPv6 addresses at all that day.
+///
+/// The IPv6 half is checked only while this machine has an IPv6 link. Without
+/// one, Windows answers an IPv6 lookup with "no data of the requested type"
+/// even though the DNS server holds the records: seen 2026-10-13 with only
+/// IPv4 Wi-Fi up, `Resolve-DnsName -Type AAAA -DnsOnly` returning two
+/// addresses at the same moment. No IPv6 link also means nothing to probe
+/// over IPv6, so the product never makes that lookup.
 #[test]
 fn each_familys_probe_host_has_addresses_of_that_family() {
+    use barrage::links::{enumerate, usable};
     use dns_lookup::{AddrFamily, AddrInfoHints, getaddrinfo};
 
     let v4: IpAddr = "192.0.2.1".parse().unwrap();
     let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    let have_v6 = usable(&enumerate().unwrap())
+        .iter()
+        .any(|c| c.addr.ip().is_ipv6());
+    if !have_v6 {
+        eprintln!("IPv6 half not checked: this machine has no IPv6 link right now");
+    }
     for (link, family, name) in [
         (v4, AddrFamily::Inet, "IPv4"),
         (v6, AddrFamily::Inet6, "IPv6"),
     ] {
+        if link.is_ipv6() && !have_v6 {
+            continue;
+        }
         let url = reqwest::Url::parse(probe_target(link)).unwrap();
         let host = url.host_str().unwrap().to_string();
         let hints = AddrInfoHints {

@@ -1,158 +1,17 @@
 //! The watcher, driven by a scripted network: no hardware, no internet.
-//!
-//! `Fake` stands in for the outside world. Its interface list follows a
-//! script, one entry per poll, the last entry repeating. Its probe answers
-//! `Working` unless told otherwise, and can be told to hang. Its speed test
-//! answers at once and counts how often it was asked.
+//! The scripted network itself lives in `fake/mod.rs`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+mod fake;
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use barrage::links::probe::{Probe, ProbeVerdict};
-use barrage::links::watch::{Network, WatchConfig, spawn_watcher};
-use barrage::links::{Addr, Candidate, LinkEvent, LinkState};
-use tokio::sync::broadcast::Receiver;
-use tokio::time::{Instant, timeout};
-
-#[derive(Clone)]
-enum Step {
-    Links(Vec<Candidate>),
-    Fail,
-}
-
-#[derive(Default)]
-struct Fake {
-    script: Mutex<VecDeque<Step>>,
-    verdicts: Mutex<HashMap<IpAddr, VecDeque<ProbeVerdict>>>,
-    hangs: HashSet<IpAddr>,
-    samples: AtomicUsize,
-    /// How long each speed test takes. Zero answers at once.
-    sample_time: Duration,
-    sampling_now: AtomicUsize,
-    /// The most speed tests that were ever running at the same moment.
-    most_at_once: AtomicUsize,
-}
-
-const SAMPLED_BPS: u64 = 40_000_000;
-
-impl Fake {
-    fn scripted(steps: Vec<Vec<Candidate>>) -> Self {
-        Self::steps(steps.into_iter().map(Step::Links).collect())
-    }
-
-    fn steps(steps: Vec<Step>) -> Self {
-        Self {
-            script: Mutex::new(steps.into()),
-            ..Self::default()
-        }
-    }
-
-    /// Probe answers for `ip`, in order; the last one repeats.
-    fn verdicts(self, ip: &str, answers: &[ProbeVerdict]) -> Self {
-        self.verdicts
-            .lock()
-            .unwrap()
-            .insert(ip.parse().unwrap(), answers.iter().copied().collect());
-        self
-    }
-
-    fn hanging(mut self, ip: &str) -> Self {
-        self.hangs.insert(ip.parse().unwrap());
-        self
-    }
-
-    fn slow_samples(mut self, each: Duration) -> Self {
-        self.sample_time = each;
-        self
-    }
-}
-
-impl Network for Fake {
-    fn enumerate(&self) -> anyhow::Result<Vec<Candidate>> {
-        let mut script = self.script.lock().unwrap();
-        let step = if script.len() > 1 {
-            script.pop_front()
-        } else {
-            script.front().cloned()
-        };
-        match step {
-            Some(Step::Links(links)) => Ok(links),
-            Some(Step::Fail) => anyhow::bail!("scripted enumeration failure"),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn probe(
-        &self,
-        addr: IpAddr,
-        _timeout: Duration,
-    ) -> impl Future<Output = anyhow::Result<Probe>> + Send {
-        let hang = self.hangs.contains(&addr);
-        let verdict = match self.verdicts.lock().unwrap().get_mut(&addr) {
-            Some(queue) if queue.len() > 1 => queue.pop_front().unwrap(),
-            Some(queue) => *queue.front().unwrap(),
-            None => ProbeVerdict::Working,
-        };
-        async move {
-            if hang {
-                std::future::pending::<()>().await;
-            }
-            Ok(Probe {
-                verdict,
-                rtt: Duration::from_millis(20),
-            })
-        }
-    }
-
-    fn sample(
-        &self,
-        _addr: IpAddr,
-        _budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send {
-        self.samples.fetch_add(1, Ordering::SeqCst);
-        async move {
-            let now = self.sampling_now.fetch_add(1, Ordering::SeqCst) + 1;
-            self.most_at_once.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(self.sample_time).await;
-            self.sampling_now.fetch_sub(1, Ordering::SeqCst);
-            Ok(SAMPLED_BPS)
-        }
-    }
-}
-
-fn cand(name: &str, ip: &str, up: bool) -> Candidate {
-    Candidate {
-        os_index: 1,
-        name: name.to_string(),
-        addr: Addr::from(ip.parse::<IpAddr>().unwrap()),
-        up,
-    }
-}
-
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
-}
-
-/// The next event, failing the test if none arrives within two seconds.
-async fn next(rx: &mut Receiver<LinkEvent>) -> LinkEvent {
-    timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("no event within 2 s")
-        .expect("event channel closed")
-}
-
-/// Every event that arrives within `window`.
-async fn drain_for(rx: &mut Receiver<LinkEvent>, window: Duration) -> Vec<LinkEvent> {
-    let deadline = Instant::now() + window;
-    let mut seen = Vec::new();
-    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        seen.push(event);
-    }
-    seen
-}
+use barrage::links::probe::ProbeVerdict;
+use barrage::links::watch::{WatchConfig, spawn_watcher};
+use barrage::links::{LinkEvent, LinkState};
+use fake::{Fake, SAMPLED_BPS, Step, cand, drain_for, ms, next};
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn appearance_emits_up_and_disappearance_emits_down() {
@@ -231,7 +90,9 @@ async fn a_portal_that_is_logged_into_becomes_up_on_a_later_probe() {
 async fn a_link_that_fails_its_probe_is_down_and_never_up() {
     let net = Fake::scripted(vec![vec![cand("Dead", "192.0.2.40", true)]])
         .verdicts("192.0.2.40", &[ProbeVerdict::Broken]);
-    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), WatchConfig::every(ms(50)));
+    let mut config = WatchConfig::every(ms(50));
+    config.retry = ms(100);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), config);
 
     assert!(matches!(next(&mut rx).await, LinkEvent::Down(_)));
     assert_eq!(table.snapshot()[0].state, LinkState::Down);
@@ -247,6 +108,7 @@ async fn a_hanging_probe_holds_up_nothing_and_is_given_up_on() {
     let net = Fake::scripted(vec![vec![a.clone()], vec![a, b]]).hanging("192.0.2.50");
     let mut config = WatchConfig::every(ms(50));
     config.probe_timeout = ms(300);
+    config.retry = ms(100);
     let (_h, mut rx, table) = spawn_watcher(Arc::new(net), config);
 
     assert!(
@@ -270,6 +132,75 @@ async fn a_hanging_probe_holds_up_nothing_and_is_given_up_on() {
         states.contains(&("Fine".to_string(), LinkState::Up)),
         "{states:?}"
     );
+}
+
+/// Found by task 8's real-machine test, 2026-10-13: about one probe in 15 over
+/// this Wi-Fi ran past 3 s, the first after a pause, while the system looked
+/// the probe host up again. One slow probe must not make a working link look
+/// dead, here for 10 s until the next probe.
+#[tokio::test]
+async fn a_new_link_whose_first_probe_fails_is_tried_again_before_it_is_called_down() {
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .failing_first("192.0.2.10", 1);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), WatchConfig::every(ms(50)));
+
+    let first = next(&mut rx).await;
+    assert!(matches!(first, LinkEvent::Up(_)), "{first:?}");
+    assert_eq!(table.snapshot()[0].state, LinkState::Up);
+}
+
+/// The same for a link already in use: phase 2 would drop it, and the
+/// download through it, over one slow probe. Two failures with a success in
+/// between are not "in a row" either.
+#[tokio::test]
+async fn an_up_link_stays_up_through_failed_probes_that_are_not_in_a_row() {
+    use ProbeVerdict::{Broken, Working};
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .verdicts("192.0.2.10", &[Working, Broken, Working, Broken, Working]);
+    let mut config = WatchConfig::every(ms(50));
+    config.reprobe = ms(100);
+    config.retry = ms(200);
+    let (_h, mut rx, _t) = spawn_watcher(Arc::new(net), config);
+
+    assert!(matches!(next(&mut rx).await, LinkEvent::Up(_)));
+    let after = drain_for(&mut rx, ms(1500)).await;
+    assert!(after.is_empty(), "flapped: {after:?}");
+}
+
+/// A link that really dies must still be reported, just not on one failure.
+#[tokio::test]
+async fn an_up_link_that_fails_two_probes_in_a_row_is_down() {
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .verdicts("192.0.2.10", &[ProbeVerdict::Working, ProbeVerdict::Broken]);
+    let mut config = WatchConfig::every(ms(50));
+    config.reprobe = ms(100);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), config);
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(id));
+    assert_eq!(table.snapshot()[0].state, LinkState::Down);
+}
+
+/// A dead link is probed quickly only to confirm it is dead, then at the
+/// normal pace, so one left plugged in does not cost a probe every second.
+#[tokio::test]
+async fn a_dead_link_is_probed_at_the_normal_pace_once_confirmed() {
+    let net = Arc::new(
+        Fake::scripted(vec![vec![cand("Dead", "192.0.2.40", true)]])
+            .verdicts("192.0.2.40", &[ProbeVerdict::Broken]),
+    );
+    let mut config = WatchConfig::every(ms(50));
+    config.retry = ms(50);
+    config.reprobe = ms(500);
+    let (_h, mut rx, _t) = spawn_watcher(net.clone(), config);
+
+    assert!(matches!(next(&mut rx).await, LinkEvent::Down(_)));
+    tokio::time::sleep(ms(1200)).await;
+    // Two to confirm, then one per 500 ms. Retrying every 50 ms would be ~26.
+    let probes = net.probes.load(Ordering::SeqCst);
+    assert!(probes <= 5, "{probes} probes in about 1.3 s");
 }
 
 /// The user's choice, 2026-10-13: one speed test per link, when it first comes
