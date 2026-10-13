@@ -4,8 +4,8 @@
 //! routes. On 2026-10-13 and again on 2026-10-14 the phone was joined to the
 //! laptop's own Wi-Fi: the tether was a working link, but its traffic left
 //! through the same router as the Wi-Fi's, so using both bought nothing. The
-//! public address gives it away: through the tether it was the Wi-Fi's own,
-//! `119.82.121.78`.
+//! public address gives it away: through the tether it was exactly the
+//! Wi-Fi's own.
 //!
 //! Pure, like `filter`: the watcher looks the public addresses up, this
 //! decides what they mean.
