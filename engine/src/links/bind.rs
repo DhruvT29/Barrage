@@ -16,9 +16,19 @@
 //!
 //! So `client` resolves the host itself, keeps only addresses of the same
 //! family as the link, and pins the client to those. A host with no address of
-//! that family is refused outright. Nothing on this machine had global IPv6 on
-//! 2026-10-13, so the trap was not live, but mobile carriers hand out IPv6
-//! freely and a tether could start passing it through at any time.
+//! that family is refused outright. The trap went live on 2026-10-13, the day
+//! it was found: once the phone was on mobile data, the tether passed two
+//! global IPv6 addresses through to this machine.
+//!
+//! ASK FOR THE LINK'S FAMILY, NOT FOR ANY ADDRESS
+//!
+//! The lookup asks the OS for one address family only. Windows' default
+//! lookup, which asks for any family, returned no IPv6 addresses at all on
+//! 2026-10-13 while the tether's IPv6 worked: `ipv6.msftconnecttest.com`,
+//! which has only IPv6 addresses, came back "No such host is known", and hosts
+//! with both families came back IPv4 only. The likely cause is that Windows
+//! asks over its preferred interface, Wi-Fi here, which has no IPv6. Asking
+//! for IPv6 explicitly works, which is also what `curl -6` does.
 //!
 //! REDIRECTS ARE NOT FOLLOWED
 //!
@@ -32,6 +42,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, ensure};
+use dns_lookup::{AddrFamily, AddrInfoHints, SockType};
 
 /// A client whose every connection leaves through the link that owns `local`,
 /// ready to request `url`.
@@ -53,10 +64,12 @@ pub(crate) async fn client(local: IpAddr, url: &str) -> anyhow::Result<reqwest::
         .ok();
     let found: Vec<SocketAddr> = match literal {
         Some(ip) => vec![SocketAddr::new(ip, port)],
-        None => tokio::net::lookup_host((host, port))
-            .await
-            .with_context(|| format!("looking up {host}"))?
-            .collect(),
+        None => resolve(host, port, local).await.with_context(|| {
+            format!(
+                "looking up {host} for an {} link",
+                family_name(local.is_ipv4())
+            )
+        })?,
     };
     ensure!(!found.is_empty(), "{host} resolved to no addresses");
 
@@ -90,9 +103,39 @@ pub(crate) async fn client(local: IpAddr, url: &str) -> anyhow::Result<reqwest::
     builder.build().context("building the HTTP client")
 }
 
+/// The addresses of `host`, asked of the OS for `local`'s family alone. See
+/// the module docs for why the family is named rather than left open.
+async fn resolve(host: &str, port: u16, local: IpAddr) -> anyhow::Result<Vec<SocketAddr>> {
+    let family = if local.is_ipv4() {
+        AddrFamily::Inet
+    } else {
+        AddrFamily::Inet6
+    };
+    let host = host.to_string();
+    // getaddrinfo blocks, so it runs off the async threads.
+    let found = tokio::task::spawn_blocking(move || {
+        let hints = AddrInfoHints {
+            address: family.into(),
+            socktype: SockType::Stream.into(),
+            ..AddrInfoHints::default()
+        };
+        dns_lookup::getaddrinfo(Some(&host), None, Some(hints)).map(|all| {
+            all.filter_map(Result::ok)
+                .map(|a| a.sockaddr.ip())
+                .collect::<Vec<_>>()
+        })
+    })
+    .await
+    .context("the lookup task failed")??;
+    Ok(found
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
+}
+
 /// The destinations a socket bound to `local` really reaches through its own
-/// link: those of the same address family. See the module docs for what
-/// happens to the others.
+/// link: those of the same address family. The lookup already asks for one
+/// family; this is the check that does not depend on the OS honouring that.
 fn same_family(local: IpAddr, found: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     found
         .into_iter()

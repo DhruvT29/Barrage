@@ -8,7 +8,7 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use barrage::links::measure::{sample, sample_url};
+use barrage::links::measure::{SAMPLE_CAP_BYTES, SAMPLE_URL, sample, sample_url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -29,6 +29,17 @@ async fn sample_stops_inside_its_budget() {
     let started = Instant::now();
     let _ = sample(addr, budget).await;
     assert!(started.elapsed() < budget + Duration::from_secs(1));
+}
+
+/// If the cap and the URL drift apart, the URL can ask Cloudflare for more
+/// than the cap allows. The cap itself is held under Cloudflare's 100 MB
+/// limit by a compile-time check in `measure.rs`.
+#[test]
+fn the_sample_url_asks_for_exactly_the_cap() {
+    assert!(
+        SAMPLE_URL.ends_with(&format!("bytes={SAMPLE_CAP_BYTES}")),
+        "{SAMPLE_URL} does not ask for {SAMPLE_CAP_BYTES} bytes"
+    );
 }
 
 // Scripted local servers from here on.

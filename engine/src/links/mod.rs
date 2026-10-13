@@ -18,7 +18,7 @@
 //! traffic really leaves through one chosen link.
 //!
 //! `model` (task 1), `filter` (task 2), `enumerate` (task 3), `probe` (tasks 4
-//! and 5), `bind` and `measure` (task 6) exist so far.
+//! and 5), `bind` and `measure` (task 6) and `watch` (task 7) exist so far.
 
 pub(crate) mod bind;
 pub mod enumerate;
@@ -26,6 +26,7 @@ pub mod filter;
 pub mod measure;
 pub mod model;
 pub mod probe;
+pub mod watch;
 
 pub use enumerate::enumerate;
 pub use filter::usable;

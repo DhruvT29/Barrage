@@ -46,13 +46,27 @@ use tokio::time::{Instant, timeout_at};
 
 use super::bind;
 
-/// A large object served with range support: Hetzner's Singapore speed
-/// server, close to this machine and the one phase 0 measured against. It
-/// drops clients that send no User-Agent, which `bind::client` handles.
-pub const SAMPLE_URL: &str = "https://sin-speed.hetzner.com/10GB.bin";
+/// Cloudflare's speed-test endpoint, asked for exactly [`SAMPLE_CAP_BYTES`].
+///
+/// Chosen because it answers on both address families. Hetzner's Singapore
+/// server, used through phase 0 and at first here, has an IPv6 address, but
+/// connections to it over the tether's IPv6 timed out on 2026-10-13, while
+/// Cloudflare served 64 MiB over both Wi-Fi IPv4 and the tether's IPv6. One
+/// server for every link also keeps their numbers comparable.
+///
+/// Cloudflare refuses requests of 100 MB and above with 403, so the cap must
+/// stay below that; a test ties this URL to [`SAMPLE_CAP_BYTES`].
+pub const SAMPLE_URL: &str = "https://speed.cloudflare.com/__down?bytes=67108864";
 
 /// The most one sample asks for: 64 MiB, about two seconds at 270 Mbps.
 pub const SAMPLE_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+// Checked when compiling, so a cap raised past Cloudflare's limit cannot even
+// build, rather than failing every speed test at run time.
+const _: () = assert!(
+    SAMPLE_CAP_BYTES < 100_000_000,
+    "Cloudflare refuses requests of 100 MB and above"
+);
 
 /// The download rate through the link that owns `addr`, in bits per second.
 pub async fn sample(addr: IpAddr, budget: Duration) -> anyhow::Result<u64> {

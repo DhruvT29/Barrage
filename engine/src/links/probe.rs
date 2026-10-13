@@ -41,17 +41,26 @@ pub enum ProbeVerdict {
     Broken,
 }
 
-/// Windows' own connectivity check. Answers 200 with exactly
+/// Windows' own connectivity check for IPv4 links. Answers 200 with exactly
 /// [`MS_PROBE_EXPECTED`] as the whole body.
 ///
-/// Plain HTTP on purpose, as is [`G_PROBE_URL`]. A portal can reveal itself
-/// only on a request it can intercept and answer. Over HTTPS it cannot present
-/// a valid certificate for this host, so the request would fail as a TLS error
-/// and the portal would be reported as a broken link instead.
+/// **IPv4 only**: the host had no IPv6 address at all on 2026-10-13, so the
+/// family check in `bind` refuses it for an IPv6 link. [`probe_target`]
+/// picks [`MS_PROBE_URL_V6`] for those.
+///
+/// Plain HTTP on purpose, as are the other probe URLs. A portal can reveal
+/// itself only on a request it can intercept and answer. Over HTTPS it cannot
+/// present a valid certificate for this host, so the request would fail as a
+/// TLS error and the portal would be reported as a broken link instead.
 pub const MS_PROBE_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
 
-/// The whole body [`MS_PROBE_URL`] returns: 22 bytes with no trailing
-/// newline, checked byte for byte on 2026-10-13.
+/// Windows' connectivity check for IPv6 links: the same answer as
+/// [`MS_PROBE_URL`], from a host with IPv6 addresses. Checked byte for byte
+/// through the phone tether's two IPv6 addresses on 2026-10-13.
+pub const MS_PROBE_URL_V6: &str = "http://ipv6.msftconnecttest.com/connecttest.txt";
+
+/// The whole body both Microsoft probe URLs return: 22 bytes with no
+/// trailing newline, checked byte for byte on 2026-10-13.
 pub const MS_PROBE_EXPECTED: &str = "Microsoft Connect Test";
 
 /// Android's connectivity check. Answers 204 with an empty body, also checked
@@ -96,14 +105,25 @@ pub struct Probe {
     pub rtt: Duration,
 }
 
-/// Where [`public_ip_via`] asks. Answers with the caller's public address as
-/// plain text. The host has IPv4 addresses only, which suits IPv4 links; an
-/// IPv6 link is refused loudly by the family check rather than misreported.
+/// Where [`public_ip_via`] asks, per address family. Each answers with the
+/// caller's public address as plain text, and each host has addresses of
+/// only its own family, so neither can answer through the wrong one.
 const PUBLIC_IP_URL: &str = "https://api.ipify.org";
+const PUBLIC_IP_URL_V6: &str = "https://api6.ipify.org";
+
+/// The probe URL for a link with this address: a host that has addresses of
+/// the same family, or the family check in `bind` would refuse it.
+pub fn probe_target(addr: IpAddr) -> &'static str {
+    if addr.is_ipv4() {
+        MS_PROBE_URL
+    } else {
+        MS_PROBE_URL_V6
+    }
+}
 
 /// Probe the internet through the link that owns `addr`.
 pub async fn probe(addr: IpAddr, timeout: Duration) -> anyhow::Result<Probe> {
-    probe_url(addr, MS_PROBE_URL, timeout).await
+    probe_url(addr, probe_target(addr), timeout).await
 }
 
 /// [`probe`] against any URL. Public so tests can aim it at a server that
@@ -132,12 +152,20 @@ pub async fn probe_url(addr: IpAddr, url: &str, timeout: Duration) -> anyhow::Re
 /// that owns `addr`.
 ///
 /// This is what proves binding works. Two links that report the same public
-/// address are not two paths, whatever the local addresses say.
+/// address are not two paths, whatever the local addresses say. On IPv6 there
+/// is normally no address sharing, so a link's public address is its own
+/// address: both of the tether's IPv6 addresses reported themselves on
+/// 2026-10-13.
 pub async fn public_ip_via(addr: IpAddr, timeout: Duration) -> anyhow::Result<IpAddr> {
-    within(timeout, addr, PUBLIC_IP_URL, async {
-        let client = bind::client(addr, PUBLIC_IP_URL).await?;
+    let url = if addr.is_ipv4() {
+        PUBLIC_IP_URL
+    } else {
+        PUBLIC_IP_URL_V6
+    };
+    within(timeout, addr, url, async {
+        let client = bind::client(addr, url).await?;
         let text = client
-            .get(PUBLIC_IP_URL)
+            .get(url)
             .send()
             .await?
             .error_for_status()?

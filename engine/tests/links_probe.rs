@@ -13,8 +13,8 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use barrage::links::probe::{
-    G_PROBE_URL, MS_PROBE_EXPECTED, MS_PROBE_URL, ProbeVerdict, classify, probe, probe_url,
-    public_ip_via,
+    G_PROBE_URL, MS_PROBE_EXPECTED, MS_PROBE_URL, MS_PROBE_URL_V6, ProbeVerdict, classify, probe,
+    probe_target, probe_url, public_ip_via,
 };
 use tokio::net::TcpListener;
 
@@ -97,8 +97,44 @@ fn every_status_range_lands_where_the_rule_says() {
 /// a portal would be reported as a broken link.
 #[test]
 fn probe_urls_are_plain_http() {
-    for url in [MS_PROBE_URL, G_PROBE_URL] {
+    for url in [MS_PROBE_URL, MS_PROBE_URL_V6, G_PROBE_URL] {
         assert!(url.starts_with("http://"), "{url} must be plain HTTP");
+    }
+}
+
+/// Each family's probe host must have addresses of that family, or the
+/// family check in `bind` refuses it and every link of that family reads
+/// `Down` while working. Exactly that happened to the tether's IPv6 addresses
+/// on 2026-10-13, when IPv6 links were probed at an IPv4-only host.
+///
+/// Asks for one family at a time, as `bind` does: Windows' any-family lookup
+/// returned no IPv6 addresses at all that day. Needs DNS, not IPv6
+/// connectivity, so it runs on any machine with a working link.
+#[test]
+fn each_familys_probe_host_has_addresses_of_that_family() {
+    use dns_lookup::{AddrFamily, AddrInfoHints, getaddrinfo};
+
+    let v4: IpAddr = "192.0.2.1".parse().unwrap();
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    for (link, family, name) in [
+        (v4, AddrFamily::Inet, "IPv4"),
+        (v6, AddrFamily::Inet6, "IPv6"),
+    ] {
+        let url = reqwest::Url::parse(probe_target(link)).unwrap();
+        let host = url.host_str().unwrap().to_string();
+        let hints = AddrInfoHints {
+            address: family.into(),
+            ..AddrInfoHints::default()
+        };
+        let found: Vec<IpAddr> = getaddrinfo(Some(&host), None, Some(hints))
+            .unwrap_or_else(|e| panic!("{host} has no {name} address: {e}"))
+            .filter_map(Result::ok)
+            .map(|a| a.sockaddr.ip())
+            .collect();
+        assert!(
+            found.iter().any(|ip| ip.is_ipv4() == link.is_ipv4()),
+            "{host} has no {name} address: {found:?}"
+        );
     }
 }
 

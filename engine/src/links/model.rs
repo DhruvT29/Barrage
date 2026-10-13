@@ -24,13 +24,8 @@ use std::time::Duration;
 pub struct LinkId(u64);
 
 impl LinkId {
-    /// Only the watcher mints ids, hence `pub(crate)`.
-    ///
-    /// Unused until `watch.rs` arrives in task 7. Allowed rather than deleted
-    /// because the constructor's visibility is the mechanism that keeps id
-    /// minting in one place, and that constraint is worth stating now, while
-    /// there is still only one caller to get right.
-    #[allow(dead_code)]
+    /// Only the watcher mints ids, hence `pub(crate)`. The constructor's
+    /// visibility is the mechanism that keeps id minting in one place.
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }

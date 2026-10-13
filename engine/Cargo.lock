@@ -42,6 +42,7 @@ name = "barrage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dns-lookup",
  "if-addrs",
  "reqwest",
  "tokio",
@@ -161,6 +162,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.8",
+]
+
+[[package]]
+name = "dns-lookup"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "263c0ccfc6b3b6a93e959edad4f985779e76c0b36dbb2e13e3d27c690974adf1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
