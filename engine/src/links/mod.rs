@@ -14,8 +14,8 @@
 //! | `measure` | throughput sampling | yes |
 //! | `watch` | poll, diff, emit events | yes |
 //!
-//! `model` (task 1), `filter` (task 2), `enumerate` (task 3) and
-//! `probe::classify` (task 4) exist so far.
+//! `model` (task 1), `filter` (task 2), `enumerate` (task 3) and `probe`
+//! (tasks 4 and 5) exist so far.
 
 pub mod enumerate;
 pub mod filter;
@@ -25,4 +25,4 @@ pub mod probe;
 pub use enumerate::enumerate;
 pub use filter::usable;
 pub use model::{Addr, Candidate, Link, LinkEvent, LinkId, LinkState};
-pub use probe::{ProbeVerdict, classify};
+pub use probe::{Probe, ProbeVerdict, classify, probe};
