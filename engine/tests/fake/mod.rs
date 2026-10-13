@@ -41,6 +41,15 @@ pub struct Fake {
     sampling_now: AtomicUsize,
     /// The most speed tests that were ever running at the same moment.
     pub most_at_once: AtomicUsize,
+    /// Scripted speed test results and how long each takes, in order; the
+    /// last repeats. Empty means `SAMPLED_BPS` after `sample_time`.
+    sample_answers: Mutex<VecDeque<(u64, Duration)>>,
+    /// Public addresses per local address, in order; the last repeats. An
+    /// address with none scripted reports itself, so no two links share.
+    publics: Mutex<HashMap<IpAddr, VecDeque<Option<IpAddr>>>>,
+    pub lookups: AtomicUsize,
+    /// How long each public address lookup takes. Zero answers at once.
+    lookup_time: Duration,
 }
 
 pub const SAMPLED_BPS: u64 = 40_000_000;
@@ -80,6 +89,31 @@ impl Fake {
 
     pub fn slow_samples(mut self, each: Duration) -> Self {
         self.sample_time = each;
+        self
+    }
+
+    /// Speed test results and durations, in order; the last repeats.
+    pub fn sample_answers(self, answers: &[(u64, Duration)]) -> Self {
+        *self.sample_answers.lock().unwrap() = answers.iter().copied().collect();
+        self
+    }
+
+    pub fn slow_lookups(mut self, each: Duration) -> Self {
+        self.lookup_time = each;
+        self
+    }
+
+    /// The public address seen through `ip`, lookup after lookup; the last
+    /// repeats. `None` makes that lookup fail.
+    pub fn public(self, ip: &str, answers: &[Option<&str>]) -> Self {
+        let answers = answers
+            .iter()
+            .map(|a| a.map(|s| s.parse().unwrap()))
+            .collect();
+        self.publics
+            .lock()
+            .unwrap()
+            .insert(ip.parse().unwrap(), answers);
         self
     }
 }
@@ -139,19 +173,50 @@ impl Network for Fake {
         _budget: Duration,
     ) -> impl Future<Output = anyhow::Result<u64>> + Send {
         self.samples.fetch_add(1, Ordering::SeqCst);
+        let (bps, takes) = {
+            let mut answers = self.sample_answers.lock().unwrap();
+            match answers.len() {
+                0 => (SAMPLED_BPS, self.sample_time),
+                1 => *answers.front().unwrap(),
+                _ => answers.pop_front().unwrap(),
+            }
+        };
         async move {
             let now = self.sampling_now.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_at_once.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(self.sample_time).await;
+            tokio::time::sleep(takes).await;
             self.sampling_now.fetch_sub(1, Ordering::SeqCst);
-            Ok(SAMPLED_BPS)
+            Ok(bps)
+        }
+    }
+
+    fn public_ip(
+        &self,
+        addr: IpAddr,
+        _timeout: Duration,
+    ) -> impl Future<Output = anyhow::Result<IpAddr>> + Send {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        let answer = match self.publics.lock().unwrap().get_mut(&addr) {
+            Some(queue) if queue.len() > 1 => queue.pop_front().unwrap(),
+            Some(queue) => *queue.front().unwrap(),
+            None => Some(addr),
+        };
+        let takes = self.lookup_time;
+        async move {
+            tokio::time::sleep(takes).await;
+            answer.ok_or_else(|| anyhow::anyhow!("scripted lookup failure"))
         }
     }
 }
 
 pub fn cand(name: &str, ip: &str, up: bool) -> Candidate {
+    cand_idx(1, name, ip, up)
+}
+
+/// A candidate with a chosen OS interface index.
+pub fn cand_idx(os_index: u32, name: &str, ip: &str, up: bool) -> Candidate {
     Candidate {
-        os_index: 1,
+        os_index,
         name: name.to_string(),
         addr: Addr::from(ip.parse::<IpAddr>().unwrap()),
         up,

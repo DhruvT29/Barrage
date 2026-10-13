@@ -66,18 +66,39 @@
 //!   the user's choice on 2026-10-13, because each test is seconds of real
 //!   download, and through a phone that is real mobile data. Phase 2 will
 //!   measure speed for free from actual download traffic.
-//! - An interface keeps its measured speed only while at least one of its
-//!   addresses remains. A rotating IPv6 privacy address joins while the
-//!   others stay, so it inherits the speed and costs no new test. Moving
-//!   Wi-Fi to a new network removes every old address, so the old speed is
-//!   forgotten and the new network is tested afresh.
+//! - An interface keeps its measured speed only while it stays on the same
+//!   network. Moving Wi-Fi to a new network removes every old address, so
+//!   the old speed is forgotten and the new network is tested afresh. A
+//!   rotating IPv6 privacy address joins while the others stay, so it
+//!   inherits the speed and costs no new test.
+//! - **A change in an interface's IPv6 networks is a new network too**, the
+//!   user's choice on 2026-10-14. That day the phone, cable in, switched from
+//!   mobile data to Wi-Fi and back: the tether's IPv4 address never changed,
+//!   while its IPv6 addresses went Deprecated and returned, and its public
+//!   address moved from the carrier's to the laptop Wi-Fi's own. So IPv6
+//!   leaving, arriving or changing prefix forgets the speed and the public
+//!   addresses and tests afresh. Rotation keeps the prefix, so it does not
+//!   count, and neither does IPv6 arriving within
+//!   [`WatchConfig::settle`] of the interface appearing. Blind spot: a phone
+//!   whose networks have no IPv6 shows no sign.
+//! - A test still running when that happens is thrown away when it ends, and
+//!   a fresh one follows; two at once would split the cable. Every test and
+//!   lookup is numbered, so an answer that no longer matters, including one
+//!   from a network that has entirely gone, is recognised and dropped.
 //! - A failed test is retried, through another of the interface's addresses
 //!   if one is up, and otherwise on a later probe, at most
 //!   [`MAX_SAMPLE_ATTEMPTS`] times while the interface lasts.
 //! - Separate interfaces test at the same time, since phase 0 showed separate
 //!   links keep most of their speed when used together.
+//!
+//! PUBLIC ADDRESS: ONCE PER LINK, AGAIN ON A NEW NETWORK
+//!
+//! Each `Up` link's public address is looked up once (a few KB over HTTPS),
+//! at most [`MAX_LOOKUP_ATTEMPTS`] times if it fails, and again when its
+//! interface's network changes. Links on different cables showing the same
+//! one share an internet connection; see [`super::upstream`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,6 +130,13 @@ pub trait Network: Send + Sync + 'static {
         addr: IpAddr,
         budget: Duration,
     ) -> impl Future<Output = anyhow::Result<u64>> + Send;
+
+    /// The address the internet sees traffic from `addr` arrive from.
+    fn public_ip(
+        &self,
+        addr: IpAddr,
+        timeout: Duration,
+    ) -> impl Future<Output = anyhow::Result<IpAddr>> + Send;
 }
 
 /// This machine's interfaces and the real internet.
@@ -134,6 +162,14 @@ impl Network for SystemNetwork {
     ) -> impl Future<Output = anyhow::Result<u64>> + Send {
         super::measure::sample(addr, budget)
     }
+
+    fn public_ip(
+        &self,
+        addr: IpAddr,
+        timeout: Duration,
+    ) -> impl Future<Output = anyhow::Result<IpAddr>> + Send {
+        super::probe::public_ip_via(addr, timeout)
+    }
 }
 
 /// How often the watcher looks, and how long it lets each check take.
@@ -156,6 +192,10 @@ pub struct WatchConfig {
     /// a single 2 s sample ranged 22.7 to 47.1 Mbps on steady Wi-Fi, and
     /// about half a second of any budget goes on connecting.
     pub sample_budget: Duration,
+    /// How long after an interface first appears a change in its IPv6
+    /// networks is taken for its addresses still arriving rather than a new
+    /// network. A plugged-in phone's IPv6 addresses follow its IPv4 one.
+    pub settle: Duration,
 }
 
 impl WatchConfig {
@@ -167,6 +207,7 @@ impl WatchConfig {
             reprobe: Duration::from_secs(10),
             retry: Duration::from_secs(1),
             sample_budget: Duration::from_secs(5),
+            settle: Duration::from_secs(10),
         }
     }
 }
@@ -175,6 +216,15 @@ impl WatchConfig {
 /// Bounded because a test that keeps failing part-way through can keep
 /// spending mobile data.
 pub const MAX_SAMPLE_ATTEMPTS: u8 = 3;
+
+/// How many times a link's public address is looked up before giving up,
+/// until its network changes.
+pub const MAX_LOOKUP_ATTEMPTS: u8 = 3;
+
+/// How long one public address lookup may take. It is an HTTPS request, so a
+/// TLS handshake at the tether's worst round trip (934 ms on 2026-10-13)
+/// alone takes about 3 s.
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many probes in a row must fail before a link is called `Down`.
 pub const FAILURES_FOR_DOWN: u8 = 2;
@@ -198,8 +248,9 @@ impl LinkTable {
 ///
 /// Returns the task, a receiver for link events, and a view of the table.
 /// Events go out on a broadcast channel so later subscribers can join
-/// (task 8), each only after the table showing it. A subscriber that falls more than [`EVENT_CAPACITY`] events
-/// behind misses the oldest; the table is always current regardless.
+/// (task 8), each only after the table showing it. A subscriber that falls
+/// more than [`EVENT_CAPACITY`] events behind misses the oldest; the table is
+/// always current regardless.
 pub fn spawn_watcher<N: Network>(
     net: Arc<N>,
     config: WatchConfig,
@@ -212,7 +263,9 @@ pub fn spawn_watcher<N: Network>(
         config,
         links: BTreeMap::new(),
         speeds: HashMap::new(),
+        networks: HashMap::new(),
         next_id: 1,
+        next_job: 1,
         events,
         table,
         reports_tx,
@@ -223,14 +276,20 @@ pub fn spawn_watcher<N: Network>(
     (tokio::spawn(watcher.run()), events_rx, LinkTable(table_rx))
 }
 
-/// What a probe or speed test reports back to the loop.
+/// What a probe, speed test or lookup reports back to the loop.
 enum Report {
     Probed(LinkId, anyhow::Result<Probe>),
     /// Keyed by interface, since the speed belongs to the interface and the
     /// address the test ran through may have vanished in the meantime.
     Sampled {
         interface: String,
+        job: u64,
         result: anyhow::Result<u64>,
+    },
+    LookedUp {
+        id: LinkId,
+        job: u64,
+        result: anyhow::Result<IpAddr>,
     },
 }
 
@@ -240,13 +299,20 @@ struct Entry {
     next_probe: Instant,
     /// Probes failed in a row since the last one that answered.
     failures: u8,
+    /// The public address lookup whose answer is wanted, if one is running.
+    lookup: Option<u64>,
+    lookup_attempts: u8,
 }
 
 /// One interface's speed test, shared by all its addresses.
 #[derive(Default)]
 struct Speed {
     bps: Option<u64>,
-    testing: bool,
+    /// The test running on this interface, if any. Only its result counts.
+    running: Option<u64>,
+    /// The network changed while `running` ran, so its result describes
+    /// neither network: throw it away and test again.
+    stale: bool,
     attempts: u8,
 }
 
@@ -258,7 +324,13 @@ struct Watcher<N> {
     links: BTreeMap<LinkId, Entry>,
     /// Per interface name, for as long as the interface has a link.
     speeds: HashMap<String, Speed>,
+    /// Per interface name, when it was first seen and its IPv6 networks
+    /// (/64 prefixes) as last seen.
+    networks: HashMap<String, (Instant, BTreeSet<u64>)>,
     next_id: u64,
+    /// Numbers every speed test and lookup, so a late answer to one that no
+    /// longer matters can be recognised and dropped.
+    next_job: u64,
     events: broadcast::Sender<LinkEvent>,
     table: watch::Sender<Vec<Link>>,
     reports_tx: mpsc::UnboundedSender<Report>,
@@ -325,6 +397,32 @@ impl<N: Network> Watcher<N> {
         self.speeds
             .retain(|name, _| links.values().any(|e| &e.link.name == name));
 
+        // An interface whose IPv6 networks changed is on a new network even
+        // if an address stayed, as the tether's IPv4 did when the phone
+        // switched between mobile data and Wi-Fi.
+        // Changes in an interface's first moments are its addresses still
+        // arriving: a plugged-in phone's IPv6 follows its IPv4 by a second or
+        // two, and counting that would run every first speed test twice.
+        let at = Instant::now();
+        let mut switched = Vec::new();
+        let mut networks = HashMap::new();
+        for (name, prefixes) in ipv6_networks(&candidates) {
+            let since = match self.networks.get(&name) {
+                Some((since, before)) => {
+                    if *before != prefixes && at.duration_since(*since) >= self.config.settle {
+                        switched.push(name.clone());
+                    }
+                    *since
+                }
+                None => at,
+            };
+            networks.insert(name, (since, prefixes));
+        }
+        self.networks = networks;
+        for interface in &switched {
+            self.network_changed(interface);
+        }
+
         for c in &candidates {
             if self.links.values().any(|e| is_same_link(c, &e.link)) {
                 continue;
@@ -338,6 +436,7 @@ impl<N: Network> Watcher<N> {
                 state: LinkState::Probing,
                 rtt: None,
                 down_bps: None,
+                public_ip: None,
                 // No task reads the Windows network cost type yet.
                 metered: false,
             };
@@ -348,6 +447,8 @@ impl<N: Network> Watcher<N> {
                     probing: false,
                     next_probe: Instant::now(),
                     failures: 0,
+                    lookup: None,
+                    lookup_attempts: 0,
                 },
             );
             self.changed = true;
@@ -368,10 +469,45 @@ impl<N: Network> Watcher<N> {
         }
     }
 
+    /// Forget what was measured about `interface`'s old network, and measure
+    /// the new one.
+    fn network_changed(&mut self, interface: &str) {
+        tracing::info!(%interface, "IPv6 networks changed: a new network, testing afresh");
+        if let Some(speed) = self.speeds.get_mut(interface) {
+            speed.bps = None;
+            speed.attempts = 0;
+            speed.stale = speed.running.is_some();
+        }
+        let ids: Vec<LinkId> = self
+            .links
+            .iter_mut()
+            .filter(|(_, e)| e.link.name == interface)
+            .map(|(id, e)| {
+                e.link.down_bps = None;
+                e.link.public_ip = None;
+                e.lookup = None;
+                e.lookup_attempts = 0;
+                *id
+            })
+            .collect();
+        if !ids.is_empty() {
+            self.changed = true;
+        }
+        self.measure_interface(interface);
+        for id in ids {
+            self.look_up_if_wanted(id);
+        }
+    }
+
     fn receive(&mut self, report: Report) {
         match report {
             Report::Probed(id, result) => self.probed(id, result),
-            Report::Sampled { interface, result } => self.sampled(interface, result),
+            Report::Sampled {
+                interface,
+                job,
+                result,
+            } => self.sampled(interface, job, result),
+            Report::LookedUp { id, job, result } => self.looked_up(id, job, result),
         }
     }
 
@@ -424,15 +560,24 @@ impl<N: Network> Watcher<N> {
             self.emit(event);
         }
         self.measure_if_wanted(id);
+        self.look_up_if_wanted(id);
     }
 
-    fn sampled(&mut self, interface: String, result: anyhow::Result<u64>) {
-        // Every address on the interface left while the test ran: the result
-        // describes a connection that no longer exists.
+    fn sampled(&mut self, interface: String, job: u64, result: anyhow::Result<u64>) {
+        // A test of a network that has since gone, every address with it:
+        // its result describes a connection that no longer exists.
         let Some(speed) = self.speeds.get_mut(&interface) else {
             return;
         };
-        speed.testing = false;
+        if speed.running != Some(job) {
+            return;
+        }
+        speed.running = None;
+        if std::mem::take(&mut speed.stale) {
+            // Ran across a network change, so it measured part of each.
+            self.measure_interface(&interface);
+            return;
+        }
         match result {
             Ok(bps) => {
                 speed.bps = Some(bps);
@@ -447,17 +592,23 @@ impl<N: Network> Watcher<N> {
                 tracing::warn!(%interface, error = %format!("{err:#}"), "speed test failed");
                 // Retry through another address on the same interface, if one
                 // is up: an IPv6 route can fail where IPv4 works.
-                let others: Vec<LinkId> = self
-                    .links
-                    .iter()
-                    .filter(|(_, e)| e.link.name == interface)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in others {
-                    if self.measure_if_wanted(id) {
-                        break;
-                    }
-                }
+                self.measure_interface(&interface);
+            }
+        }
+    }
+
+    /// Start `interface`'s speed test through the first of its addresses that
+    /// can take it.
+    fn measure_interface(&mut self, interface: &str) {
+        let ids: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, e)| e.link.name == interface)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if self.measure_if_wanted(id) {
+                break;
             }
         }
     }
@@ -480,15 +631,58 @@ impl<N: Network> Watcher<N> {
             }
             return false;
         }
-        if speed.testing || speed.attempts >= MAX_SAMPLE_ATTEMPTS {
+        if speed.running.is_some() || speed.attempts >= MAX_SAMPLE_ATTEMPTS {
             return false;
         }
-        speed.testing = true;
+        let job = self.next_job;
+        self.next_job += 1;
+        speed.running = Some(job);
         speed.attempts += 1;
         let interface = e.link.name.clone();
         let addr = e.link.addr.ip();
-        self.start_sample(interface, addr);
+        self.start_sample(interface, job, addr);
         true
+    }
+
+    /// Look up an up link's public address, unless it is known, being looked
+    /// up, or has failed too often.
+    fn look_up_if_wanted(&mut self, id: LinkId) {
+        let Some(e) = self.links.get_mut(&id) else {
+            return;
+        };
+        if e.link.state != LinkState::Up
+            || e.link.public_ip.is_some()
+            || e.lookup.is_some()
+            || e.lookup_attempts >= MAX_LOOKUP_ATTEMPTS
+        {
+            return;
+        }
+        let job = self.next_job;
+        self.next_job += 1;
+        e.lookup = Some(job);
+        e.lookup_attempts += 1;
+        let addr = e.link.addr.ip();
+        self.start_lookup(id, job, addr);
+    }
+
+    fn looked_up(&mut self, id: LinkId, job: u64, result: anyhow::Result<IpAddr>) {
+        let Some(e) = self.links.get_mut(&id) else {
+            return;
+        };
+        // Started before the network changed: an answer about the old one.
+        if e.lookup != Some(job) {
+            return;
+        }
+        e.lookup = None;
+        match result {
+            Ok(public) => {
+                e.link.public_ip = Some(public);
+                self.changed = true;
+            }
+            Err(err) => {
+                tracing::debug!(link = %e.link.name, error = %format!("{err:#}"), "public address lookup failed");
+            }
+        }
     }
 
     fn start_probe(&self, id: LinkId, addr: IpAddr) {
@@ -506,7 +700,7 @@ impl<N: Network> Watcher<N> {
         });
     }
 
-    fn start_sample(&self, interface: String, addr: IpAddr) {
+    fn start_sample(&self, interface: String, job: u64, addr: IpAddr) {
         let net = Arc::clone(&self.net);
         let reports = self.reports_tx.clone();
         let budget = self.config.sample_budget;
@@ -516,7 +710,24 @@ impl<N: Network> Watcher<N> {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("no speed test result within {limit:?}")),
             };
-            let _ = reports.send(Report::Sampled { interface, result });
+            let _ = reports.send(Report::Sampled {
+                interface,
+                job,
+                result,
+            });
+        });
+    }
+
+    fn start_lookup(&self, id: LinkId, job: u64, addr: IpAddr) {
+        let net = Arc::clone(&self.net);
+        let reports = self.reports_tx.clone();
+        tokio::spawn(async move {
+            let limit = LOOKUP_TIMEOUT;
+            let result = match tokio::time::timeout(limit, net.public_ip(addr, limit)).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("no public address within {limit:?}")),
+            };
+            let _ = reports.send(Report::LookedUp { id, job, result });
         });
     }
 
@@ -524,6 +735,21 @@ impl<N: Network> Watcher<N> {
     fn emit(&mut self, event: LinkEvent) {
         self.pending.push(event);
     }
+}
+
+/// Each interface's IPv6 networks, as the set of its addresses' /64
+/// prefixes. An interface with no IPv6 address maps to an empty set, so IPv6
+/// arriving or leaving shows as a change. A rotating privacy address keeps
+/// its prefix, so it does not.
+fn ipv6_networks(candidates: &[Candidate]) -> HashMap<String, BTreeSet<u64>> {
+    let mut networks: HashMap<String, BTreeSet<u64>> = HashMap::new();
+    for c in candidates {
+        let prefixes = networks.entry(c.name.clone()).or_default();
+        if let IpAddr::V6(v6) = c.addr.ip() {
+            prefixes.insert((v6.to_bits() >> 64) as u64);
+        }
+    }
+    networks
 }
 
 fn is_same_link(candidate: &Candidate, link: &Link) -> bool {

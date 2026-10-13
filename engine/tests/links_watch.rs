@@ -3,14 +3,15 @@
 
 mod fake;
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use barrage::links::probe::ProbeVerdict;
 use barrage::links::watch::{WatchConfig, spawn_watcher};
-use barrage::links::{LinkEvent, LinkState};
-use fake::{Fake, SAMPLED_BPS, Step, cand, drain_for, ms, next};
+use barrage::links::{Candidate, Link, LinkEvent, LinkState};
+use fake::{Fake, SAMPLED_BPS, Step, cand, cand_idx, drain_for, ms, next};
 use tokio::time::timeout;
 
 #[tokio::test]
@@ -248,16 +249,21 @@ async fn one_speed_test_per_interface_shared_by_its_addresses() {
     assert_eq!(speeds, [Some(SAMPLED_BPS); 3]);
 }
 
-/// A rotating IPv6 privacy address joins an interface whose other addresses
-/// stay. Same connection, so the speed carries over and no data is spent.
+/// A rotating IPv6 privacy address: a new one joins, later the old one
+/// leaves, all within the same IPv6 network. Same connection, so the speed
+/// carries over and no data is spent.
 #[tokio::test]
-async fn an_address_joining_a_live_interface_inherits_its_speed() {
+async fn a_rotating_ipv6_address_inherits_the_speed() {
     let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let old = cand("Ethernet 2", "2001:db8::21", true);
+    let new = cand("Ethernet 2", "2001:db8::22", true);
     let net = Arc::new(Fake::scripted(vec![
-        vec![v4.clone()],
-        vec![v4.clone()],
-        vec![v4.clone()],
-        vec![v4, cand("Ethernet 2", "2001:db8::22", true)],
+        vec![v4.clone(), old.clone()],
+        vec![v4.clone(), old.clone()],
+        vec![v4.clone(), old.clone()],
+        vec![v4.clone(), old, new.clone()],
+        vec![v4.clone(), new.clone()],
+        vec![v4, new],
     ]));
     let (_h, _rx, table) = spawn_watcher(net.clone(), WatchConfig::every(ms(50)));
 
@@ -343,4 +349,291 @@ async fn the_table_keeps_links_in_the_order_they_appeared() {
     let _ = next(&mut rx).await;
     let names: Vec<_> = table.snapshot().into_iter().map(|l| l.name).collect();
     assert_eq!(names, ["Tether", "Wi-Fi"]);
+}
+
+/// Watch a link get measured, swap it for `replacement` (after `gap` empty
+/// polls), and check the replacement starts with no speed and is tested
+/// afresh. Shared by the two invalidation tests below.
+async fn replacement_starts_unmeasured(
+    original: Candidate,
+    gap: usize,
+    replacement: Candidate,
+) -> Link {
+    let mut steps = vec![vec![original]; 10];
+    steps.extend(std::iter::repeat_n(vec![], gap));
+    steps.push(vec![replacement]);
+    let net = Arc::new(Fake::scripted(steps).slow_samples(ms(200)));
+    let (_h, mut rx, table) = spawn_watcher(net.clone(), WatchConfig::every(ms(50)));
+
+    let LinkEvent::Up(old) = next(&mut rx).await else {
+        panic!("expected the original link Up");
+    };
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(
+        table.snapshot()[0].down_bps,
+        Some(SAMPLED_BPS),
+        "nothing was measured, so nothing to clear"
+    );
+
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(old));
+    let LinkEvent::Up(new) = next(&mut rx).await else {
+        panic!("expected the replacement Up");
+    };
+    let links = table.snapshot();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].id, new);
+    assert_ne!(new, old, "the replacement kept the old link's id");
+    assert_eq!(links[0].down_bps, None, "the old speed carried over");
+
+    tokio::time::sleep(ms(400)).await;
+    assert_eq!(
+        net.samples.load(Ordering::SeqCst),
+        2,
+        "the replacement was not tested"
+    );
+    table.snapshot().remove(0)
+}
+
+// Acceptance: a new network invalidates cached measurements. Moving Wi-Fi to
+// another network gives it a new address, so it is a new link: the old speed
+// must not show on it even for a moment, and it is tested afresh.
+#[tokio::test]
+async fn a_changed_address_on_the_same_interface_clears_measurements() {
+    let after = replacement_starts_unmeasured(
+        cand("Wi-Fi", "192.0.2.10", true),
+        0,
+        cand("Wi-Fi", "198.51.100.10", true),
+    )
+    .await;
+    assert_eq!(after.addr.ip().to_string(), "198.51.100.10");
+    assert_eq!(after.down_bps, Some(SAMPLED_BPS));
+}
+
+// Review Focus 5. Windows hands a freed interface index to the next adapter
+// plugged in. Identity is (name, address) and never the index, so the
+// newcomer is a new link with nothing carried over.
+#[tokio::test]
+async fn a_reused_os_index_does_not_inherit_the_old_links_measurements() {
+    let after = replacement_starts_unmeasured(
+        cand_idx(20, "Tether", "192.0.2.20", true),
+        1,
+        cand_idx(20, "Dock Ethernet", "198.51.100.20", true),
+    )
+    .await;
+    assert_eq!(after.name, "Dock Ethernet");
+}
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
+
+/// These tests switch networks well inside the default settle time.
+fn switching_config() -> WatchConfig {
+    let mut config = WatchConfig::every(ms(50));
+    config.settle = ms(0);
+    config
+}
+
+/// A phone being plugged in: its IPv6 address follows its IPv4 one by a
+/// moment. That is one network arriving, not a switch, so one speed test.
+#[tokio::test]
+async fn ipv6_arriving_just_after_a_cable_appears_is_not_a_new_network() {
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let net = Arc::new(Fake::scripted(vec![
+        vec![v4.clone()],
+        vec![v4.clone()],
+        vec![v4, cand("Ethernet 2", "2001:db8::20", true)],
+    ]));
+    let (_h, _rx, table) = spawn_watcher(net.clone(), WatchConfig::every(ms(50)));
+
+    tokio::time::sleep(ms(500)).await;
+    assert_eq!(
+        net.samples.load(Ordering::SeqCst),
+        1,
+        "a plug-in tested twice"
+    );
+    assert!(
+        table
+            .snapshot()
+            .iter()
+            .all(|l| l.down_bps == Some(SAMPLED_BPS))
+    );
+}
+
+/// Seen 2026-10-14 with the real phone. Switched from mobile data to Wi-Fi
+/// with the cable in, the tether kept its IPv4 address throughout while its
+/// IPv6 addresses went Deprecated and its public address became the laptop
+/// Wi-Fi's own. The IPv6 network leaving was the only sign of a new network.
+/// The user's choice: treat it as one, and test the cable afresh.
+#[tokio::test]
+async fn ipv6_leaving_a_cable_is_a_new_network() {
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let mut steps = vec![
+        vec![
+            v4.clone(),
+            cand("Ethernet 2", "2001:db8::20", true),
+            cand("Ethernet 2", "2001:db8::21", true),
+        ];
+        6
+    ];
+    steps.push(vec![v4]);
+    let net = Arc::new(
+        Fake::scripted(steps)
+            .sample_answers(&[(SAMPLED_BPS, ms(0)), (50_000_000, ms(200))])
+            .public("192.0.2.20", &[Some("203.0.113.1"), Some("198.51.100.99")]),
+    );
+    let (_h, _rx, table) = spawn_watcher(net.clone(), switching_config());
+
+    tokio::time::sleep(ms(400)).await;
+    let links = table.snapshot();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(
+        links[0].down_bps, None,
+        "the old network's speed still shows"
+    );
+
+    tokio::time::sleep(ms(400)).await;
+    assert_eq!(net.samples.load(Ordering::SeqCst), 2, "not tested afresh");
+    let link = &table.snapshot()[0];
+    assert_eq!(link.down_bps, Some(50_000_000));
+    assert_eq!(
+        link.public_ip,
+        Some(ip("198.51.100.99")),
+        "public address not looked up again"
+    );
+}
+
+/// The way back, also seen 2026-10-14: the phone returned to mobile data and
+/// its IPv6 addresses came back while the IPv4 address stayed the same.
+#[tokio::test]
+async fn ipv6_arriving_on_a_cable_is_a_new_network() {
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let mut steps = vec![vec![v4.clone()]; 6];
+    steps.push(vec![v4, cand("Ethernet 2", "2001:db8::20", true)]);
+    let net = Arc::new(Fake::scripted(steps));
+    let (_h, _rx, _t) = spawn_watcher(net.clone(), switching_config());
+
+    tokio::time::sleep(ms(600)).await;
+    assert_eq!(net.samples.load(Ordering::SeqCst), 2, "not tested afresh");
+}
+
+/// A phone moving between two networks that both have IPv6 keeps IPv6 on
+/// the cable, but under a different network prefix.
+#[tokio::test]
+async fn a_new_ipv6_prefix_on_a_cable_is_a_new_network() {
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let mut steps = vec![vec![v4.clone(), cand("Ethernet 2", "2001:db8:0:1::20", true)]; 6];
+    steps.push(vec![v4, cand("Ethernet 2", "2001:db8:0:2::20", true)]);
+    let net = Arc::new(Fake::scripted(steps));
+    let (_h, _rx, _t) = spawn_watcher(net.clone(), switching_config());
+
+    tokio::time::sleep(ms(600)).await;
+    assert_eq!(net.samples.load(Ordering::SeqCst), 2, "not tested afresh");
+}
+
+/// A test still running when the network changes measured some of each
+/// network, so its result is thrown away and a fresh test follows. The fresh
+/// one waits for the old to finish: two at once would split the cable.
+#[tokio::test]
+async fn a_speed_test_running_across_a_network_change_is_thrown_away() {
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let mut steps = vec![vec![v4.clone(), cand("Ethernet 2", "2001:db8::20", true)]; 4];
+    steps.push(vec![v4]);
+    let net =
+        Arc::new(Fake::scripted(steps).sample_answers(&[(111, ms(300)), (222_000_000, ms(100))]));
+    let (_h, _rx, table) = spawn_watcher(net.clone(), switching_config());
+
+    tokio::time::sleep(ms(800)).await;
+    assert_eq!(table.snapshot()[0].down_bps, Some(222_000_000));
+    assert_eq!(net.samples.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        net.most_at_once.load(Ordering::SeqCst),
+        1,
+        "two tests at once"
+    );
+}
+
+/// Wi-Fi moves to another network while its test is still running. The old
+/// test's result describes a network that has gone and must not land on the
+/// new one, which runs its own test.
+#[tokio::test]
+async fn a_speed_test_of_a_network_that_left_is_not_applied_to_the_next() {
+    let mut steps = vec![vec![cand("Wi-Fi", "192.0.2.10", true)]; 4];
+    steps.push(vec![cand("Wi-Fi", "198.51.100.10", true)]);
+    let net =
+        Arc::new(Fake::scripted(steps).sample_answers(&[(111, ms(400)), (222_000_000, ms(50))]));
+    let (_h, _rx, table) = spawn_watcher(net.clone(), WatchConfig::every(ms(50)));
+
+    tokio::time::sleep(ms(700)).await;
+    let link = &table.snapshot()[0];
+    assert_eq!(link.addr.ip(), ip("198.51.100.10"));
+    assert_eq!(
+        link.down_bps,
+        Some(222_000_000),
+        "the old network's result landed"
+    );
+}
+
+#[tokio::test]
+async fn an_up_link_learns_its_public_address() {
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .public("192.0.2.10", &[Some("203.0.113.7")]);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), WatchConfig::every(ms(50)));
+
+    assert!(matches!(next(&mut rx).await, LinkEvent::Up(_)));
+    tokio::time::sleep(ms(200)).await;
+    assert_eq!(table.snapshot()[0].public_ip, Some(ip("203.0.113.7")));
+}
+
+/// A portal would answer with its own address, or not at all.
+#[tokio::test]
+async fn a_link_that_is_not_up_is_not_looked_up() {
+    let net = Arc::new(
+        Fake::scripted(vec![vec![cand("Hotel", "192.0.2.30", true)]])
+            .verdicts("192.0.2.30", &[ProbeVerdict::Portal]),
+    );
+    let (_h, mut rx, table) = spawn_watcher(net.clone(), WatchConfig::every(ms(50)));
+
+    assert!(matches!(next(&mut rx).await, LinkEvent::Portal(_)));
+    tokio::time::sleep(ms(200)).await;
+    assert_eq!(net.lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(table.snapshot()[0].public_ip, None);
+}
+
+#[tokio::test]
+async fn a_failing_public_lookup_is_tried_at_most_three_times() {
+    let net = Arc::new(
+        Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]]).public("192.0.2.10", &[None]),
+    );
+    let mut config = WatchConfig::every(ms(50));
+    config.reprobe = ms(50);
+    let (_h, _rx, table) = spawn_watcher(net.clone(), config);
+
+    tokio::time::sleep(ms(800)).await;
+    assert_eq!(net.lookups.load(Ordering::SeqCst), 3);
+    assert_eq!(table.snapshot()[0].public_ip, None);
+}
+
+/// A lookup still running when the network changes answers for the old
+/// network, so its answer is dropped and the new lookup's is kept.
+#[tokio::test]
+async fn a_public_lookup_from_before_a_switch_is_not_applied() {
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let mut steps = vec![vec![v4.clone(), cand("Ethernet 2", "2001:db8::20", true)]; 4];
+    steps.push(vec![v4]);
+    let net = Arc::new(
+        Fake::scripted(steps)
+            .slow_lookups(ms(300))
+            .public("192.0.2.20", &[Some("203.0.113.1"), Some("198.51.100.99")]),
+    );
+    let (_h, _rx, table) = spawn_watcher(net.clone(), switching_config());
+
+    tokio::time::sleep(ms(400)).await;
+    assert_eq!(
+        table.snapshot()[0].public_ip,
+        None,
+        "the old network's answer landed"
+    );
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(table.snapshot()[0].public_ip, Some(ip("198.51.100.99")));
 }

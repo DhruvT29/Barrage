@@ -142,6 +142,12 @@ pub struct Link {
     /// 25 Mbps tether and measured roughly 170, and the tether turned out to
     /// be faster than the Wi-Fi.
     pub down_bps: Option<u64>,
+    /// The address the internet sees this link's traffic come from, `None`
+    /// until looked up. Two links on different cables showing the same one
+    /// share one internet connection: on 2026-10-14 the phone, joined to the
+    /// laptop's Wi-Fi, showed exactly the Wi-Fi's own. See
+    /// [`super::upstream::shared_upstreams`].
+    pub public_ip: Option<IpAddr>,
     /// Whether the OS reports this link as metered. Phase 0 burned about
     /// 2.5 GB of mobile data in six test runs, which is the whole argument for
     /// carrying this flag from the start.

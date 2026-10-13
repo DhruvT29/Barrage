@@ -7,6 +7,7 @@
 //! - [`LinkHandle::snapshot`]: every link the watcher knows, whatever its state
 //! - [`LinkHandle::usable`]: only the links that work right now
 //! - [`LinkHandle::subscribe`]: be told as links come, go and change
+//! - [`LinkHandle::shared_upstreams`]: which links are really one internet
 //!
 //! To follow the links without missing anything, subscribe first and then
 //! take a snapshot. A change in between then shows up in the snapshot and as
@@ -21,7 +22,7 @@ use anyhow::Context as _;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use super::model::{Link, LinkEvent, LinkState};
+use super::model::{Link, LinkEvent, LinkId, LinkState};
 use super::watch::{LinkTable, Network, SystemNetwork, WatchConfig, spawn_watcher};
 
 /// A running watcher, and the way to ask it about links.
@@ -77,6 +78,13 @@ impl LinkHandle {
         let mut links = self.snapshot();
         links.retain(|l| l.state == LinkState::Up);
         links
+    }
+
+    /// Groups of working links on different cables that reach the internet
+    /// through one connection, so using them together gains nothing. See
+    /// [`super::upstream::shared_upstreams`].
+    pub fn shared_upstreams(&self) -> Vec<Vec<LinkId>> {
+        super::upstream::shared_upstreams(&self.snapshot())
     }
 
     /// Events from now on. Each subscriber gets every event, and returns

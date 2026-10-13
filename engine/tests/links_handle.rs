@@ -121,6 +121,32 @@ async fn an_event_goes_out_only_after_the_table_shows_it() {
     );
 }
 
+/// Seen 2026-10-14: with the phone on the laptop's Wi-Fi, the tether's public
+/// address was the Wi-Fi's own, two rows over one internet. The phone's IPv6
+/// address reports itself and shares with nothing.
+#[tokio::test]
+async fn links_on_different_cables_behind_one_public_address_share_an_upstream() {
+    let net = Fake::scripted(vec![vec![
+        cand("Wi-Fi", "192.0.2.10", true),
+        cand("Ethernet 2", "192.0.2.20", true),
+        cand("Ethernet 2", "2001:db8::20", true),
+    ]])
+    .public("192.0.2.10", &[Some("198.51.100.99")])
+    .public("192.0.2.20", &[Some("198.51.100.99")]);
+    let h = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(50))).unwrap();
+
+    tokio::time::sleep(ms(300)).await;
+    let groups = h.shared_upstreams();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let table = h.snapshot();
+    let mut names: Vec<_> = groups[0]
+        .iter()
+        .map(|id| table.iter().find(|l| l.id == *id).unwrap().name.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Ethernet 2", "Wi-Fi"]);
+}
+
 /// Otherwise the watcher would go on probing the internet every few seconds,
 /// for nobody.
 #[tokio::test]
