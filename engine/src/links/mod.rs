@@ -30,6 +30,7 @@ pub mod handle;
 pub mod measure;
 pub mod model;
 pub mod probe;
+pub mod render;
 pub mod upstream;
 pub mod watch;
 
