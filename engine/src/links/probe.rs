@@ -4,21 +4,9 @@
 //! `classify` decides what a response means and is pure, and `probe` performs
 //! the request through one chosen link and is the I/O edge.
 //!
-//! BINDING, AND THE TRAP UNDERNEATH IT
-//!
 //! A probe is only worth anything if it really leaves through the link it was
-//! aimed at. Telling the HTTP client to use a link's address as the source
-//! does that, with one exception that fails silently. The connection layer
-//! under `reqwest` (hyper-util's `bind_local_address`) applies an IPv4 source
-//! only to IPv4 destinations. Given an IPv6 destination it binds to "any
-//! address" instead, and the OS sends the request out of whichever link it
-//! prefers. The request succeeds, through the wrong link, with no error.
-//!
-//! So the probe resolves the host itself, keeps only addresses of the same
-//! family as the link, and pins the client to those. A host with no address
-//! of that family is refused outright. Nothing on this machine had global
-//! IPv6 on 2026-10-13, so the trap was not live, but mobile carriers hand out
-//! IPv6 freely and a tether could start passing it through at any time.
+//! aimed at, which is `bind`'s job, including the silent IPv6 trap described
+//! there.
 //!
 //! WHY THE PROBE HAS TO READ THE ANSWER, NOT JUST GET ONE
 //!
@@ -33,10 +21,12 @@
 //! correctly passes. Only measured throughput can expose a link that answers
 //! the probe and then moves no data.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, bail};
+
+use super::bind;
 
 /// What one probe response says about the link it came through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,7 +114,7 @@ pub async fn probe(addr: IpAddr, timeout: Duration) -> anyhow::Result<Probe> {
 /// most this long, never a stalled poll loop (Review Focus 3).
 pub async fn probe_url(addr: IpAddr, url: &str, timeout: Duration) -> anyhow::Result<Probe> {
     within(timeout, addr, url, async {
-        let client = bound_client(addr, url).await?;
+        let client = bind::client(addr, url).await?;
         let started = Instant::now();
         let response = client.get(url).send().await?;
         let rtt = started.elapsed();
@@ -145,7 +135,7 @@ pub async fn probe_url(addr: IpAddr, url: &str, timeout: Duration) -> anyhow::Re
 /// address are not two paths, whatever the local addresses say.
 pub async fn public_ip_via(addr: IpAddr, timeout: Duration) -> anyhow::Result<IpAddr> {
     within(timeout, addr, PUBLIC_IP_URL, async {
-        let client = bound_client(addr, PUBLIC_IP_URL).await?;
+        let client = bind::client(addr, PUBLIC_IP_URL).await?;
         let text = client
             .get(PUBLIC_IP_URL)
             .send()
@@ -174,105 +164,5 @@ async fn within<T>(
         // "Did not complete" rather than "no answer": the deadline also ends
         // a response that was arriving, just not fast enough.
         Err(_) => bail!("request to {url} from {addr} did not complete within {timeout:?}"),
-    }
-}
-
-/// A client whose every connection leaves through the link that owns `local`.
-///
-/// Built per call, so a pooled connection opened through one link can never
-/// be reused for another.
-async fn bound_client(local: IpAddr, url: &str) -> anyhow::Result<reqwest::Client> {
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("unusable URL {url}"))?;
-    let host = parsed.host_str().context("the URL has no host")?;
-    let port = parsed
-        .port_or_known_default()
-        .context("the URL has no port")?;
-
-    let literal = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .ok();
-    let found: Vec<SocketAddr> = match literal {
-        Some(ip) => vec![SocketAddr::new(ip, port)],
-        None => tokio::net::lookup_host((host, port))
-            .await
-            .with_context(|| format!("looking up {host}"))?
-            .collect(),
-    };
-    ensure!(!found.is_empty(), "{host} resolved to no addresses");
-
-    let targets = same_family(local, found);
-    ensure!(
-        !targets.is_empty(),
-        "{host} has only {} addresses, which an {} link cannot reach. Refused rather than let the \
-         OS send it out of whichever link it prefers",
-        family_name(!local.is_ipv4()),
-        family_name(local.is_ipv4()),
-    );
-
-    let mut builder = reqwest::Client::builder()
-        .local_address(local)
-        // reqwest sends no User-Agent unless told to, and some servers drop
-        // anonymous clients. Measured 2026-10-13: Hetzner's speed server
-        // served curl with its user-agent and closed the connection on the
-        // same request without one, and Cloudflare refused it outright. A
-        // server refusing the client would make a working link look broken.
-        .user_agent(concat!("barrage/", env!("CARGO_PKG_VERSION")))
-        // A proxy would carry every request over the route to the proxy,
-        // whichever link was asked for.
-        .no_proxy()
-        // A redirect is evidence of a portal, so it is returned, not followed.
-        .redirect(reqwest::redirect::Policy::none());
-    if literal.is_none() {
-        // Pin the hostname to the addresses checked above, so the client
-        // cannot resolve it again and pick one of the other family.
-        builder = builder.resolve_to_addrs(host, &targets);
-    }
-    builder.build().context("building the HTTP client")
-}
-
-/// The destinations a socket bound to `local` really reaches through its own
-/// link: those of the same address family. See the module docs for what
-/// happens to the others.
-fn same_family(local: IpAddr, found: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
-    found
-        .into_iter()
-        .filter(|a| a.is_ipv4() == local.is_ipv4())
-        .collect()
-}
-
-fn family_name(ipv4: bool) -> &'static str {
-    if ipv4 { "IPv4" } else { "IPv6" }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
-        list.iter().map(|s| s.parse().unwrap()).collect()
-    }
-
-    const MIXED: &[&str] = &["192.0.2.10:80", "[2001:db8::10]:80", "198.51.100.10:80"];
-
-    #[test]
-    fn an_ipv4_link_keeps_only_ipv4_destinations() {
-        let local: IpAddr = "192.0.2.1".parse().unwrap();
-        let kept = same_family(local, addrs(MIXED));
-        assert_eq!(kept, addrs(&["192.0.2.10:80", "198.51.100.10:80"]));
-    }
-
-    #[test]
-    fn an_ipv6_link_keeps_only_ipv6_destinations() {
-        let local: IpAddr = "2001:db8::1".parse().unwrap();
-        let kept = same_family(local, addrs(MIXED));
-        assert_eq!(kept, addrs(&["[2001:db8::10]:80"]));
-    }
-
-    #[test]
-    fn a_host_with_no_address_of_the_links_family_leaves_nothing() {
-        let local: IpAddr = "192.0.2.1".parse().unwrap();
-        assert!(same_family(local, addrs(&["[2001:db8::10]:80"])).is_empty());
     }
 }

@@ -16,8 +16,10 @@ use barrage::links::probe::{
     G_PROBE_URL, MS_PROBE_EXPECTED, MS_PROBE_URL, ProbeVerdict, classify, probe, probe_url,
     public_ip_via,
 };
-use barrage::links::{enumerate, usable};
 use tokio::net::TcpListener;
+
+mod common;
+use common::first_usable_local_addr;
 
 #[test]
 fn empty_204_is_working() {
@@ -101,14 +103,6 @@ fn probe_urls_are_plain_http() {
 }
 
 // The source-bound probe. Everything below goes through a real link.
-
-fn first_usable_local_addr() -> IpAddr {
-    usable(&enumerate().expect("enumeration failed"))
-        .into_iter()
-        .map(|c| c.addr.ip())
-        .find(IpAddr::is_ipv4)
-        .expect("these tests need at least one working IPv4 network link")
-}
 
 #[tokio::test]
 async fn probe_from_a_real_local_address_reports_working() {
