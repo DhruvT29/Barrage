@@ -14,10 +14,12 @@
 //! | `measure` | throughput sampling | yes |
 //! | `watch` | poll, diff, emit events | yes |
 //!
-//! `model` (task 1) and `filter` (task 2) exist so far.
+//! `model` (task 1), `filter` (task 2) and `enumerate` (task 3) exist so far.
 
+pub mod enumerate;
 pub mod filter;
 pub mod model;
 
+pub use enumerate::enumerate;
 pub use filter::usable;
 pub use model::{Addr, Candidate, Link, LinkEvent, LinkId, LinkState};
