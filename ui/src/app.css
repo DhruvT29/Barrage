@@ -85,6 +85,177 @@ body {
   outline-offset: 4px;
 }
 
+/* A panel: HUD corner brackets in the colour of what it shows (--c). */
+.panel {
+  --c: var(--edge);
+  padding: 12px 14px 13px;
+  background:
+    linear-gradient(var(--c), var(--c)) top left / 10px 1.5px no-repeat,
+    linear-gradient(var(--c), var(--c)) top left / 1.5px 10px no-repeat,
+    linear-gradient(var(--c), var(--c)) top right / 10px 1.5px no-repeat,
+    linear-gradient(var(--c), var(--c)) top right / 1.5px 10px no-repeat,
+    linear-gradient(var(--c), var(--c)) bottom left / 10px 1.5px no-repeat,
+    linear-gradient(var(--c), var(--c)) bottom left / 1.5px 10px no-repeat,
+    linear-gradient(var(--c), var(--c)) bottom right / 10px 1.5px no-repeat,
+    linear-gradient(var(--c), var(--c)) bottom right / 1.5px 10px no-repeat,
+    var(--panel);
+}
+
+/* A cable. Its state is a colour, a shape and a word: the word is in the markup. */
+.cable.up {
+  --c: rgba(0, 229, 255, 0.55);
+}
+.cable.degraded,
+.cable.probing,
+.cable.portal {
+  --c: rgba(255, 225, 77, 0.55);
+}
+.cable.down {
+  --c: rgba(255, 61, 110, 0.75);
+}
+
+.cable .top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.cable .name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.cable .state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.mark {
+  width: 7px;
+  height: 7px;
+  flex: none;
+}
+.up .mark {
+  background: var(--cyan);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--cyan);
+}
+.degraded .mark {
+  background: var(--yellow);
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(255, 225, 77, 0.6);
+}
+.probing .mark {
+  border: 1.5px solid var(--yellow);
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(255, 225, 77, 0.6);
+}
+.portal .mark {
+  border: 1.5px solid var(--yellow);
+  box-shadow: 0 0 6px rgba(255, 225, 77, 0.6);
+}
+.down .mark {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+}
+
+.figure {
+  margin-top: 6px;
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 28px;
+  line-height: 1.1;
+  color: var(--cyan);
+  text-shadow: var(--glow-cyan);
+}
+.figure small {
+  font-family: var(--body);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--dim);
+  text-shadow: none;
+}
+.figure.unknown {
+  color: var(--dim);
+  text-shadow: none;
+}
+
+/* One scale for every card: the fastest cable fills its own beam. */
+.beam {
+  position: relative;
+  margin-top: 8px;
+  height: 3px;
+  background: rgba(0, 229, 255, 0.1);
+}
+.beam span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: block;
+  background: linear-gradient(90deg, rgba(0, 229, 255, 0.25), var(--cyan));
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.65);
+}
+/* Nothing measured: no beam, and no glowing head sitting at zero. */
+.beam span.empty {
+  display: none;
+}
+.beam span::after {
+  content: '';
+  position: absolute;
+  right: -3px;
+  top: -2.5px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #cffbff;
+  box-shadow: 0 0 10px 3px var(--cyan);
+}
+
+.addresses {
+  list-style: none;
+  padding: 0;
+  margin-top: 9px;
+  color: var(--dim);
+  font-size: 12px;
+}
+.addresses li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.addresses .addr {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.addresses .public {
+  text-align: right;
+}
+.own-state.up {
+  color: var(--cyan);
+}
+.own-state.degraded,
+.own-state.probing,
+.own-state.portal {
+  color: var(--yellow);
+}
+.own-state.down {
+  color: var(--red);
+}
+
+.counted-once,
+.shared-with {
+  color: var(--magenta);
+}
+.shared-with {
+  margin-top: 4px;
+  font-size: 12px;
+  text-align: right;
+}
+
 @media (max-width: 760px) {
   :root {
     --gutter: 16px;
