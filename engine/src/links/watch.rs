@@ -248,6 +248,22 @@ impl LinkTable {
     pub fn snapshot(&self) -> Vec<Link> {
         self.0.borrow().clone()
     }
+
+    /// The links as of now, like [`snapshot`](Self::snapshot), and marked as
+    /// seen, so [`changed`](Self::changed) waits for the next change.
+    pub fn latest(&mut self) -> Vec<Link> {
+        self.0.borrow_and_update().clone()
+    }
+
+    /// Wait until the table differs from the one last seen. Returns `false`
+    /// once the watcher has stopped and nothing newer will come.
+    ///
+    /// Changes made while nobody was waiting are not queued: the next call
+    /// returns at once and [`latest`](Self::latest) gives the newest table,
+    /// so a slow reader skips ahead rather than falling behind. Cancel safe.
+    pub async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
 }
 
 /// Start the watcher.

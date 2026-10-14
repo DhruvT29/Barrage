@@ -2,11 +2,13 @@
 //! links exist and which work.
 //!
 //! Starting a handle starts the watcher; dropping it stops the watcher. In
-//! between, three questions, none of which ever waits on the network:
+//! between, these ways to ask, none of which ever waits on the network:
 //!
 //! - [`LinkHandle::snapshot`]: every link the watcher knows, whatever its state
 //! - [`LinkHandle::usable`]: only the links that work right now
-//! - [`LinkHandle::subscribe`]: be told as links come, go and change
+//! - [`LinkHandle::subscribe`]: be told as links come, go and change state
+//! - [`LinkHandle::table`]: follow the whole table, figures included, which
+//!   is what the API's live feed does
 //! - [`LinkHandle::shared_upstreams`]: which links are really one internet
 //!
 //! To follow the links without missing anything, subscribe first and then
@@ -67,6 +69,14 @@ impl LinkHandle {
     /// their state. Copies the table and returns at once.
     pub fn snapshot(&self) -> Vec<Link> {
         self.table.snapshot()
+    }
+
+    /// A copy of the table to follow from elsewhere, such as the API server.
+    /// It reads the table and can wait for it to change, but holds nothing
+    /// that keeps the watcher running: once this handle is dropped, every
+    /// copy's [`changed`](super::watch::LinkTable::changed) returns `false`.
+    pub fn table(&self) -> LinkTable {
+        self.table.clone()
     }
 
     /// The links that may be given work right now, by
