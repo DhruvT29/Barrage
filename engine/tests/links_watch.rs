@@ -615,6 +615,110 @@ async fn a_speed_test_of_a_network_that_left_is_not_applied_to_the_next() {
         Some(222_000_000),
         "the old network's result landed"
     );
+    // The new network's test waits for the old one, as on an IPv6 change:
+    // two at once would split the cable (code review of PR #2).
+    assert_eq!(
+        net.most_at_once.load(Ordering::SeqCst),
+        1,
+        "two tests at once"
+    );
+}
+
+/// The phone's IPv6 address arrives first, so it is first in the table. When
+/// its speed test fails, the retry must go through the IPv4 address, not the
+/// IPv6 one again (code review of PR #2). The IPv6 test takes 200 ms to fail,
+/// so the IPv4 address is up by then.
+#[tokio::test]
+async fn a_failed_speed_test_is_retried_through_another_address() {
+    let v6 = cand("Ethernet 2", "2001:db8::20", true);
+    let v4 = cand("Ethernet 2", "192.0.2.20", true);
+    let net = Arc::new(
+        Fake::scripted(vec![vec![v6.clone()], vec![v6, v4]])
+            .slow_samples(ms(200))
+            .failing_samples("2001:db8::20"),
+    );
+    let mut config = WatchConfig::every(ms(50));
+    config.retry = ms(50);
+    let (_h, _rx, table) = spawn_watcher(net.clone(), config);
+
+    wait_for("the speed, through IPv4", || {
+        let links = table.snapshot();
+        (links.len() == 2 && links.iter().all(|l| l.down_bps == Some(SAMPLED_BPS))).then_some(())
+    })
+    .await;
+    assert_eq!(
+        net.sampled_through(),
+        [ip("2001:db8::20"), ip("192.0.2.20")]
+    );
+}
+
+/// A test that fails at once is not retried at once: three back-to-back
+/// tries would all meet the same passing trouble.
+#[tokio::test]
+async fn a_failed_speed_test_waits_before_it_is_tried_again() {
+    let net = Arc::new(
+        Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]]).failing_samples("192.0.2.10"),
+    );
+    let mut config = WatchConfig::every(ms(50));
+    config.retry = ms(300);
+    let (_h, _rx, _t) = spawn_watcher(net.clone(), config);
+
+    wait_for("the first test", || (samples(&net) >= 1).then_some(())).await;
+    tokio::time::sleep(ms(150)).await;
+    assert_eq!(samples(&net), 1, "retried without waiting");
+    wait_for("all three tries", || (samples(&net) == 3).then_some(())).await;
+}
+
+/// Code review of PR #2: a dead link kept its speed and public address, so
+/// anything reading the table could count capacity that was not there. The
+/// figures go when the link stops being `Up`. The speed comes back without a
+/// new test when the link does, since it belongs to the cable, and the
+/// public address is looked up again.
+#[tokio::test]
+async fn a_link_that_stops_working_shows_no_speed_or_public_address() {
+    let net = Arc::new(
+        Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+            .verdicts(
+                "192.0.2.10",
+                &[
+                    ProbeVerdict::Working,
+                    ProbeVerdict::Broken,
+                    ProbeVerdict::Broken,
+                    ProbeVerdict::Working,
+                ],
+            )
+            .public("192.0.2.10", &[Some("203.0.113.7")]),
+    );
+    let mut config = WatchConfig::every(ms(50));
+    config.reprobe = ms(300);
+    config.retry = ms(50);
+    let (_h, mut rx, table) = spawn_watcher(net.clone(), config);
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    wait_for("the speed and public address", || {
+        let link = table.snapshot().remove(0);
+        (link.down_bps.is_some() && link.public_ip.is_some()).then_some(())
+    })
+    .await;
+
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(id));
+    let dead = table.snapshot().remove(0);
+    assert_eq!(
+        (dead.state, dead.down_bps, dead.public_ip),
+        (LinkState::Down, None, None)
+    );
+
+    assert_eq!(next(&mut rx).await, LinkEvent::Up(id));
+    let back = wait_for("the figures to return", || {
+        let link = table.snapshot().remove(0);
+        (link.down_bps.is_some() && link.public_ip.is_some()).then_some(link)
+    })
+    .await;
+    assert_eq!(back.down_bps, Some(SAMPLED_BPS));
+    assert_eq!(samples(&net), 1, "the cable was tested again");
+    assert_eq!(net.lookups.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

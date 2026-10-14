@@ -13,18 +13,19 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use super::model::{Link, LinkId, LinkState};
+use super::model::{Link, LinkId};
 
 /// Groups of working links, on at least two different interfaces, that show
 /// the internet the same public address. Each group is in table order.
 ///
 /// Addresses on one interface are one cable whatever their public addresses,
-/// so a group needs more than one interface. Only `Up` links count: a portal
-/// or a dead link is not being used anyway, and a link whose public address
-/// is not known yet is left out rather than guessed.
+/// so a group needs more than one interface. Only links that may be given
+/// work count ([`is_usable`](super::model::LinkState::is_usable)): a portal or a dead link is not
+/// being used anyway, and a link whose public address is not known yet is
+/// left out rather than guessed.
 pub fn shared_upstreams(links: &[Link]) -> Vec<Vec<LinkId>> {
     let mut by_public: BTreeMap<IpAddr, Vec<&Link>> = BTreeMap::new();
-    for link in links.iter().filter(|l| l.state == LinkState::Up) {
+    for link in links.iter().filter(|l| l.state.is_usable()) {
         if let Some(public) = link.public_ip {
             by_public.entry(public).or_default().push(link);
         }
@@ -39,7 +40,7 @@ pub fn shared_upstreams(links: &[Link]) -> Vec<Vec<LinkId>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::links::model::Addr;
+    use crate::links::model::{Addr, LinkState};
 
     fn link(id: u64, name: &str, local: &str, public: Option<&str>, state: LinkState) -> Link {
         Link {
@@ -119,6 +120,26 @@ mod tests {
             ),
         ];
         assert!(shared_upstreams(&links).is_empty());
+    }
+
+    /// A degraded link still carries work, so it still counts (code review
+    /// of PR #2).
+    #[test]
+    fn a_degraded_link_counts() {
+        let links = [
+            up(1, "Wi-Fi", "192.0.2.10", Some("198.51.100.99")),
+            link(
+                2,
+                "Ethernet 2",
+                "192.0.2.20",
+                Some("198.51.100.99"),
+                LinkState::Degraded,
+            ),
+        ];
+        assert_eq!(
+            shared_upstreams(&links),
+            [vec![LinkId::new(1), LinkId::new(2)]]
+        );
     }
 
     /// The phone on the Wi-Fi: its IPv4 shares with the Wi-Fi, its IPv6

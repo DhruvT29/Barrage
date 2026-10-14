@@ -4,6 +4,7 @@
 mod fake;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use barrage::LinkHandle;
@@ -162,6 +163,32 @@ async fn dropping_the_handle_stops_the_watcher() {
         .await
         .expect("the watcher was still running 2 s after the handle was dropped");
     assert!(matches!(end, Err(RecvError::Closed)), "{end:?}");
+}
+
+/// Code review of PR #2: stopping only the watcher left its speed test
+/// running, downloading (through a phone, mobile data) for a result nobody
+/// would read. The test here takes 300 ms; the handle goes 300 ms early.
+#[tokio::test]
+async fn dropping_the_handle_stops_its_speed_tests() {
+    let net = Arc::new(
+        Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]]).slow_samples(ms(300)),
+    );
+    let h = LinkHandle::start_with(net.clone(), WatchConfig::every(ms(50))).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while net.samples.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(ms(10)).await;
+        }
+    })
+    .await
+    .expect("no speed test started within 2 s");
+
+    drop(h);
+    tokio::time::sleep(ms(600)).await;
+    assert_eq!(
+        net.samples_finished.load(Ordering::SeqCst),
+        0,
+        "a speed test ran on after the handle was dropped"
+    );
 }
 
 #[test]

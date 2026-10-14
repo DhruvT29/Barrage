@@ -22,7 +22,7 @@ use anyhow::Context as _;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use super::model::{Link, LinkEvent, LinkId, LinkState};
+use super::model::{Link, LinkEvent, LinkId};
 use super::watch::{LinkTable, Network, SystemNetwork, WatchConfig, spawn_watcher};
 
 /// A running watcher, and the way to ask it about links.
@@ -69,14 +69,15 @@ impl LinkHandle {
         self.table.snapshot()
     }
 
-    /// The links that work right now: `Up` only. A portal, a dead link and
-    /// a link still being probed are left out.
+    /// The links that may be given work right now, by
+    /// [`LinkState::is_usable`](super::model::LinkState::is_usable): `Up`, and `Degraded` once anything reports
+    /// it. A portal, a dead link and a link still being probed are left out.
     ///
     /// Not the same question as [`super::filter::usable`], which picks the
     /// interface addresses worth probing at all.
     pub fn usable(&self) -> Vec<Link> {
         let mut links = self.snapshot();
-        links.retain(|l| l.state == LinkState::Up);
+        links.retain(|l| l.state.is_usable());
         links
     }
 

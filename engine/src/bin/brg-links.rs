@@ -199,8 +199,15 @@ impl Screen {
 
     fn close(self) {
         println!("\nstopped.");
-        #[cfg(windows)]
-        if let Some(mode) = self.restore {
+    }
+}
+
+/// The console mode goes back however the program ends: a clean stop, an
+/// error from a write, or a panic.
+#[cfg(windows)]
+impl Drop for Screen {
+    fn drop(&mut self) {
+        if let Some(mode) = self.restore.take() {
             console::set_mode(mode);
         }
     }

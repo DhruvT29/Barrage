@@ -2,10 +2,11 @@
 //!
 //! Every poll it reads the interface list, keeps the usable entries, and
 //! compares them with the table. A newcomer gets a fresh `LinkId` and starts
-//! as `Probing`; a link no longer listed is removed. Probes and speed tests run
-//! as separate tasks and post their results back as messages, so the loop
-//! itself never waits on the network (Review Focus 3). Nothing else ever
-//! writes the table. Readers get a published copy through [`LinkTable`].
+//! as `Probing`; a link no longer listed is removed. Probes, speed tests and
+//! lookups run as separate tasks that the watcher owns, each ending in a
+//! report, so the loop itself never waits on the network (Review Focus 3),
+//! and when the watcher stops they stop with it. Nothing else ever writes
+//! the table. Readers get a published copy through [`LinkTable`].
 //!
 //! THE OUTSIDE WORLD IS INJECTED
 //!
@@ -85,9 +86,12 @@
 //!   a fresh one follows; two at once would split the cable. Every test and
 //!   lookup is numbered, so an answer that no longer matters, including one
 //!   from a network that has entirely gone, is recognised and dropped.
-//! - A failed test is retried, through another of the interface's addresses
-//!   if one is up, and otherwise on a later probe, at most
-//!   [`MAX_SAMPLE_ATTEMPTS`] times while the interface lasts.
+//! - A failed test is retried after [`WatchConfig::retry`], through an
+//!   address not tried yet if one is up, otherwise through one already
+//!   tried, at most [`MAX_SAMPLE_ATTEMPTS`] times while the interface stays
+//!   on one network.
+//! - A link shows a speed only while it is `Up`. The speed stays with the
+//!   cable, so a link that recovers shows it again without a new test.
 //! - Separate interfaces test at the same time, since phase 0 showed separate
 //!   links keep most of their speed when used together.
 //!
@@ -95,16 +99,17 @@
 //!
 //! Each `Up` link's public address is looked up once (a few KB over HTTPS),
 //! at most [`MAX_LOOKUP_ATTEMPTS`] times if it fails, and again when its
-//! interface's network changes. Links on different cables showing the same
-//! one share an internet connection; see [`super::upstream`].
+//! interface's network changes or the link recovers from being down. Links on
+//! different cables showing the same one share an internet connection; see
+//! [`super::upstream`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::filter::usable;
@@ -186,7 +191,8 @@ pub struct WatchConfig {
     pub reprobe: Duration,
     /// How soon a failed probe is tried again, before the link is called
     /// `Down`. Long enough for a stalled lookup to have finished, so the
-    /// second try finds the answer remembered.
+    /// second try finds the answer remembered. A failed speed test waits as
+    /// long before its retry.
     pub retry: Duration,
     /// How long the one speed test per interface runs. Five seconds, because
     /// a single 2 s sample ranged 22.7 to 47.1 Mbps on steady Wi-Fi, and
@@ -257,7 +263,6 @@ pub fn spawn_watcher<N: Network>(
 ) -> (JoinHandle<()>, broadcast::Receiver<LinkEvent>, LinkTable) {
     let (events, events_rx) = broadcast::channel(EVENT_CAPACITY);
     let (table, table_rx) = watch::channel(Vec::new());
-    let (reports_tx, reports) = mpsc::unbounded_channel();
     let watcher = Watcher {
         net,
         config,
@@ -268,8 +273,7 @@ pub fn spawn_watcher<N: Network>(
         next_job: 1,
         events,
         table,
-        reports_tx,
-        reports,
+        tasks: JoinSet::new(),
         changed: false,
         pending: Vec::new(),
     };
@@ -314,6 +318,21 @@ struct Speed {
     /// neither network: throw it away and test again.
     stale: bool,
     attempts: u8,
+    /// The links tests have gone through, so a retry can go another way.
+    tried: BTreeSet<LinkId>,
+}
+
+impl Speed {
+    /// Forget the old network. A test still running measured it, so it is
+    /// marked stale rather than dropped: the next test waits for it to end,
+    /// since two at once would split the cable.
+    fn forget(&mut self) {
+        *self = Speed {
+            running: self.running,
+            stale: self.running.is_some(),
+            ..Speed::default()
+        };
+    }
 }
 
 struct Watcher<N> {
@@ -333,8 +352,10 @@ struct Watcher<N> {
     next_job: u64,
     events: broadcast::Sender<LinkEvent>,
     table: watch::Sender<Vec<Link>>,
-    reports_tx: mpsc::UnboundedSender<Report>,
-    reports: mpsc::UnboundedReceiver<Report>,
+    /// Every probe, speed test and lookup still running, each ending in its
+    /// report. Owned here so that when the watcher stops they all stop: a
+    /// speed test left running would go on spending mobile data for nobody.
+    tasks: JoinSet<Report>,
     /// Whether the table differs from the copy last published.
     changed: bool,
     /// Events waiting for the table that shows them to be published.
@@ -348,7 +369,10 @@ impl<N: Network> Watcher<N> {
         loop {
             tokio::select! {
                 _ = ticker.tick() => self.poll(),
-                Some(report) = self.reports.recv() => self.receive(report),
+                Some(done) = self.tasks.join_next() => match done {
+                    Ok(report) => self.receive(report),
+                    Err(e) => tracing::error!(error = %e, "a probe, speed test or lookup panicked"),
+                },
             }
             if self.changed {
                 let copy = self.links.values().map(|e| e.link.clone()).collect();
@@ -392,10 +416,16 @@ impl<N: Network> Watcher<N> {
         // An interface whose every address has gone forgets its speed, so a
         // new network on the same interface is tested afresh. This runs
         // before newcomers are added, so a network swap seen within a single
-        // poll still counts.
+        // poll still counts. The record stays while a test is still running,
+        // so the new network's test waits for it.
         let links = &self.links;
-        self.speeds
-            .retain(|name, _| links.values().any(|e| &e.link.name == name));
+        self.speeds.retain(|name, speed| {
+            if links.values().any(|e| &e.link.name == name) {
+                return true;
+            }
+            speed.forget();
+            speed.running.is_some()
+        });
 
         // An interface whose IPv6 networks changed is on a new network even
         // if an address stayed, as the tether's IPv4 did when the phone
@@ -474,9 +504,7 @@ impl<N: Network> Watcher<N> {
     fn network_changed(&mut self, interface: &str) {
         tracing::info!(%interface, "IPv6 networks changed: a new network, testing afresh");
         if let Some(speed) = self.speeds.get_mut(interface) {
-            speed.bps = None;
-            speed.attempts = 0;
-            speed.stale = speed.running.is_some();
+            speed.forget();
         }
         let ids: Vec<LinkId> = self
             .links
@@ -493,7 +521,7 @@ impl<N: Network> Watcher<N> {
         if !ids.is_empty() {
             self.changed = true;
         }
-        self.measure_interface(interface);
+        self.measure_interface(interface, Duration::ZERO);
         for id in ids {
             self.look_up_if_wanted(id);
         }
@@ -555,11 +583,19 @@ impl<N: Network> Watcher<N> {
 
         let changed_state = e.link.state != state;
         e.link.state = state;
+        if state != LinkState::Up {
+            // A speed and a public address describe a working link, and a
+            // dead one showing them would count capacity that is not there.
+            // The speed stays with the cable and comes back with the link;
+            // the public address is looked up again.
+            e.link.down_bps = None;
+            e.link.public_ip = None;
+        }
 
         if changed_state && let Some(event) = event_for(state, id) {
             self.emit(event);
         }
-        self.measure_if_wanted(id);
+        self.measure_if_wanted(id, Duration::ZERO);
         self.look_up_if_wanted(id);
     }
 
@@ -575,7 +611,7 @@ impl<N: Network> Watcher<N> {
         speed.running = None;
         if std::mem::take(&mut speed.stale) {
             // Ran across a network change, so it measured part of each.
-            self.measure_interface(&interface);
+            self.measure_interface(&interface, Duration::ZERO);
             return;
         }
         match result {
@@ -590,33 +626,38 @@ impl<N: Network> Watcher<N> {
             }
             Err(err) => {
                 tracing::warn!(%interface, error = %format!("{err:#}"), "speed test failed");
-                // Retry through another address on the same interface, if one
-                // is up: an IPv6 route can fail where IPv4 works.
-                self.measure_interface(&interface);
+                // Retry after a pause, through an address not tried yet if
+                // one is up: an IPv6 route can fail where IPv4 works.
+                self.measure_interface(&interface, self.config.retry);
             }
         }
     }
 
-    /// Start `interface`'s speed test through the first of its addresses that
-    /// can take it.
-    fn measure_interface(&mut self, interface: &str) {
-        let ids: Vec<LinkId> = self
+    /// Start `interface`'s speed test after `wait`, through the first of its
+    /// addresses that can take it, preferring one not tried yet.
+    fn measure_interface(&mut self, interface: &str, wait: Duration) {
+        let tried = self
+            .speeds
+            .get(interface)
+            .map(|s| s.tried.clone())
+            .unwrap_or_default();
+        let (fresh, again): (Vec<LinkId>, Vec<LinkId>) = self
             .links
             .iter()
             .filter(|(_, e)| e.link.name == interface)
             .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            if self.measure_if_wanted(id) {
+            .partition(|id| !tried.contains(id));
+        for id in fresh.into_iter().chain(again) {
+            if self.measure_if_wanted(id, wait) {
                 break;
             }
         }
     }
 
     /// Give an up link its interface's speed, or start the interface's test
-    /// through it if none is known and none is running. Returns whether a
-    /// test started.
-    fn measure_if_wanted(&mut self, id: LinkId) -> bool {
+    /// through it, after `wait`, if none is known and none is running.
+    /// Returns whether a test started.
+    fn measure_if_wanted(&mut self, id: LinkId, wait: Duration) -> bool {
         let Some(e) = self.links.get_mut(&id) else {
             return false;
         };
@@ -638,9 +679,10 @@ impl<N: Network> Watcher<N> {
         self.next_job += 1;
         speed.running = Some(job);
         speed.attempts += 1;
+        speed.tried.insert(id);
         let interface = e.link.name.clone();
         let addr = e.link.addr.ip();
-        self.start_sample(interface, job, addr);
+        self.start_sample(interface, job, addr, wait);
         true
     }
 
@@ -675,8 +717,14 @@ impl<N: Network> Watcher<N> {
         }
         e.lookup = None;
         match result {
+            // Asked while the link worked, answered after it stopped: kept
+            // off a dead link, and looked up again if it recovers.
+            Ok(_) if e.link.state != LinkState::Up => {}
             Ok(public) => {
                 e.link.public_ip = Some(public);
+                // The tries are for a lookup that keeps failing; a link that
+                // goes down and up again gets them afresh.
+                e.lookup_attempts = 0;
                 self.changed = true;
             }
             Err(err) => {
@@ -685,49 +733,49 @@ impl<N: Network> Watcher<N> {
         }
     }
 
-    fn start_probe(&self, id: LinkId, addr: IpAddr) {
+    fn start_probe(&mut self, id: LinkId, addr: IpAddr) {
         let net = Arc::clone(&self.net);
-        let reports = self.reports_tx.clone();
         let limit = self.config.probe_timeout;
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             // The watcher enforces the limit itself rather than trusting
             // every `Network` to honour the timeout it is given.
             let result = match tokio::time::timeout(limit, net.probe(addr, limit)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("no probe answer within {limit:?}")),
             };
-            let _ = reports.send(Report::Probed(id, result));
+            Report::Probed(id, result)
         });
     }
 
-    fn start_sample(&self, interface: String, job: u64, addr: IpAddr) {
+    /// Start a speed test through `addr` after `wait`. It counts as running
+    /// while it waits, so nothing else starts meanwhile.
+    fn start_sample(&mut self, interface: String, job: u64, addr: IpAddr, wait: Duration) {
         let net = Arc::clone(&self.net);
-        let reports = self.reports_tx.clone();
         let budget = self.config.sample_budget;
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
+            tokio::time::sleep(wait).await;
             let limit = budget + Duration::from_secs(1);
             let result = match tokio::time::timeout(limit, net.sample(addr, budget)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("no speed test result within {limit:?}")),
             };
-            let _ = reports.send(Report::Sampled {
+            Report::Sampled {
                 interface,
                 job,
                 result,
-            });
+            }
         });
     }
 
-    fn start_lookup(&self, id: LinkId, job: u64, addr: IpAddr) {
+    fn start_lookup(&mut self, id: LinkId, job: u64, addr: IpAddr) {
         let net = Arc::clone(&self.net);
-        let reports = self.reports_tx.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let limit = LOOKUP_TIMEOUT;
             let result = match tokio::time::timeout(limit, net.public_ip(addr, limit)).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("no public address within {limit:?}")),
             };
-            let _ = reports.send(Report::LookedUp { id, job, result });
+            Report::LookedUp { id, job, result }
         });
     }
 

@@ -3,7 +3,8 @@
 //! `Fake` stands in for the outside world. Its interface list follows a
 //! script, one entry per poll, the last entry repeating. Its probe answers
 //! `Working` unless told otherwise, and can be told to fail or hang. Its speed
-//! test answers at once. Both count how often they were asked.
+//! test answers at once unless told to be slow or to fail. Both count how
+//! often they were asked.
 //!
 //! Shared by `links_watch.rs` and `links_handle.rs`, which each use a
 //! different part of it.
@@ -36,6 +37,12 @@ pub struct Fake {
     hangs: HashSet<IpAddr>,
     pub probes: AtomicUsize,
     pub samples: AtomicUsize,
+    /// Speed tests that ran to the end, rather than being stopped.
+    pub samples_finished: AtomicUsize,
+    /// The address each speed test went through, in order.
+    sampled_through: Mutex<Vec<IpAddr>>,
+    /// Addresses whose speed tests fail, after taking their usual time.
+    failing_samples: HashSet<IpAddr>,
     /// How long each speed test takes. Zero answers at once.
     sample_time: Duration,
     sampling_now: AtomicUsize,
@@ -85,6 +92,17 @@ impl Fake {
     pub fn hanging(mut self, ip: &str) -> Self {
         self.hangs.insert(ip.parse().unwrap());
         self
+    }
+
+    /// Every speed test through `ip` fails, as one over a route that cannot
+    /// carry a download does.
+    pub fn failing_samples(mut self, ip: &str) -> Self {
+        self.failing_samples.insert(ip.parse().unwrap());
+        self
+    }
+
+    pub fn sampled_through(&self) -> Vec<IpAddr> {
+        self.sampled_through.lock().unwrap().clone()
     }
 
     pub fn slow_samples(mut self, each: Duration) -> Self {
@@ -169,10 +187,12 @@ impl Network for Fake {
 
     fn sample(
         &self,
-        _addr: IpAddr,
+        addr: IpAddr,
         _budget: Duration,
     ) -> impl Future<Output = anyhow::Result<u64>> + Send {
         self.samples.fetch_add(1, Ordering::SeqCst);
+        self.sampled_through.lock().unwrap().push(addr);
+        let fail = self.failing_samples.contains(&addr);
         let (bps, takes) = {
             let mut answers = self.sample_answers.lock().unwrap();
             match answers.len() {
@@ -186,6 +206,10 @@ impl Network for Fake {
             self.most_at_once.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(takes).await;
             self.sampling_now.fetch_sub(1, Ordering::SeqCst);
+            self.samples_finished.fetch_add(1, Ordering::SeqCst);
+            if fail {
+                anyhow::bail!("scripted speed test failure");
+            }
             Ok(bps)
         }
     }
