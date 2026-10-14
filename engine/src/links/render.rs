@@ -11,7 +11,7 @@
 //! in the order cables first appeared, so rows do not jump about between
 //! redraws. **A cable's speed is shown once**, on its first row: on
 //! 2026-10-13 the phone held three addresses over one cable, and three
-//! copies of one figure invite adding them up (PLAN.md phase 2 item 11).
+//! copies of one figure invite adding them up (PLAN.md phase 3 item 11).
 //! Links on different cables behind one internet connection carry a `*`
 //! after their public address and a note under the table.
 
@@ -202,7 +202,8 @@ fn label(link: &Link) -> String {
     format!("{} {}", link.name, link.addr.ip())
 }
 
-fn state_word(state: LinkState) -> &'static str {
+/// The word for a state, in the table and in the UI's JSON alike.
+pub(crate) fn state_word(state: LinkState) -> &'static str {
     match state {
         LinkState::Probing => "probing",
         LinkState::Up => "up",
@@ -292,7 +293,7 @@ mod tests {
 
     // The table, beyond the plan.
 
-    /// Phase 2 item 11: the phone's addresses are one cable. Its speed is
+    /// Phase 3 item 11: the phone's addresses are one cable. Its speed is
     /// shown once, on the cable's first line, so nobody adds three copies.
     /// Its rows stay together even when another cable appeared in between.
     #[test]

@@ -11,6 +11,7 @@
 //! functions that can be tested without summoning a fake network adapter,
 //! which is most of what this phase needs to get right.
 
+pub mod api;
 pub mod links;
 
 pub use links::LinkHandle;

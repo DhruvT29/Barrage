@@ -1,4 +1,4 @@
-//! `LinkHandle`, the surface phase 2 consumes. All but the last test drive it
+//! `LinkHandle`, the surface phase 3 consumes. All but the last test drive it
 //! with the scripted network in `fake/mod.rs`; the last uses this machine.
 
 mod fake;
@@ -56,7 +56,7 @@ async fn usable_excludes_portal_down_and_unprobed_links() {
     assert_eq!(h.snapshot().len(), 4);
 }
 
-/// Phase 2 will have more than one listener: the scheduler, and later the UI.
+/// Phase 3 will have more than one listener: the scheduler, and later the UI.
 #[tokio::test]
 async fn every_subscriber_hears_every_event() {
     let net = Fake::scripted(vec![vec![], vec![cand("Wi-Fi", "192.0.2.10", true)]]);
@@ -69,7 +69,7 @@ async fn every_subscriber_hears_every_event() {
     assert_eq!(next(&mut b).await, heard);
 }
 
-/// Phase 2 will hear `Up(id)` and at once look the link up. If the event went
+/// Phase 3 will hear `Up(id)` and at once look the link up. If the event went
 /// out before the table changed, it would find the link still `Probing`.
 ///
 /// The listener is a plain thread checking constantly, as a UI thread might

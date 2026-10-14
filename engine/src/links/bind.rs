@@ -2,7 +2,7 @@
 //!
 //! Every request the engine makes through a chosen link gets its client here,
 //! so that "send it through this link" means the same thing everywhere: the
-//! probe, throughput sampling, and the phase 2 downloader.
+//! probe, throughput sampling, and the phase 3 downloader.
 //!
 //! THE TRAP UNDERNEATH BINDING
 //!
@@ -35,7 +35,7 @@
 //! Both callers so far treat a redirect as evidence: of a captive portal for
 //! the probe, of no measurement for sampling. A followed redirect would also
 //! slip past the family check, because `reqwest` would resolve the new host
-//! itself. Phase 2 will need redirects, since download links commonly bounce
+//! itself. Phase 3 will need redirects, since download links commonly bounce
 //! to a CDN, and must follow them by hand, calling `client` again for each new
 //! host.
 

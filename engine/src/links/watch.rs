@@ -49,7 +49,7 @@
 //! 15 over a healthy Wi-Fi ran past 3 s, the first after a pause, while the
 //! system looked the probe host up again (one lookup took 2,026 ms against a
 //! usual 25). Calling the link `Down` on that would hide a working link for
-//! 10 s, or make phase 2 drop one mid-download. Once a link is `Down` it is
+//! 10 s, or make phase 3 drop one mid-download. Once a link is `Down` it is
 //! probed at the normal pace again, so a dead link costs one probe per
 //! `reprobe`, not one a second.
 //!
@@ -65,7 +65,7 @@
 //!
 //! - The test runs once, when the first address on an interface comes up:
 //!   the user's choice on 2026-10-13, because each test is seconds of real
-//!   download, and through a phone that is real mobile data. Phase 2 will
+//!   download, and through a phone that is real mobile data. Phase 3 will
 //!   measure speed for free from actual download traffic.
 //! - An interface keeps its measured speed only while it stays on the same
 //!   network. Moving Wi-Fi to a new network removes every old address, so
