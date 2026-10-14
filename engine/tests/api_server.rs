@@ -1,15 +1,16 @@
 //! The API server, driven by the scripted network in `fake/mod.rs`: the JSON
-//! route, the live WebSocket, and who may use them.
+//! route, the live WebSocket, the page, the port, and who may use them.
 
 mod fake;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use barrage::LinkHandle;
 use barrage::api::live::Feed;
-use barrage::api::{LiveMessage, router, table_view};
+use barrage::api::{LiveMessage, app, bind, router, serve, table_view};
 use barrage::links::LinkState;
 use barrage::links::watch::{LinkTable, WatchConfig};
 use fake::{Fake, SAMPLED_BPS, cand, ms};
@@ -29,7 +30,7 @@ fn start(net: Fake) -> LinkHandle {
 }
 
 /// Serve the API for `table` on a free loopback port.
-async fn serve(table: LinkTable) -> SocketAddr {
+async fn serve_api(table: LinkTable) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(table)).await.unwrap() });
@@ -99,7 +100,7 @@ async fn links_returns_the_table_as_json() {
             .is_some_and(|l| l.state == LinkState::Up)
     })
     .await;
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
 
     let response = reqwest::get(format!("http://{addr}/api/links"))
         .await
@@ -119,7 +120,7 @@ async fn live_sends_the_table_first_then_each_change() {
     let mut steps = vec![vec![]; 20];
     steps.push(vec![cand("Wi-Fi", "192.0.2.10", true)]);
     let h = start(Fake::scripted(steps));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
     let mut socket = connect(addr).await;
 
     let first = frame(&mut socket).await;
@@ -143,7 +144,7 @@ async fn a_speed_arriving_is_sent_though_no_event_fires() {
     let mut steps = vec![vec![]; 10];
     steps.push(vec![cand("Wi-Fi", "192.0.2.10", true)]);
     let h = start(Fake::scripted(steps).slow_samples(ms(300)));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
     let mut socket = connect(addr).await;
     frame(&mut socket).await;
 
@@ -165,7 +166,7 @@ async fn closing_one_client_leaves_the_other_streaming() {
     let mut steps = vec![vec![]; 20];
     steps.push(vec![cand("Wi-Fi", "192.0.2.10", true)]);
     let h = start(Fake::scripted(steps));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
     let mut leaving = connect(addr).await;
     let mut staying = connect(addr).await;
     frame(&mut leaving).await;
@@ -231,7 +232,7 @@ async fn the_stream_ends_when_the_watcher_stops() {
         "192.0.2.10",
         true,
     )]]));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
     let mut socket = connect(addr).await;
     frame(&mut socket).await;
 
@@ -261,7 +262,7 @@ async fn the_stream_ends_when_the_watcher_stops() {
 #[tokio::test]
 async fn a_page_from_another_site_cannot_open_the_live_feed() {
     let h = start(Fake::scripted(vec![vec![]]));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
     let mut request = format!("ws://{addr}/api/live")
         .into_client_request()
         .unwrap();
@@ -279,7 +280,7 @@ async fn a_page_from_another_site_cannot_open_the_live_feed() {
 #[tokio::test]
 async fn this_machines_own_page_can_open_it() {
     let h = start(Fake::scripted(vec![vec![]]));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
     let mut request = format!("ws://{addr}/api/live")
         .into_client_request()
         .unwrap();
@@ -297,19 +298,174 @@ async fn this_machines_own_page_can_open_it() {
 #[tokio::test]
 async fn a_request_naming_another_host_is_refused() {
     let h = start(Fake::scripted(vec![vec![]]));
-    let addr = serve(h.table()).await;
+    let addr = serve_api(h.table()).await;
 
+    let status = status_with_host(addr, "/api/links", "attacker.example").await;
+    assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+}
+
+/// The status line of a GET for `path` whose Host header names `host`.
+/// Written by hand, since an HTTP client fills in Host from the address.
+async fn status_with_host(addr: SocketAddr, path: &str, host: &str) -> String {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let request = format!(
-        "GET /api/links HTTP/1.1\r\nHost: attacker.example:{}\r\nConnection: close\r\n\r\n",
+        "GET {path} HTTP/1.1\r\nHost: {host}:{}\r\nConnection: close\r\n\r\n",
         addr.port()
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut reply = String::new();
     stream.read_to_string(&mut reply).await.unwrap();
+    reply.lines().next().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn it_listens_on_loopback_only() {
+    let listener = bind(0).await.unwrap();
+    assert!(listener.local_addr().unwrap().ip().is_loopback());
+}
+
+/// Review Focus 4: `barrage` started twice, or the port taken by something
+/// else. One line naming the port and the way out, not a panic.
+#[tokio::test]
+async fn a_taken_port_is_a_clear_error() {
+    let first = bind(0).await.unwrap();
+    let port = first.local_addr().unwrap().port();
+    let err = format!("{:#}", bind(port).await.unwrap_err());
     assert!(
-        reply.starts_with("HTTP/1.1 403"),
-        "{}",
-        reply.lines().next().unwrap_or("")
+        err.contains(&port.to_string()) && err.contains("--port"),
+        "{err}"
     );
+}
+
+/// A directory standing in for `engine/static`, removed when dropped.
+struct StaticDir(PathBuf);
+
+impl StaticDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("barrage-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn write(&self, file: &str, text: &str) {
+        let path = self.0.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+impl Drop for StaticDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Serve the whole app, page and API, on a free loopback port.
+async fn serve_app(table: LinkTable, dir: &StaticDir) -> SocketAddr {
+    let listener = bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = app(table, dir.0.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+async fn get(url: String) -> (u16, String) {
+    let response = reqwest::get(url).await.unwrap();
+    (response.status().as_u16(), response.text().await.unwrap())
+}
+
+const PAGE: &str = "<h1>the page</h1>";
+
+#[tokio::test]
+async fn the_built_ui_is_served_with_a_fallback_to_index() {
+    let dir = StaticDir::new("built");
+    dir.write("index.html", PAGE);
+    dir.write("assets/app.js", "console.log('app')");
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_app(h.table(), &dir).await;
+
+    assert_eq!(get(format!("http://{addr}/")).await, (200, PAGE.into()));
+    assert_eq!(
+        get(format!("http://{addr}/assets/app.js")).await,
+        (200, "console.log('app')".into())
+    );
+    // An address the page handles itself, opened directly or reloaded.
+    assert_eq!(
+        get(format!("http://{addr}/links")).await,
+        (200, PAGE.into())
+    );
+    // The API still answers for itself.
+    let (status, body) = get(format!("http://{addr}/api/links")).await;
+    assert_eq!(status, 200);
+    assert!(body.starts_with("{\"links\""), "{body}");
+}
+
+/// Review Focus 5: a fresh clone, the engine built and the page not. Building
+/// it while the engine runs is enough: no restart.
+#[tokio::test]
+async fn an_unbuilt_ui_gets_a_page_saying_how_to_build_it() {
+    let dir = StaticDir::new("unbuilt");
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_app(h.table(), &dir).await;
+
+    let (status, body) = get(format!("http://{addr}/")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("pnpm") && body.contains("build"), "{body}");
+
+    dir.write("index.html", PAGE);
+    assert_eq!(get(format!("http://{addr}/")).await, (200, PAGE.into()));
+}
+
+/// What Ctrl+C does to `barrage`: every open page gets a close frame, so it
+/// can say the engine stopped, and the server returns rather than waiting
+/// on the pages.
+#[tokio::test]
+async fn stopping_closes_every_page_and_returns() {
+    let dir = StaticDir::new("stopping");
+    let listener = bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = start(Fake::scripted(vec![vec![cand(
+        "Wi-Fi",
+        "192.0.2.10",
+        true,
+    )]]));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(listener, h, dir.0.clone(), async {
+        let _ = stopped.await;
+    }));
+    let mut socket = connect(addr).await;
+    frame(&mut socket).await;
+
+    stop.send(()).unwrap();
+    let closed = timeout(Duration::from_secs(2), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(closed, Ok(true), "no close frame within 2 s of stopping");
+    let returned = timeout(Duration::from_secs(2), server).await;
+    assert!(
+        matches!(returned, Ok(Ok(Ok(())))),
+        "the server did not return within 2 s: {returned:?}"
+    );
+}
+
+/// The page is under the same rule as the API: this machine's own pages
+/// only, so DNS rebinding gets nothing from it either.
+#[tokio::test]
+async fn the_page_answers_only_this_machine_too() {
+    let dir = StaticDir::new("guarded");
+    dir.write("index.html", PAGE);
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_app(h.table(), &dir).await;
+
+    let status = status_with_host(addr, "/", "attacker.example").await;
+    assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+    assert_eq!(get(format!("http://{addr}/")).await, (200, PAGE.into()));
 }
