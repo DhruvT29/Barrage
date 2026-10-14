@@ -1,0 +1,4 @@
+# Install scripts stay blocked. esbuild's only places its native binary,
+# which esbuild also finds through its @esbuild/<platform> package.
+allowBuilds:
+  esbuild: false

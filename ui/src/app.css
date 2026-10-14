@@ -1,0 +1,95 @@
+/* BARRAGE: neon / futuristic, dark only. The tokens and the layout rules are
+   the Design section of plans/2026-10-14-phase-2-web-ui.md. Each colour has
+   one meaning. */
+:root {
+  --void: #000000;
+  --panel: #050912;
+  --edge: rgba(0, 229, 255, 0.28);
+  --text: #e8f6ff;
+  --dim: #6c8ba3;
+  --cyan: #00e5ff; /* working, speeds, the wordmark */
+  --yellow: #ffe14d; /* probing, portal */
+  --red: #ff3d6e; /* down */
+  --magenta: #ff2bd6; /* shared internet */
+  --glow-cyan: 0 0 5px rgba(0, 229, 255, 0.7), 0 0 16px rgba(0, 229, 255, 0.35);
+  --gutter: 24px;
+  --display: 'Oxanium', system-ui, sans-serif;
+  --body: 'Saira', system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+  background-color: var(--void);
+  background-image:
+    radial-gradient(ellipse 70% 40% at 50% -10%, rgba(0, 229, 255, 0.09), transparent 70%),
+    linear-gradient(rgba(0, 229, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 229, 255, 0.04) 1px, transparent 1px);
+  background-size: auto, 32px 32px, 32px 32px;
+  color: var(--text);
+  font-family: var(--body);
+  font-size: 14px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+/* One slim bar across the whole width: the name, the tabs, the connection. */
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  height: 52px;
+  padding: 0 var(--gutter);
+  border-bottom: 1px solid var(--edge);
+}
+
+.wordmark {
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 19px;
+  letter-spacing: 0.16em;
+  color: var(--cyan);
+  text-shadow: var(--glow-cyan);
+}
+
+.tabs {
+  display: flex;
+  gap: 20px;
+  align-self: stretch;
+}
+
+.tabs [role='tab'] {
+  display: flex;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--dim);
+  font: 600 13px var(--body);
+}
+
+.tabs [role='tab'][aria-selected='true'] {
+  color: var(--text);
+  border-bottom-color: var(--cyan);
+}
+
+.tabs [role='tab']:focus-visible {
+  outline: 1px solid var(--cyan);
+  outline-offset: 4px;
+}
+
+@media (max-width: 760px) {
+  :root {
+    --gutter: 16px;
+  }
+  .bar {
+    gap: 20px;
+  }
+}
