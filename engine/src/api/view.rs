@@ -9,8 +9,8 @@
 
 use serde::Serialize;
 
-use crate::links::render::{changes, state_word};
-use crate::links::{Link, shared_upstreams};
+use crate::links::render::{cable_speed, cables_in_order, changes, state_word};
+use crate::links::{Link, LinkState, shared_upstreams};
 
 /// One link: one address on one interface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,6 +36,40 @@ pub struct TableView {
     /// Groups of link ids on different cables that reach the internet
     /// through one connection. See [`shared_upstreams`].
     pub shared: Vec<Vec<u64>>,
+    pub combined: CombinedView,
+}
+
+/// The combined speed available: what using every connection at once could
+/// give, from what has been measured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CombinedView {
+    /// The sum of the parts, in bits per second. 0 only when there are no parts.
+    pub bps: u64,
+    /// One per independent connection, in the order its first cable appeared.
+    pub parts: Vec<CombinedPart>,
+    /// The cables left out of the sum, in table order, and why.
+    pub not_counted: Vec<NotCounted>,
+}
+
+/// One independent connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CombinedPart {
+    /// Its fastest cable.
+    pub name: String,
+    /// That cable's measured speed, in bits per second.
+    pub bps: u64,
+    /// The other measured cables that reach the internet through the same
+    /// connection, so are counted once, here.
+    pub shared_with: Vec<String>,
+}
+
+/// A cable that adds nothing to the sum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotCounted {
+    pub name: String,
+    /// `"not measured yet"` when it works, else its state word: `"portal"`,
+    /// `"probing"` or `"down"`.
+    pub why: &'static str,
 }
 
 /// What the live socket sends: the whole table when a client connects, then
@@ -59,7 +93,106 @@ pub fn table_view(links: &[Link]) -> TableView {
             .into_iter()
             .map(|group| group.into_iter().map(|id| id.as_u64()).collect())
             .collect(),
+        combined: combined(links),
     }
+}
+
+/// Each cable's speed, by [`cable_speed`]; cables that reach the internet
+/// through one connection (joined by [`shared_upstreams`], directly or through
+/// another cable) are one part, at the speed of the fastest.
+fn combined(links: &[Link]) -> CombinedView {
+    let mut measured: Vec<(&str, u64)> = Vec::new();
+    let mut not_counted = Vec::new();
+    for name in cables_in_order(links) {
+        let cable: Vec<&Link> = links.iter().filter(|l| l.name == name).collect();
+        match cable_speed(&cable) {
+            Some(bps) => measured.push((name, bps)),
+            None => not_counted.push(NotCounted {
+                name: name.to_string(),
+                why: why_not_counted(&cable),
+            }),
+        }
+    }
+
+    // Which connection each measured cable is on: start apart, then join
+    // every pair a shared group links, until nothing moves.
+    let groups: Vec<Vec<&str>> = shared_upstreams(links)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .filter_map(|id| links.iter().find(|l| l.id == id))
+                .map(|l| l.name.as_str())
+                .collect()
+        })
+        .collect();
+    let mut connection: Vec<usize> = (0..measured.len()).collect();
+    let mut moved = true;
+    while moved {
+        moved = false;
+        for group in &groups {
+            let members: Vec<usize> = (0..measured.len())
+                .filter(|&i| group.contains(&measured[i].0))
+                .collect();
+            let Some(lowest) = members.iter().map(|&i| connection[i]).min() else {
+                continue;
+            };
+            for &i in &members {
+                if connection[i] != lowest {
+                    connection[i] = lowest;
+                    moved = true;
+                }
+            }
+        }
+    }
+
+    // A connection is numbered by its first cable, so parts come out in the
+    // order their first cable appeared.
+    let mut parts = Vec::new();
+    for first in 0..measured.len() {
+        if connection[first] != first {
+            continue;
+        }
+        let members: Vec<(&str, u64)> = (0..measured.len())
+            .filter(|&i| connection[i] == first)
+            .map(|i| measured[i])
+            .collect();
+        // The fastest; the first of equals.
+        let (name, bps) = members
+            .iter()
+            .copied()
+            .reduce(|best, m| if m.1 > best.1 { m } else { best })
+            .expect("a connection has its first cable");
+        parts.push(CombinedPart {
+            name: name.to_string(),
+            bps,
+            shared_with: members
+                .iter()
+                .filter(|m| m.0 != name)
+                .map(|m| m.0.to_string())
+                .collect(),
+        });
+    }
+
+    CombinedView {
+        bps: parts.iter().map(|p| p.bps).sum(),
+        parts,
+        not_counted,
+    }
+}
+
+/// Why a cable with no usable figure adds nothing: it works but has not been
+/// measured, or its best state says it cannot be used.
+fn why_not_counted(cable: &[&Link]) -> &'static str {
+    if cable.iter().any(|l| l.state.is_usable()) {
+        return "not measured yet";
+    }
+    for state in [LinkState::Portal, LinkState::Probing] {
+        if cable.iter().any(|l| l.state == state) {
+            return state_word(state);
+        }
+    }
+    state_word(LinkState::Down)
 }
 
 /// The table after a change, with the lines `brg-links` would log for it.
@@ -135,7 +268,12 @@ mod tests {
                     "state": "up", "rtt_ms": 40, "down_bps": 57600000,
                     "public_ip": "203.0.113.7"
                 }],
-                "shared": []
+                "shared": [],
+                "combined": {
+                    "bps": 57600000,
+                    "parts": [{ "name": "Wi-Fi", "bps": 57600000, "shared_with": [] }],
+                    "not_counted": []
+                }
             })
         );
     }
@@ -217,6 +355,238 @@ mod tests {
         };
         assert!(!lines.is_empty());
         assert_eq!(lines, changes(&before, &after));
+    }
+
+    fn with_state(mut l: Link, state: LinkState) -> Link {
+        l.state = state;
+        l
+    }
+
+    fn combined_of(links: &[Link]) -> CombinedView {
+        table_view(links).combined
+    }
+
+    fn part(name: &str, bps: u64, shared_with: &[&str]) -> CombinedPart {
+        CombinedPart {
+            name: name.to_string(),
+            bps,
+            shared_with: shared_with.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn left_out(name: &str, why: &'static str) -> NotCounted {
+        NotCounted {
+            name: name.to_string(),
+            why,
+        }
+    }
+
+    #[test]
+    fn two_independent_cables_add_up() {
+        let links = [
+            up(1, "Wi-Fi", "192.0.2.10", 40, 57_600_000, "203.0.113.7"),
+            up(
+                2,
+                "Ethernet 2",
+                "198.51.100.20",
+                61,
+                162_500_000,
+                "203.0.113.9",
+            ),
+        ];
+        assert_eq!(
+            combined_of(&links),
+            CombinedView {
+                bps: 220_100_000,
+                parts: vec![
+                    part("Wi-Fi", 57_600_000, &[]),
+                    part("Ethernet 2", 162_500_000, &[])
+                ],
+                not_counted: vec![],
+            }
+        );
+    }
+
+    /// Two cables behind one public address are one connection: adding both
+    /// would promise speed that is not there.
+    #[test]
+    fn a_shared_group_counts_once_at_its_fastest() {
+        let links = [
+            up(1, "Wi-Fi", "192.0.2.10", 40, 41_000_000, "203.0.113.7"),
+            up(
+                2,
+                "Ethernet 2",
+                "198.51.100.20",
+                61,
+                162_500_000,
+                "203.0.113.9",
+            ),
+            up(
+                3,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                57_600_000,
+                "203.0.113.7",
+            ),
+        ];
+        let combined = combined_of(&links);
+        assert_eq!(combined.bps, 57_600_000 + 162_500_000);
+        // Named after its fastest cable, placed where its first cable appeared.
+        assert_eq!(
+            combined.parts,
+            vec![
+                part("Ethernet 3", 57_600_000, &["Wi-Fi"]),
+                part("Ethernet 2", 162_500_000, &[])
+            ]
+        );
+    }
+
+    /// Wi-Fi and Ethernet 2 share by IPv6, Ethernet 2 and Ethernet 3 by IPv4:
+    /// all three leave by one connection. The IPv4 group comes first, so one
+    /// pass over the groups is not enough to join Ethernet 3 to Wi-Fi.
+    #[test]
+    fn cables_joined_through_a_third_are_one_connection() {
+        let links = [
+            up(1, "Wi-Fi", "2001:db8::10", 40, 30_000_000, "2001:db8::1"),
+            up(
+                2,
+                "Ethernet 2",
+                "198.51.100.20",
+                61,
+                50_000_000,
+                "203.0.113.7",
+            ),
+            up(
+                3,
+                "Ethernet 2",
+                "2001:db8::20",
+                61,
+                50_000_000,
+                "2001:db8::1",
+            ),
+            up(
+                4,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                20_000_000,
+                "203.0.113.7",
+            ),
+        ];
+        let combined = combined_of(&links);
+        assert_eq!(combined.bps, 50_000_000);
+        assert_eq!(
+            combined.parts,
+            vec![part("Ethernet 2", 50_000_000, &["Wi-Fi", "Ethernet 3"])]
+        );
+    }
+
+    #[test]
+    fn a_down_or_unmeasured_cable_adds_nothing() {
+        let mut stale = up(
+            2,
+            "Ethernet 4",
+            "198.51.100.40",
+            1,
+            99_000_000,
+            "203.0.113.4",
+        );
+        stale.state = LinkState::Down;
+        let mut portal = up(
+            5,
+            "Ethernet 7",
+            "198.51.100.70",
+            1,
+            88_000_000,
+            "203.0.113.5",
+        );
+        portal.state = LinkState::Portal;
+        let links = [
+            up(1, "Wi-Fi", "192.0.2.10", 40, 57_600_000, "203.0.113.7"),
+            // A dead address can still hold the figure from before it died.
+            stale,
+            link(3, "Ethernet 5", "198.51.100.50", LinkState::Up),
+            link(4, "Ethernet 6", "198.51.100.60", LinkState::Probing),
+            portal,
+            // Working but unmeasured beats down when naming the reason.
+            link(6, "Ethernet 8", "198.51.100.80", LinkState::Down),
+            link(7, "Ethernet 8", "2001:db8::80", LinkState::Up),
+        ];
+        let combined = combined_of(&links);
+        assert_eq!(combined.bps, 57_600_000);
+        assert_eq!(combined.parts, vec![part("Wi-Fi", 57_600_000, &[])]);
+        assert_eq!(
+            combined.not_counted,
+            vec![
+                left_out("Ethernet 4", "down"),
+                left_out("Ethernet 5", "not measured yet"),
+                left_out("Ethernet 6", "probing"),
+                left_out("Ethernet 7", "portal"),
+                left_out("Ethernet 8", "not measured yet"),
+            ]
+        );
+    }
+
+    /// Degraded is usable (`LinkState::is_usable`): it still carries data,
+    /// so its speed is part of what is available.
+    #[test]
+    fn a_degraded_cable_counts() {
+        let links = [
+            up(1, "Wi-Fi", "192.0.2.10", 40, 57_600_000, "203.0.113.7"),
+            with_state(
+                up(
+                    2,
+                    "Ethernet 2",
+                    "198.51.100.20",
+                    900,
+                    9_000_000,
+                    "203.0.113.9",
+                ),
+                LinkState::Degraded,
+            ),
+        ];
+        assert_eq!(combined_of(&links).bps, 66_600_000);
+    }
+
+    #[test]
+    fn nothing_measured_gives_zero_and_no_parts() {
+        assert_eq!(
+            combined_of(&[]),
+            CombinedView {
+                bps: 0,
+                parts: vec![],
+                not_counted: vec![]
+            }
+        );
+        let probing = [link(1, "Wi-Fi", "192.0.2.10", LinkState::Probing)];
+        let combined = combined_of(&probing);
+        assert_eq!((combined.bps, combined.parts.len()), (0, 0));
+        assert_eq!(combined.not_counted, vec![left_out("Wi-Fi", "probing")]);
+    }
+
+    #[test]
+    fn the_combined_speed_in_json() {
+        let links = [
+            up(1, "Wi-Fi", "192.0.2.10", 40, 57_600_000, "203.0.113.7"),
+            up(
+                2,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                41_000_000,
+                "203.0.113.7",
+            ),
+            link(3, "Ethernet 4", "198.51.100.40", LinkState::Down),
+        ];
+        assert_eq!(
+            json_of(&links)["combined"],
+            json!({
+                "bps": 57600000,
+                "parts": [{ "name": "Wi-Fi", "bps": 57600000, "shared_with": ["Ethernet 3"] }],
+                "not_counted": [{ "name": "Ethernet 4", "why": "down" }]
+            })
+        );
     }
 
     /// An RTT-only change logs nothing, but the table still moves, so the

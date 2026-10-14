@@ -1,14 +1,8 @@
-/** The page: a header bar with the name and the tabs. Only tabs for what the
- * engine really does appear: Links now, others as their phases arrive. */
+import { useLive } from './api/useLive'
+import { Dashboard } from './links/Dashboard'
+
+/** The page: the dashboard, fed by the live connection to the engine that served it. */
 export default function App() {
-  return (
-    <header className="bar">
-      <h1 className="wordmark">BARRAGE</h1>
-      <nav className="tabs" role="tablist" aria-label="Views">
-        <button type="button" role="tab" aria-selected="true">
-          Links
-        </button>
-      </nav>
-    </header>
-  )
+  const live = useLive()
+  return <Dashboard status={live.status} table={live.table} feed={live.feed} />
 }

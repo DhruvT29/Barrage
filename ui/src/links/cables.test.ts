@@ -20,7 +20,7 @@ function link(name: string, address: string, fields: Partial<LinkView> = {}): Li
 }
 
 function table(links: LinkView[], shared: number[][] = []): TableView {
-  return { links, shared }
+  return { links, shared, combined: { bps: 0, parts: [], not_counted: [] } }
 }
 
 test('links on one cable make one card, in the order they appeared', () => {
@@ -56,9 +56,12 @@ test('the speed is shown once per cable, from a working address', () => {
     // The first working address with a figure, as render.rs's find_map.
     link('Ethernet 4', '198.51.100.40', { state: 'up', down_bps: null }),
     link('Ethernet 4', '2001:db8::40', { state: 'up', down_bps: 30_000_000 }),
+    // Degraded still carries data, so its figure is real; a portal's is not.
+    link('Ethernet 5', '198.51.100.50', { state: 'degraded', down_bps: 9_000_000 }),
+    link('Ethernet 6', '198.51.100.60', { state: 'portal', down_bps: 88_000_000 }),
   ])
 
-  expect(cables(t).map((c) => c.downBps)).toEqual([12_100_000, null, null, 30_000_000])
+  expect(cables(t).map((c) => c.downBps)).toEqual([12_100_000, null, null, 30_000_000, 9_000_000, null])
 })
 
 test("the cable's state is its best address's, with that address's rtt", () => {

@@ -31,12 +31,7 @@ pub fn render(links: &[Link]) -> String {
     let mut rows: Vec<[String; 6]> = vec![HEADER.map(String::from)];
     for name in cables_in_order(links) {
         let cable: Vec<&Link> = links.iter().filter(|l| l.name == name).collect();
-        // The cable's speed, from its working addresses: a dead address can
-        // still hold the figure from before it died.
-        let speed = cable
-            .iter()
-            .filter(|l| l.state == LinkState::Up)
-            .find_map(|l| l.down_bps);
+        let speed = cable_speed(&cable);
         for (i, link) in cable.iter().enumerate() {
             let first = i == 0;
             let mut public = public_text(link);
@@ -179,8 +174,19 @@ fn join_names(names: &[&str]) -> String {
     }
 }
 
+/// A cable's speed, from its first usable address that has one (`Up` or
+/// `Degraded`, [`LinkState::is_usable`]). A dead address, or a portal's, can
+/// still hold the figure from before; it is not one this cable can give now.
+/// The table here, the page's cards and the combined speed all use this rule.
+pub(crate) fn cable_speed(cable: &[&Link]) -> Option<u64> {
+    cable
+        .iter()
+        .filter(|l| l.state.is_usable())
+        .find_map(|l| l.down_bps)
+}
+
 /// Cable names in the order each first appears.
-fn cables_in_order(links: &[Link]) -> Vec<&str> {
+pub(crate) fn cables_in_order(links: &[Link]) -> Vec<&str> {
     let mut names: Vec<&str> = Vec::new();
     for link in links {
         if !names.contains(&link.name.as_str()) {
@@ -229,7 +235,7 @@ mod tests {
     use super::*;
     use crate::links::model::{Addr, LinkId};
 
-    use LinkState::{Down, Portal, Probing, Up};
+    use LinkState::{Degraded, Down, Portal, Probing, Up};
 
     fn link(
         id: u64,
@@ -342,6 +348,32 @@ mod tests {
         ]);
         assert!(out.lines().nth(1).unwrap().contains("12.1 Mbps"), "{out}");
         assert!(!out.contains("99.0 Mbps"), "{out}");
+    }
+
+    /// Degraded still carries data (`LinkState::is_usable`), so its figure
+    /// is a real one; a portal's is not.
+    #[test]
+    fn a_degraded_cables_speed_is_shown_a_portals_is_not() {
+        let out = render(&[
+            link(
+                1,
+                "Ethernet 2",
+                "192.0.2.20",
+                Degraded,
+                Some(900),
+                Some(9_000_000),
+            ),
+            link(
+                2,
+                "Ethernet 3",
+                "192.0.2.30",
+                Portal,
+                Some(30),
+                Some(88_000_000),
+            ),
+        ]);
+        assert!(out.lines().nth(1).unwrap().contains("9.0 Mbps"), "{out}");
+        assert!(!out.contains("88.0 Mbps"), "{out}");
     }
 
     #[test]

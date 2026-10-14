@@ -11,11 +11,14 @@ export type Cable = {
   state: LinkState
   /** That address's round trip, when it has one. */
   rttMs: number | null
-  /** The measured speed, from a working address; null until measured. */
+  /** The measured speed, from a usable address; null until measured. */
   downBps: number | null
   /** The other cables that reach the internet through the same connection. */
   sharedWith: string[]
 }
+
+/** The states that carry data, as the engine's `LinkState::is_usable`. */
+const USABLE: LinkState[] = ['up', 'degraded']
 
 /** Best first. Only for a cable's own addresses, never to rank cables. */
 const BEST: LinkState[] = ['up', 'degraded', 'portal', 'probing', 'down']
@@ -31,8 +34,9 @@ export function cables(table: TableView): Cable[] {
   return names.map((name) => {
     const links = table.links.filter((l) => l.name === name)
     const best = links.reduce((a, b) => (BEST.indexOf(b.state) < BEST.indexOf(a.state) ? b : a))
-    // As render.rs: a dead address can still hold the figure from before it died.
-    const speedFrom = links.find((l) => l.state === 'up' && l.down_bps !== null)
+    // As render.rs's cable_speed: the first usable address (up or degraded)
+    // with a figure. A dead address, or a portal's, can still hold one from before.
+    const speedFrom = links.find((l) => USABLE.includes(l.state) && l.down_bps !== null)
 
     const sharedWith: string[] = []
     for (const group of table.shared) {

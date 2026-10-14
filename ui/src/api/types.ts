@@ -24,6 +24,30 @@ export interface TableView {
   links: LinkView[]
   /** Groups of link ids on different cables that share one internet connection. */
   shared: number[][]
+  combined: CombinedView
+}
+
+/** The combined speed available, worked out by the engine. */
+export interface CombinedView {
+  /** The sum of the parts, in bits per second; 0 only when there are no parts. */
+  bps: number
+  /** One per independent connection, in the order its first cable appeared. */
+  parts: CombinedPart[]
+  /** The cables left out of the sum, and why. */
+  not_counted: NotCounted[]
+}
+
+export interface CombinedPart {
+  /** The connection's fastest cable. */
+  name: string
+  bps: number
+  /** The other measured cables on the same connection, counted once here. */
+  shared_with: string[]
+}
+
+export interface NotCounted {
+  name: string
+  why: 'not measured yet' | 'portal' | 'probing' | 'down'
 }
 
 /** What the live socket sends: the table on connect, then the table and its change lines on every change. */
