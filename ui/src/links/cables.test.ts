@@ -19,8 +19,8 @@ function link(name: string, address: string, fields: Partial<LinkView> = {}): Li
   }
 }
 
-function table(links: LinkView[], shared: number[][] = []): TableView {
-  return { links, shared, combined: { bps: 0, parts: [], not_counted: [] } }
+function table(links: LinkView[], shared: number[][] = [], connections: string[][] = []): TableView {
+  return { links, shared, connections, combined: { bps: 0, parts: [], not_counted: [] } }
 }
 
 test('links on one cable make one card, in the order they appeared', () => {
@@ -90,19 +90,26 @@ test("the cable's state is its best address's, with that address's rtt", () => {
   ])
 })
 
-test('a cable in a shared group names the other cables, once each', () => {
-  const wifi = link('Wi-Fi', '192.0.2.10', { public_ip: '203.0.113.7' })
+test("a cable names every other cable on its connection, as the engine joined them", () => {
   const wifi6 = link('Wi-Fi', '2001:db8::10', { public_ip: '2001:db8::1' })
   const eth2 = link('Ethernet 2', '198.51.100.20', { public_ip: '203.0.113.7' })
   const eth2v6 = link('Ethernet 2', '2001:db8::20', { public_ip: '2001:db8::1' })
   const eth3 = link('Ethernet 3', '198.51.100.30', { public_ip: '203.0.113.7' })
   const eth4 = link('Ethernet 4', '198.51.100.40', { public_ip: '203.0.113.9' })
-  // Wi-Fi and Ethernet 2 meet twice, once per family: still named once.
+  const eth5 = link('Ethernet 5', '198.51.100.50', { public_ip: '203.0.113.5' })
+  const eth6 = link('Ethernet 6', '198.51.100.60', { public_ip: '203.0.113.5' })
+  // Wi-Fi and Ethernet 3 share no address, but each shares one with
+  // Ethernet 2, so all three are one connection, as the combined speed counts them.
   const t = table(
-    [wifi, wifi6, eth2, eth2v6, eth3, eth4],
+    [wifi6, eth2, eth2v6, eth3, eth4, eth5, eth6],
     [
-      [wifi.id, eth2.id, eth3.id],
+      [eth5.id, eth6.id],
+      [eth2.id, eth3.id],
       [wifi6.id, eth2v6.id],
+    ],
+    [
+      ['Wi-Fi', 'Ethernet 2', 'Ethernet 3'],
+      ['Ethernet 5', 'Ethernet 6'],
     ],
   )
 
@@ -111,6 +118,8 @@ test('a cable in a shared group names the other cables, once each', () => {
     ['Wi-Fi', 'Ethernet 3'],
     ['Wi-Fi', 'Ethernet 2'],
     [],
+    ['Ethernet 6'],
+    ['Ethernet 5'],
   ])
 })
 

@@ -13,7 +13,7 @@ export type Cable = {
   rttMs: number | null
   /** The measured speed, from a usable address; null until measured. */
   downBps: number | null
-  /** The other cables that reach the internet through the same connection. */
+  /** The other cables that reach the internet through the same connection, directly or through another cable. */
   sharedWith: string[]
 }
 
@@ -29,8 +29,6 @@ export function cables(table: TableView): Cable[] {
   for (const link of table.links) {
     if (!names.includes(link.name)) names.push(link.name)
   }
-  const nameOf = new Map(table.links.map((l) => [l.id, l.name]))
-
   return names.map((name) => {
     const links = table.links.filter((l) => l.name === name)
     const best = links.reduce((a, b) => (BEST.indexOf(b.state) < BEST.indexOf(a.state) ? b : a))
@@ -38,14 +36,10 @@ export function cables(table: TableView): Cable[] {
     // with a figure. A dead address, or a portal's, can still hold one from before.
     const speedFrom = links.find((l) => USABLE.includes(l.state) && l.down_bps !== null)
 
-    const sharedWith: string[] = []
-    for (const group of table.shared) {
-      const groupNames = group.map((id) => nameOf.get(id))
-      if (!groupNames.includes(name)) continue
-      for (const other of groupNames) {
-        if (other !== undefined && other !== name && !sharedWith.includes(other)) sharedWith.push(other)
-      }
-    }
+    // The engine joins cables into connections once, the same way the
+    // combined speed counts them, so the card and the total cannot disagree.
+    const connection = table.connections.find((cables) => cables.includes(name)) ?? []
+    const sharedWith = connection.filter((other) => other !== name)
 
     return {
       name,

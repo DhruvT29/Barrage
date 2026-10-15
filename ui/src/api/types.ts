@@ -24,6 +24,8 @@ export interface TableView {
   links: LinkView[]
   /** Groups of link ids on different cables that share one internet connection. */
   shared: number[][]
+  /** The cables on each shared connection, by name: joined directly or through another cable, measured or not. */
+  connections: string[][]
   combined: CombinedView
 }
 

@@ -24,7 +24,7 @@ function link(name: string, address: string, fields: Partial<LinkView> = {}): Li
 const NOTHING: CombinedView = { bps: 0, parts: [], not_counted: [] }
 
 function table(links: LinkView[], fields: Partial<TableView> = {}): TableView {
-  return { links, shared: [], combined: NOTHING, ...fields }
+  return { links, shared: [], connections: [], combined: NOTHING, ...fields }
 }
 
 function show(status: Status, t: TableView | null, feed: FeedLine[] = []) {

@@ -21,6 +21,7 @@ vi.mock('./api/useLive', () => ({
         },
       ],
       shared: [],
+      connections: [],
       combined: { bps: 57_600_000, parts: [{ name: 'Wi-Fi', bps: 57_600_000, shared_with: [] }], not_counted: [] },
     },
     feed: [],

@@ -66,7 +66,7 @@ function link(id: number, name: string): LinkView {
 }
 
 function table(...links: LinkView[]): TableView {
-  return { links, shared: [], combined: { bps: 0, parts: [], not_counted: [] } }
+  return { links, shared: [], connections: [], combined: { bps: 0, parts: [], not_counted: [] } }
 }
 
 const after = (ms: number) => act(() => vi.advanceTimersByTime(ms))

@@ -36,6 +36,10 @@ pub struct TableView {
     /// Groups of link ids on different cables that reach the internet
     /// through one connection. See [`shared_upstreams`].
     pub shared: Vec<Vec<u64>>,
+    /// The cables on each shared connection, by name, in table order: joined
+    /// by [`shared_upstreams`] directly or through another cable, measured or
+    /// not. Only connections of two or more cables are listed.
+    pub connections: Vec<Vec<String>>,
     pub combined: CombinedView,
 }
 
@@ -93,13 +97,67 @@ pub fn table_view(links: &[Link]) -> TableView {
             .into_iter()
             .map(|group| group.into_iter().map(|id| id.as_u64()).collect())
             .collect(),
+        connections: connections(links)
+            .into_iter()
+            .map(|cables| cables.into_iter().map(String::from).collect())
+            .collect(),
         combined: combined(links),
     }
 }
 
-/// Each cable's speed, by [`cable_speed`]; cables that reach the internet
-/// through one connection (joined by [`shared_upstreams`], directly or through
-/// another cable) are one part, at the speed of the fastest.
+/// The cables that reach the internet through one connection: two cables
+/// [`shared_upstreams`] puts in a group are on one, and so is a cable joined to
+/// either through another. A cable joins whether or not it has been measured,
+/// since sharing comes from public addresses, not speeds. Each connection
+/// lists its cables in table order, and connections come in the order their
+/// first cable appeared. A cable that shares with nobody is in none.
+fn connections(links: &[Link]) -> Vec<Vec<&str>> {
+    let names = cables_in_order(links);
+    let groups: Vec<Vec<usize>> = shared_upstreams(links)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .filter_map(|id| links.iter().find(|l| l.id == id))
+                .filter_map(|l| names.iter().position(|&n| n == l.name))
+                .collect()
+        })
+        .collect();
+
+    // Which connection each cable is on: start apart, then join every pair a
+    // shared group links, until nothing moves.
+    let mut connection: Vec<usize> = (0..names.len()).collect();
+    let mut moved = true;
+    while moved {
+        moved = false;
+        for group in &groups {
+            let Some(lowest) = group.iter().map(|&i| connection[i]).min() else {
+                continue;
+            };
+            for &i in group {
+                if connection[i] != lowest {
+                    connection[i] = lowest;
+                    moved = true;
+                }
+            }
+        }
+    }
+
+    // A connection is numbered by its first cable.
+    (0..names.len())
+        .filter(|&first| connection[first] == first)
+        .map(|first| {
+            (0..names.len())
+                .filter(|&i| connection[i] == first)
+                .map(|i| names[i])
+                .collect::<Vec<&str>>()
+        })
+        .filter(|cables| cables.len() > 1)
+        .collect()
+}
+
+/// Each cable's speed, by [`cable_speed`]; the measured cables on one of the
+/// [`connections`] are one part, at the speed of the fastest.
 fn combined(links: &[Link]) -> CombinedView {
     let mut measured: Vec<(&str, u64)> = Vec::new();
     let mut not_counted = Vec::new();
@@ -114,40 +172,22 @@ fn combined(links: &[Link]) -> CombinedView {
         }
     }
 
-    // Which connection each measured cable is on: start apart, then join
-    // every pair a shared group links, until nothing moves.
-    let groups: Vec<Vec<&str>> = shared_upstreams(links)
-        .into_iter()
-        .map(|group| {
-            group
-                .into_iter()
-                .filter_map(|id| links.iter().find(|l| l.id == id))
-                .map(|l| l.name.as_str())
-                .collect()
+    // Each measured cable is numbered by the first measured cable on its
+    // connection, or by itself when it shares with nobody. Parts come out in
+    // the order their first measured cable appeared.
+    let shared = connections(links);
+    let connection: Vec<usize> = measured
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, _))| {
+            let on = shared.iter().find(|cables| cables.contains(&name));
+            measured
+                .iter()
+                .position(|m| on.is_some_and(|cables| cables.contains(&m.0)))
+                .unwrap_or(i)
         })
         .collect();
-    let mut connection: Vec<usize> = (0..measured.len()).collect();
-    let mut moved = true;
-    while moved {
-        moved = false;
-        for group in &groups {
-            let members: Vec<usize> = (0..measured.len())
-                .filter(|&i| group.contains(&measured[i].0))
-                .collect();
-            let Some(lowest) = members.iter().map(|&i| connection[i]).min() else {
-                continue;
-            };
-            for &i in &members {
-                if connection[i] != lowest {
-                    connection[i] = lowest;
-                    moved = true;
-                }
-            }
-        }
-    }
 
-    // A connection is numbered by its first cable, so parts come out in the
-    // order their first cable appeared.
     let mut parts = Vec::new();
     for first in 0..measured.len() {
         if connection[first] != first {
@@ -269,6 +309,7 @@ mod tests {
                     "public_ip": "203.0.113.7"
                 }],
                 "shared": [],
+                "connections": [],
                 "combined": {
                     "bps": 57600000,
                     "parts": [{ "name": "Wi-Fi", "bps": 57600000, "shared_with": [] }],
@@ -479,6 +520,107 @@ mod tests {
         assert_eq!(
             combined.parts,
             vec![part("Ethernet 2", 50_000_000, &["Wi-Fi", "Ethernet 3"])]
+        );
+    }
+
+    /// Working, with a public address, but no speed yet.
+    fn unmeasured(id: u64, name: &str, addr: &str, public: &str) -> Link {
+        Link {
+            public_ip: Some(public.parse().unwrap()),
+            ..link(id, name, addr, LinkState::Up)
+        }
+    }
+
+    /// The cable in the middle joins the other two whether or not it has
+    /// been measured, so measuring it cannot lower the total.
+    #[test]
+    fn an_unmeasured_cable_still_joins_the_two_it_links() {
+        let links = [
+            up(1, "Wi-Fi", "2001:db8::10", 40, 30_000_000, "2001:db8::1"),
+            unmeasured(2, "Ethernet 2", "198.51.100.20", "203.0.113.7"),
+            unmeasured(3, "Ethernet 2", "2001:db8::20", "2001:db8::1"),
+            up(
+                4,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                20_000_000,
+                "203.0.113.7",
+            ),
+        ];
+        let combined = combined_of(&links);
+        assert_eq!(combined.bps, 30_000_000);
+        assert_eq!(
+            combined.parts,
+            vec![part("Wi-Fi", 30_000_000, &["Ethernet 3"])]
+        );
+        assert_eq!(
+            combined.not_counted,
+            vec![left_out("Ethernet 2", "not measured yet")]
+        );
+    }
+
+    /// The cards' "shared with" and the combined speed join cables the same
+    /// way: directly or through a third, measured or not.
+    #[test]
+    fn connections_join_cables_directly_or_through_a_third() {
+        let links = [
+            up(1, "Wi-Fi", "2001:db8::10", 40, 30_000_000, "2001:db8::1"),
+            up(
+                2,
+                "Ethernet 2",
+                "198.51.100.20",
+                61,
+                50_000_000,
+                "203.0.113.7",
+            ),
+            up(
+                3,
+                "Ethernet 2",
+                "2001:db8::20",
+                61,
+                50_000_000,
+                "2001:db8::1",
+            ),
+            up(
+                4,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                20_000_000,
+                "203.0.113.7",
+            ),
+            up(
+                5,
+                "Ethernet 4",
+                "198.51.100.40",
+                30,
+                9_000_000,
+                "203.0.113.9",
+            ),
+            unmeasured(6, "Ethernet 5", "198.51.100.50", "203.0.113.5"),
+            unmeasured(7, "Ethernet 6", "198.51.100.60", "203.0.113.5"),
+        ];
+        assert_eq!(
+            json_of(&links)["connections"],
+            json!([
+                ["Wi-Fi", "Ethernet 2", "Ethernet 3"],
+                ["Ethernet 5", "Ethernet 6"]
+            ])
+        );
+    }
+
+    #[test]
+    fn connections_come_in_the_order_their_first_cable_appeared() {
+        let links = [
+            unmeasured(1, "Wi-Fi", "192.0.2.10", "203.0.113.7"),
+            unmeasured(2, "Ethernet 2", "198.51.100.20", "203.0.113.9"),
+            unmeasured(3, "Ethernet 3", "198.51.100.30", "203.0.113.9"),
+            unmeasured(4, "Ethernet 4", "198.51.100.40", "203.0.113.7"),
+        ];
+        assert_eq!(
+            json_of(&links)["connections"],
+            json!([["Wi-Fi", "Ethernet 4"], ["Ethernet 2", "Ethernet 3"]])
         );
     }
 

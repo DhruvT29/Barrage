@@ -604,6 +604,12 @@ impl<N: Network> Watcher<N> {
             // dead one showing them would count capacity that is not there.
             // The speed stays with the cable and comes back with the link;
             // the public address is looked up again.
+            //
+            // Only Up keeps them, here and in `sampled`, `measure_if_wanted`,
+            // `look_up_if_wanted` and `looked_up`. Nothing sets Degraded yet;
+            // the phase that does must let it keep them too, since it is
+            // usable (`LinkState::is_usable`) and the cards and the combined
+            // speed already count a degraded cable's figure.
             e.link.down_bps = None;
             e.link.public_ip = None;
         }
