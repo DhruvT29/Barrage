@@ -150,7 +150,7 @@ async fn a_new_link_whose_first_probe_fails_is_tried_again_before_it_is_called_d
     assert_eq!(table.snapshot()[0].state, LinkState::Up);
 }
 
-/// The same for a link already in use: phase 2 would drop it, and the
+/// The same for a link already in use: phase 3 would drop it, and the
 /// download through it, over one slow probe. Two failures with a success in
 /// between are not "in a row" either.
 #[tokio::test]

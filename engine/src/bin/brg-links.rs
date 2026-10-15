@@ -14,17 +14,14 @@
 //! redrawing: a fresh table is printed each time the table changes.
 
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use barrage::LinkHandle;
 use barrage::links::render::{changes, render};
 use barrage::links::{Link, LinkState};
-use tracing_subscriber::filter::Targets;
-use tracing_subscriber::prelude::*;
 
 const USAGE: &str = "usage: brg-links [--log FILE]";
 
@@ -52,7 +49,7 @@ async fn run() -> anyhow::Result<()> {
         Args::Run { log } => log,
     };
     if let Some(path) = &log {
-        start_log(path)?;
+        barrage::logging::to_file(path, &["brg_links"])?;
     }
     let handle = LinkHandle::start(Duration::from_secs(1))?;
     tracing::info!("started");
@@ -98,29 +95,6 @@ fn parse_args() -> anyhow::Result<Args> {
         }
     }
     Ok(Args::Run { log })
-}
-
-/// Send the watcher's notes and this program's change lines to `path`,
-/// appending, so a second run does not erase the first.
-fn start_log(path: &Path) -> anyhow::Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("cannot open the log file {}", path.display()))?;
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(Mutex::new(file)),
-        )
-        .with(
-            Targets::new()
-                .with_target("barrage", tracing::Level::DEBUG)
-                .with_target("brg_links", tracing::Level::INFO),
-        )
-        .init();
-    Ok(())
 }
 
 /// The line above the table. The running clock shows the program is alive

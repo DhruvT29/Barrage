@@ -1,4 +1,4 @@
-//! `LinkHandle`, the surface phase 2 consumes. All but the last test drive it
+//! `LinkHandle`, the surface phase 3 consumes. All but the last test drive it
 //! with the scripted network in `fake/mod.rs`; the last uses this machine.
 
 mod fake;
@@ -56,7 +56,7 @@ async fn usable_excludes_portal_down_and_unprobed_links() {
     assert_eq!(h.snapshot().len(), 4);
 }
 
-/// Phase 2 will have more than one listener: the scheduler, and later the UI.
+/// Phase 3 will have more than one listener: the scheduler, and later the UI.
 #[tokio::test]
 async fn every_subscriber_hears_every_event() {
     let net = Fake::scripted(vec![vec![], vec![cand("Wi-Fi", "192.0.2.10", true)]]);
@@ -69,7 +69,7 @@ async fn every_subscriber_hears_every_event() {
     assert_eq!(next(&mut b).await, heard);
 }
 
-/// Phase 2 will hear `Up(id)` and at once look the link up. If the event went
+/// Phase 3 will hear `Up(id)` and at once look the link up. If the event went
 /// out before the table changed, it would find the link still `Probing`.
 ///
 /// The listener is a plain thread checking constantly, as a UI thread might
@@ -189,6 +189,29 @@ async fn dropping_the_handle_stops_its_speed_tests() {
         0,
         "a speed test ran on after the handle was dropped"
     );
+}
+
+/// The API's live feed follows the table itself, since a speed or a public
+/// address arriving changes it without any event. A copy of the table wakes
+/// on each change and stops waiting once the watcher has gone, though it
+/// never kept the watcher alive.
+#[tokio::test]
+async fn a_table_copy_wakes_on_each_change_and_ends_with_the_watcher() {
+    let net = Fake::scripted(vec![vec![], vec![cand("Wi-Fi", "192.0.2.10", true)]]);
+    let h = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(50))).unwrap();
+    let mut table = h.table();
+    assert!(table.latest().is_empty());
+
+    let woke = timeout(Duration::from_secs(2), table.changed()).await;
+    assert_eq!(woke, Ok(true), "no change seen within 2 s");
+    assert_eq!(table.latest()[0].name, "Wi-Fi");
+
+    drop(h);
+    let ended = timeout(Duration::from_secs(2), async {
+        while table.changed().await {}
+    })
+    .await;
+    assert!(ended.is_ok(), "still waiting 2 s after the watcher stopped");
 }
 
 #[test]

@@ -49,7 +49,7 @@
 //! 15 over a healthy Wi-Fi ran past 3 s, the first after a pause, while the
 //! system looked the probe host up again (one lookup took 2,026 ms against a
 //! usual 25). Calling the link `Down` on that would hide a working link for
-//! 10 s, or make phase 2 drop one mid-download. Once a link is `Down` it is
+//! 10 s, or make phase 3 drop one mid-download. Once a link is `Down` it is
 //! probed at the normal pace again, so a dead link costs one probe per
 //! `reprobe`, not one a second.
 //!
@@ -65,7 +65,7 @@
 //!
 //! - The test runs once, when the first address on an interface comes up:
 //!   the user's choice on 2026-10-13, because each test is seconds of real
-//!   download, and through a phone that is real mobile data. Phase 2 will
+//!   download, and through a phone that is real mobile data. Phase 3 will
 //!   measure speed for free from actual download traffic.
 //! - An interface keeps its measured speed only while it stays on the same
 //!   network. Moving Wi-Fi to a new network removes every old address, so
@@ -247,6 +247,22 @@ impl LinkTable {
     /// Copies out and returns at once; it never waits on the watcher.
     pub fn snapshot(&self) -> Vec<Link> {
         self.0.borrow().clone()
+    }
+
+    /// The links as of now, like [`snapshot`](Self::snapshot), and marked as
+    /// seen, so [`changed`](Self::changed) waits for the next change.
+    pub fn latest(&mut self) -> Vec<Link> {
+        self.0.borrow_and_update().clone()
+    }
+
+    /// Wait until the table differs from the one last seen. Returns `false`
+    /// once the watcher has stopped and nothing newer will come.
+    ///
+    /// Changes made while nobody was waiting are not queued: the next call
+    /// returns at once and [`latest`](Self::latest) gives the newest table,
+    /// so a slow reader skips ahead rather than falling behind. Cancel safe.
+    pub async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
     }
 }
 
@@ -588,6 +604,12 @@ impl<N: Network> Watcher<N> {
             // dead one showing them would count capacity that is not there.
             // The speed stays with the cable and comes back with the link;
             // the public address is looked up again.
+            //
+            // Only Up keeps them, here and in `sampled`, `measure_if_wanted`,
+            // `look_up_if_wanted` and `looked_up`. Nothing sets Degraded yet;
+            // the phase that does must let it keep them too, since it is
+            // usable (`LinkState::is_usable`) and the cards and the combined
+            // speed already count a degraded cable's figure.
             e.link.down_bps = None;
             e.link.public_ip = None;
         }
