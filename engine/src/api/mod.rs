@@ -4,7 +4,8 @@
 //! The UI is a separate program in another language, so the JSON here is a
 //! contract. `view` decides what a link looks like on the wire and is pure,
 //! like `links::render` is for the terminal. `live` streams it, and `guard`
-//! keeps every route, the page included, to this machine's own pages.
+//! keeps every route, the page included, to this machine's own pages and out
+//! of other pages' frames.
 
 pub mod guard;
 pub mod live;
@@ -19,7 +20,7 @@ use anyhow::Context as _;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router, middleware};
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
@@ -45,8 +46,9 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 }
 
 /// The API alone: `GET /api/links`, the table as JSON, and `GET /api/live`,
-/// the table as a WebSocket stream of [`LiveMessage`]s. Every route answers
-/// only this machine's own pages ([`guard`]).
+/// the table as a WebSocket stream of [`LiveMessage`]s. Any other address
+/// under `/api` answers `404`. Every route answers only this machine's own
+/// pages, and none may be framed ([`guard`]).
 ///
 /// It holds a copy of the table, never the [`LinkHandle`]. A reader does not
 /// keep the watcher alive, so stopping the engine ends every live stream,
@@ -97,7 +99,20 @@ fn api(table: LinkTable) -> Router {
     Router::new()
         .route("/api/links", get(links))
         .route("/api/live", get(live::upgrade))
+        // Any other address under /api is a route this engine does not have,
+        // a typo or one a newer page expects. Left to the page's fallback it
+        // would answer 200 with index.html, which a JSON client cannot read.
+        .route("/api", any(no_such_route))
+        .route("/api/", any(no_such_route))
+        .route("/api/{*rest}", any(no_such_route))
         .with_state(table)
+}
+
+async fn no_such_route() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "no such API route" })),
+    )
 }
 
 fn guarded(router: Router) -> Router {

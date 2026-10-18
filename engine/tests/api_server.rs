@@ -318,6 +318,25 @@ async fn status_with_host(addr: SocketAddr, path: &str, host: &str) -> String {
     reply.lines().next().unwrap_or_default().to_string()
 }
 
+/// Browsers send no Origin on an `<img>`, `<script>` or frame load, or on a
+/// navigation, so a page on another site can send GETs that pass the Host
+/// and Origin checks. `Sec-Fetch-Site` names where those came from too.
+#[tokio::test]
+async fn an_image_tag_on_another_site_cannot_read_the_api() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+
+    for site in ["cross-site", "same-site"] {
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/api/links"))
+            .header("sec-fetch-site", site)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "{site}");
+    }
+}
+
 #[tokio::test]
 async fn it_listens_on_loopback_only() {
     let listener = bind(0).await.unwrap();
@@ -468,4 +487,71 @@ async fn the_page_answers_only_this_machine_too() {
     let status = status_with_host(addr, "/", "attacker.example").await;
     assert!(status.starts_with("HTTP/1.1 403"), "{status}");
     assert_eq!(get(format!("http://{addr}/")).await, (200, PAGE.into()));
+}
+
+/// Another site's page must not show the dashboard inside a frame of its
+/// own, where a disguised click could press the dashboard's buttons. Every
+/// answer says so, refusals included.
+#[tokio::test]
+async fn every_answer_forbids_framing() {
+    let dir = StaticDir::new("framing");
+    dir.write("index.html", PAGE);
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_app(h.table(), &dir).await;
+    let client = reqwest::Client::new();
+
+    let answers = [
+        ("the page", client.get(format!("http://{addr}/")), 200),
+        (
+            "the API",
+            client.get(format!("http://{addr}/api/links")),
+            200,
+        ),
+        (
+            "a refusal",
+            client
+                .get(format!("http://{addr}/api/links"))
+                .header("sec-fetch-site", "cross-site"),
+            403,
+        ),
+        (
+            "an unknown API route",
+            client.get(format!("http://{addr}/api/link")),
+            404,
+        ),
+    ];
+    for (what, request, status) in answers {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), status, "{what}");
+        let header = |name| response.headers().get(name)?.to_str().ok();
+        assert_eq!(header("x-frame-options"), Some("DENY"), "{what}");
+        assert_eq!(
+            header("content-security-policy"),
+            Some("frame-ancestors 'none'"),
+            "{what}"
+        );
+    }
+}
+
+/// A typo, or a route a newer page expects from an older engine, must say
+/// there is no such route. Answering 200 with the page leaves a JSON client
+/// with a parse error instead.
+#[tokio::test]
+async fn an_unknown_api_route_is_404_not_the_page() {
+    let dir = StaticDir::new("api-404");
+    dir.write("index.html", PAGE);
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_app(h.table(), &dir).await;
+
+    for path in ["/api/link", "/api", "/api/", "/api/links/extra"] {
+        let (status, body) = get(format!("http://{addr}{path}")).await;
+        assert_eq!(status, 404, "{path}");
+        let json: Value = serde_json::from_str(&body).unwrap_or_else(|_| panic!("{path}: {body}"));
+        assert!(json["error"].is_string(), "{path}: {body}");
+    }
+    // An address the page routes for itself still gets the page.
+    assert_eq!(
+        get(format!("http://{addr}/some/view")).await,
+        (200, PAGE.into())
+    );
 }
