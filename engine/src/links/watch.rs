@@ -121,6 +121,14 @@ pub trait Network: Send + Sync + 'static {
     /// Every address on every interface, unjudged.
     fn enumerate(&self) -> anyhow::Result<Vec<Candidate>>;
 
+    /// Of the candidates [`enumerate`](Self::enumerate) returned, those worth
+    /// probing: what [`usable`] keeps, unless a network says otherwise. Only a
+    /// scripted one does, keeping loopback addresses as stand-ins for real
+    /// links, so tests can carry real downloads over 127.0.0.x.
+    fn usable(&self, all: &[Candidate]) -> Vec<Candidate> {
+        usable(all)
+    }
+
     /// Probe the internet through the link that owns `addr`.
     fn probe(
         &self,
@@ -404,7 +412,7 @@ impl<N: Network> Watcher<N> {
 
     fn poll(&mut self) {
         let candidates = match self.net.enumerate() {
-            Ok(all) => usable(&all),
+            Ok(all) => self.net.usable(&all),
             Err(e) => {
                 // Says nothing about the links themselves; keep what we know.
                 tracing::warn!(error = %format!("{e:#}"), "interface list unavailable this poll");

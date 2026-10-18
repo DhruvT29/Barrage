@@ -164,29 +164,27 @@ fn describe(url: Url, response: &Response) -> anyhow::Result<Remote> {
 }
 
 /// The whole file's length from a 206 answer to the probe, `None` if the
-/// server does not know it. The answer must hold exactly the bytes asked for,
-/// or less when the file is shorter than the probe: a server that answers a
-/// range with other bytes would put every later piece in the wrong place.
+/// server does not know it. The answer must start at byte 0, where the probe
+/// asked, and end inside the file: a server that answers with other bytes
+/// does not honour ranges. It may hold more or fewer bytes than asked, as
+/// some servers send: the body is never read, and every piece of the
+/// download is checked again as it arrives, its own bytes alone written.
 fn probed_length(headers: &HeaderMap) -> anyhow::Result<Option<u64>> {
     let text =
         header_text(headers, CONTENT_RANGE).context("a 206 answer without a Content-Range")?;
     let (start, end, total) = content_range(text)
         .with_context(|| format!("a 206 answer with an unreadable Content-Range {text:?}"))?;
-    let last = PROBE_BYTES - 1;
-    let asked = match total {
-        Some(total) => total > 0 && end == last.min(total - 1),
-        None => end <= last,
-    };
     ensure!(
-        start == 0 && asked,
-        "asked for bytes 0-{last}, the Content-Range says {text:?}"
+        start == 0 && total.is_none_or(|total| end < total),
+        "asked for bytes 0-{}, the Content-Range says {text:?}",
+        PROBE_BYTES - 1
     );
     Ok(total)
 }
 
 /// `bytes START-END/TOTAL` as (start, end, total), the total `None` when it
 /// is `*`, unknown.
-fn content_range(text: &str) -> Option<(u64, u64, Option<u64>)> {
+pub(crate) fn content_range(text: &str) -> Option<(u64, u64, Option<u64>)> {
     let (unit, rest) = text.trim().split_once(' ')?;
     if !unit.eq_ignore_ascii_case("bytes") {
         return None;

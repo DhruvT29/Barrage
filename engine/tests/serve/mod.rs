@@ -2,9 +2,10 @@
 //!
 //! It serves a seeded pseudo-random file, so bytes written at the wrong
 //! offset cannot match by chance, and it records every request: where it came
-//! from, the method, the path and the range asked. The source address is how
-//! a test tells its links apart: a socket bound to 127.0.0.2 reaches this
-//! server and shows up here as 127.0.0.2.
+//! from, the method, the path, the range asked, the bytes sent, and when the
+//! answer began and ended. The source address is how a test tells its links
+//! apart: a socket bound to 127.0.0.2 reaches this server and shows up here
+//! as 127.0.0.2.
 //!
 //! Every path answers as scripted with [`Server::at`], and anything not
 //! scripted is 404. Phase 3 grows the scripts task by task, each adding the
@@ -14,8 +15,9 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -35,6 +37,8 @@ pub enum Answer {
     Headers(u16, Vec<(&'static str, String)>),
     /// This status alone.
     Status(u16),
+    /// Nothing, ever: the connection is held open with no answer.
+    Silent,
 }
 
 /// A file of [`content`] and how its requests are answered.
@@ -50,6 +54,37 @@ pub struct File {
     pub disposition: Option<String>,
     /// Stop after this many body bytes and hold the connection open.
     pub stall_after: Option<u64>,
+    /// Send each answer at this many bytes a second. `None`: as fast as the
+    /// machine goes.
+    pub rate: Option<u64>,
+    /// Hold each ranged answer to this many bytes, with a `Content-Range`
+    /// shorter than the range asked, as some servers do.
+    pub max_answer: Option<u64>,
+    /// Run each ranged answer on to the end of the file whatever end was
+    /// asked. The bytes past the asked end are not the file's, so writing
+    /// them anywhere shows.
+    pub past_the_range: bool,
+    /// Answer each range from byte 0, whatever start was asked, with a
+    /// `Content-Range` that says so.
+    pub from_the_top: bool,
+    pub cuts: Vec<Cut>,
+}
+
+/// Close the connection partway through some answers to one source.
+#[derive(Clone, Debug)]
+pub struct Cut {
+    source: IpAddr,
+    after: u64,
+    left: Arc<AtomicUsize>,
+}
+
+impl Cut {
+    /// Use up one cut, if any are left.
+    fn take(&self) -> bool {
+        self.left
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
 }
 
 impl File {
@@ -62,6 +97,11 @@ impl File {
             last_modified: None,
             disposition: None,
             stall_after: None,
+            rate: None,
+            max_answer: None,
+            past_the_range: false,
+            from_the_top: false,
+            cuts: Vec::new(),
         }
     }
 
@@ -94,6 +134,37 @@ impl File {
         self.stall_after = Some(bytes);
         self
     }
+
+    pub fn rate(mut self, bytes_per_second: u64) -> Self {
+        self.rate = Some(bytes_per_second);
+        self
+    }
+
+    pub fn max_answer(mut self, bytes: u64) -> Self {
+        self.max_answer = Some(bytes);
+        self
+    }
+
+    pub fn past_the_range(mut self) -> Self {
+        self.past_the_range = true;
+        self
+    }
+
+    pub fn answers_from_the_top(mut self) -> Self {
+        self.from_the_top = true;
+        self
+    }
+
+    /// Cut the next `times` answers to `source` that are longer than `after`
+    /// bytes, once `after` bytes are sent.
+    pub fn cut(mut self, source: &str, after: u64, times: usize) -> Self {
+        self.cuts.push(Cut {
+            source: source.parse().unwrap(),
+            after,
+            left: Arc::new(AtomicUsize::new(times)),
+        });
+        self
+    }
 }
 
 /// One request, as the server saw it.
@@ -105,6 +176,43 @@ pub struct Seen {
     pub range: Option<String>,
     /// Body bytes handed to the connection so far.
     pub sent: Arc<AtomicU64>,
+    pub started: Instant,
+    /// When the answer ended, or was dropped because the client went away.
+    pub finished: Arc<OnceLock<Instant>>,
+    /// The file offset at which this answer was cut, if it was.
+    pub cut: Option<u64>,
+}
+
+impl Seen {
+    /// The range asked, `bytes=START-END`, as (start, end) with the end
+    /// included, as the header writes it.
+    pub fn asked(&self) -> Option<(u64, u64)> {
+        let (start, end) = parse_range(self.range.as_deref()?)?;
+        Some((start, end?))
+    }
+
+    pub fn sent(&self) -> u64 {
+        self.sent.load(Ordering::SeqCst)
+    }
+}
+
+/// The most requests from `source` that `keep` picks which were open at the
+/// same moment. One not finished yet counts as open until now.
+pub fn most_at_once(seen: &[Seen], source: IpAddr, keep: impl Fn(&Seen) -> bool) -> usize {
+    let now = Instant::now();
+    let mut edges: Vec<(Instant, i64)> = Vec::new();
+    for s in seen.iter().filter(|s| s.source == source && keep(s)) {
+        edges.push((s.started, 1));
+        edges.push((s.finished.get().copied().unwrap_or(now), -1));
+    }
+    // At the same instant, an end comes before a start.
+    edges.sort();
+    let (mut open, mut most) = (0i64, 0i64);
+    for (_, step) in edges {
+        open += step;
+        most = most.max(open);
+    }
+    most as usize
 }
 
 pub struct Server {
@@ -178,6 +286,10 @@ pub fn content(range: Range<u64>) -> Vec<u8> {
     out
 }
 
+/// What a file's answer sends where the file's own bytes end: never a byte
+/// of the file, so it cannot pass for one.
+pub const NOT_THE_FILE: u8 = 0xEE;
+
 /// SplitMix64: a well-mixed 64-bit value per input, so neighbouring words
 /// share no pattern.
 fn splitmix(x: u64) -> u64 {
@@ -198,23 +310,40 @@ async fn answer(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let script = shared.routes.lock().unwrap().get(&path).cloned();
+    let plan = match &script {
+        Some(Answer::File(file)) => Some(file.plan(range.as_deref(), peer.ip())),
+        _ => None,
+    };
     let sent = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(OnceLock::new());
     shared.seen.lock().unwrap().push(Seen {
         source: peer.ip(),
         method: request.method().clone(),
-        path: path.clone(),
-        range: range.clone(),
+        path,
+        range,
         sent: sent.clone(),
+        started: Instant::now(),
+        finished: finished.clone(),
+        cut: plan.as_ref().and_then(|p| p.cut),
     });
 
-    let script = shared.routes.lock().unwrap().get(&path).cloned();
-    match script {
-        None => StatusCode::NOT_FOUND.into_response(),
-        Some(Answer::Status(code)) => status(code).into_response(),
-        Some(Answer::Redirect(code, location)) => {
+    let finish_now = || {
+        let _ = finished.set(Instant::now());
+    };
+    match (script, plan) {
+        (Some(Answer::File(file)), Some(plan)) => serve_file(&file, plan, sent, finished),
+        (Some(Answer::Silent), _) => std::future::pending().await,
+        (Some(Answer::Status(code)), _) => {
+            finish_now();
+            status(code).into_response()
+        }
+        (Some(Answer::Redirect(code, location)), _) => {
+            finish_now();
             (status(code), [(header::LOCATION, location)]).into_response()
         }
-        Some(Answer::Headers(code, headers)) => {
+        (Some(Answer::Headers(code, headers)), _) => {
+            finish_now();
             let mut response = status(code).into_response();
             for (name, value) in headers {
                 response
@@ -223,7 +352,10 @@ async fn answer(
             }
             response
         }
-        Some(Answer::File(file)) => serve_file(&file, range.as_deref(), sent),
+        _ => {
+            finish_now();
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
@@ -231,10 +363,76 @@ fn status(code: u16) -> StatusCode {
     StatusCode::from_u16(code).unwrap()
 }
 
-fn serve_file(file: &File, range: Option<&str>, sent: Arc<AtomicU64>) -> Response {
-    let asked = range.filter(|_| file.ranges).and_then(parse_range);
-    let mut response = match asked {
-        Some((start, _)) if start >= file.length => {
+/// How one request for a file is answered.
+struct Plan {
+    kind: Kind,
+    /// The bytes sent.
+    range: Range<u64>,
+    /// Where the file's own bytes end; past it, [`NOT_THE_FILE`].
+    real_until: u64,
+    cut: Option<u64>,
+}
+
+enum Kind {
+    Whole,
+    Partial,
+    Unsatisfiable,
+}
+
+impl File {
+    fn plan(&self, range: Option<&str>, source: IpAddr) -> Plan {
+        let asked = range.filter(|_| self.ranges).and_then(parse_range);
+        let (kind, range, real_until) = match asked {
+            Some((start, _)) if start >= self.length => (Kind::Unsatisfiable, 0..0, 0),
+            Some((start, last)) => {
+                let asked_end = last.map_or(self.length, |last| (last + 1).min(self.length));
+                let mut end = if self.past_the_range {
+                    self.length
+                } else {
+                    asked_end
+                };
+                if let Some(most) = self.max_answer {
+                    end = end.min(start + most);
+                }
+                if self.from_the_top {
+                    return self.plan_from_the_top(end - start);
+                }
+                (Kind::Partial, start..end, asked_end)
+            }
+            None => (Kind::Whole, 0..self.length, self.length),
+        };
+        let cut = self.cuts.iter().find_map(|c| {
+            (c.source == source && range.end - range.start > c.after && c.take())
+                .then_some(range.start + c.after)
+        });
+        Plan {
+            kind,
+            range,
+            real_until,
+            cut,
+        }
+    }
+
+    /// As many bytes as were asked for, from the top of the file.
+    fn plan_from_the_top(&self, length: u64) -> Plan {
+        Plan {
+            kind: Kind::Partial,
+            range: 0..length,
+            real_until: length,
+            cut: None,
+        }
+    }
+}
+
+fn serve_file(
+    file: &File,
+    plan: Plan,
+    sent: Arc<AtomicU64>,
+    finished: Arc<OnceLock<Instant>>,
+) -> Response {
+    let mut response = match plan.kind {
+        Kind::Unsatisfiable => {
+            let _ = finished.set(Instant::now());
             let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
             set(
                 &mut response,
@@ -243,9 +441,9 @@ fn serve_file(file: &File, range: Option<&str>, sent: Arc<AtomicU64>) -> Respons
             );
             response
         }
-        Some((start, end)) => {
-            let end = end.map_or(file.length, |last| (last + 1).min(file.length));
-            let mut response = Response::new(body(file, start..end, sent));
+        Kind::Partial => {
+            let Range { start, end } = plan.range.clone();
+            let mut response = Response::new(body(file, plan, sent, finished));
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
             let content_range = format!("bytes {start}-{}/{}", end - 1, file.length);
             set(&mut response, header::CONTENT_RANGE, content_range);
@@ -256,8 +454,8 @@ fn serve_file(file: &File, range: Option<&str>, sent: Arc<AtomicU64>) -> Respons
             );
             response
         }
-        None => {
-            let mut response = Response::new(body(file, 0..file.length, sent));
+        Kind::Whole => {
+            let mut response = Response::new(body(file, plan, sent, finished));
             if file.send_length {
                 set(
                     &mut response,
@@ -305,29 +503,60 @@ fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-/// The file's bytes in `range`, made as they are sent, counted into `sent`.
-fn body(file: &File, range: Range<u64>, sent: Arc<AtomicU64>) -> Body {
+/// Marks the answer finished when the body is dropped: at its end, or when
+/// the client goes away.
+struct Finish(Arc<OnceLock<Instant>>);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        let _ = self.0.set(Instant::now());
+    }
+}
+
+/// The planned bytes, made as they are sent and counted into `sent`, at the
+/// file's rate, stalling or cutting where scripted.
+fn body(file: &File, plan: Plan, sent: Arc<AtomicU64>, finished: Arc<OnceLock<Instant>>) -> Body {
     const PIECE: u64 = 64 << 10;
-    let end = range.end;
+    let Range { start, end } = plan.range;
+    let real_until = plan.real_until;
+    let cut = plan.cut;
+    let rate = file.rate;
     let stop = file
         .stall_after
-        .map_or(end, |bytes| end.min(range.start.saturating_add(bytes)));
-    let pieces = futures_util::stream::unfold(range.start, move |at| {
+        .map_or(end, |bytes| end.min(start.saturating_add(bytes)));
+    let began = tokio::time::Instant::now();
+    let pieces = futures_util::stream::unfold((start, Finish(finished)), move |(at, mark)| {
         let sent = sent.clone();
         async move {
             if at >= end {
                 return None;
             }
+            if cut == Some(at) {
+                let error = std::io::Error::other("cut on purpose");
+                return Some((Err(error), (end, mark)));
+            }
             if at >= stop {
                 std::future::pending::<()>().await;
             }
-            let next = (at + PIECE).min(stop);
-            sent.fetch_add(next - at, Ordering::Relaxed);
-            Some((
-                Ok::<_, std::io::Error>(Bytes::from(content(at..next))),
-                next,
-            ))
+            let mut next = (at + PIECE).min(stop);
+            if let Some(cut) = cut.filter(|&cut| cut > at) {
+                next = next.min(cut);
+            }
+            if let Some(rate) = rate {
+                let due = Duration::from_secs_f64((next - start) as f64 / rate as f64);
+                tokio::time::sleep_until(began + due).await;
+            }
+            sent.fetch_add(next - at, Ordering::SeqCst);
+            Some((Ok(Bytes::from(bytes(at..next, real_until))), (next, mark)))
         }
     });
     Body::from_stream(pieces)
+}
+
+/// The file's bytes in `range`, with [`NOT_THE_FILE`] from `real_until` on.
+fn bytes(range: Range<u64>, real_until: u64) -> Vec<u8> {
+    let real_end = range.end.min(real_until).max(range.start);
+    let mut out = content(range.start..real_end);
+    out.resize((range.end - range.start) as usize, NOT_THE_FILE);
+    out
 }

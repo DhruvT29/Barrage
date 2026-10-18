@@ -64,20 +64,27 @@ pub fn file_name(disposition: Option<&str>, url: &Url) -> String {
 }
 
 /// `name` if `dir` holds neither it nor its `.part`, else the first free of
-/// `stem (1).ext`, `stem (2).ext` and so on.
+/// `stem (1).ext`, `stem (2).ext` and so on, up to [`MAX_NUMBER`].
 ///
-/// Only a check: the caller creates the `.part` with `create_new`, so a name
-/// taken between this check and that creation is still never overwritten.
+/// Only a check: the caller creates the `.part` with `create_new` and names
+/// the finished file without replacing anything, so a name taken after this
+/// check is still never overwritten. That is also why giving up is safe: a
+/// folder that cannot be read makes every name look taken, and the last one
+/// tried then fails to be created, with the folder's own error.
 pub fn free_name(dir: &Path, name: &str) -> String {
     if !taken(dir, name) {
         return name.to_string();
     }
     let (stem, extension) = split_extension(name);
-    (1u64..)
-        .map(|n| format!("{stem} ({n}){extension}"))
+    let numbered = |n: u64| format!("{stem} ({n}){extension}");
+    (1..=MAX_NUMBER)
+        .map(numbered)
         .find(|candidate| !taken(dir, candidate))
-        .expect("a folder cannot hold a file for every number")
+        .unwrap_or_else(|| numbered(MAX_NUMBER))
 }
+
+/// The highest number [`free_name`] tries.
+const MAX_NUMBER: u64 = 999;
 
 /// Whether `dir` holds `name` or its `.part`. Anything that cannot be checked
 /// counts as taken: a file this cannot see is still one it must not
@@ -455,5 +462,15 @@ mod tests {
             dir.touch("Report.PDF");
             assert_eq!(free("report.pdf"), "report (1).pdf");
         }
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_still_gets_an_answer() {
+        let dir = Folder::new("unreadable");
+        dir.touch("a file");
+        // Inside a file every check fails, and a failed check counts as
+        // taken: the search must still end.
+        let name = free_name(&dir.0.join("a file"), "x.iso");
+        assert!(name.starts_with("x"), "{name}");
     }
 }

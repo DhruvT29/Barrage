@@ -57,6 +57,8 @@ pub struct Fake {
     pub lookups: AtomicUsize,
     /// How long each public address lookup takes. Zero answers at once.
     lookup_time: Duration,
+    /// Keep loopback addresses as links, which the real filter drops.
+    loopback: bool,
 }
 
 pub const SAMPLED_BPS: u64 = 40_000_000;
@@ -121,6 +123,14 @@ impl Fake {
         self
     }
 
+    /// Let 127.0.0.x addresses stand in for real links, so a download over
+    /// them carries real bytes to a server on this machine. Everything else
+    /// is still judged by the real filter.
+    pub fn loopback_links(mut self) -> Self {
+        self.loopback = true;
+        self
+    }
+
     /// The public address seen through `ip`, lookup after lookup; the last
     /// repeats. `None` makes that lookup fail.
     pub fn public(self, ip: &str, answers: &[Option<&str>]) -> Self {
@@ -149,6 +159,14 @@ impl Network for Fake {
             Some(Step::Fail) => anyhow::bail!("scripted enumeration failure"),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn usable(&self, all: &[Candidate]) -> Vec<Candidate> {
+        let real = barrage::links::usable(all);
+        all.iter()
+            .filter(|c| (self.loopback && c.up && c.addr.ip().is_loopback()) || real.contains(c))
+            .cloned()
+            .collect()
     }
 
     fn probe(

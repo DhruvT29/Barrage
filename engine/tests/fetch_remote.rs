@@ -294,29 +294,38 @@ async fn an_answer_that_is_not_the_file_is_an_error() {
     }
 }
 
-/// A 206 must hold the bytes asked for, or its pieces would land in the
-/// wrong places later.
+/// A 206 must start at byte 0, where the probe asked, and end inside the
+/// file, or the server does not honour ranges. More or fewer bytes than
+/// asked is a server's way, not a fault: every piece is checked again when
+/// it comes, and only its own bytes are written.
 #[tokio::test]
-async fn a_206_must_hold_the_bytes_asked_for() {
+async fn a_206_must_start_where_asked_and_fit_the_file() {
     let server = Server::start().await;
     let partial = |range: &str| Answer::Headers(206, vec![("content-range", range.into())]);
     server.at("/unknown-total", partial("bytes 0-1023/*"));
-    server.at("/shifted", partial("bytes 100-1123/5000"));
-    server.at("/late-start", partial("bytes 1-1023/5000"));
     server.at("/longer", partial("bytes 0-4999/5000"));
     server.at("/longer-unknown", partial("bytes 0-4999/*"));
+    server.at("/shorter", partial("bytes 0-511/5000"));
+    server.at("/shifted", partial("bytes 100-1123/5000"));
+    server.at("/late-start", partial("bytes 1-1023/5000"));
     server.at("/past-the-end", partial("bytes 0-1023/500"));
     server.at("/garbled", partial("pages 1-2"));
     server.at("/unlabelled", Answer::Headers(206, vec![]));
 
-    let remote = find(local(), &server.url("/unknown-total")).await.unwrap();
-    assert_eq!((remote.length, remote.ranges), (None, true));
+    let fine = [
+        ("/unknown-total", None),
+        ("/longer", Some(5000)),
+        ("/longer-unknown", None),
+        ("/shorter", Some(5000)),
+    ];
+    for (path, length) in fine {
+        let remote = find(local(), &server.url(path)).await.unwrap();
+        assert_eq!((remote.length, remote.ranges), (length, true), "{path}");
+    }
 
     for path in [
         "/shifted",
         "/late-start",
-        "/longer",
-        "/longer-unknown",
         "/past-the-end",
         "/garbled",
         "/unlabelled",
