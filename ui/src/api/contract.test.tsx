@@ -35,10 +35,14 @@ test('the dashboard draws every message the engine really sends', () => {
   const open = () => socket as unknown as WebSocket
   const { container } = render(<Page open={open} />)
 
+  // A downloads message carries no table: the cards stay as the last table drew them.
+  let drawn: LinkView[] = []
   for (const message of all) {
     socket.send(JSON.stringify(message))
-    expect(container.querySelectorAll('section.cable')).toHaveLength(cableNames(message.table.links).length)
+    if (message.type !== 'downloads') drawn = message.table.links
+    expect(container.querySelectorAll('section.cable')).toHaveLength(cableNames(drawn).length)
   }
+  expect(all.some((m) => m.type === 'downloads'), 'a downloads message').toBe(true)
 
   const last = all[all.length - 1]
   if (last.type !== 'change') throw new Error('the contract ends with a change')

@@ -159,6 +159,123 @@ export const messages = [
     }
   },
   {
+    "type": "downloads",
+    "downloads": {
+      "live": {
+        "bps": 126900000,
+        "parts": [
+          {
+            "name": "Wi-Fi",
+            "bps": 38400000
+          },
+          {
+            "name": "Ethernet 2",
+            "bps": 88500000
+          }
+        ]
+      },
+      "list": [
+        {
+          "id": 1,
+          "url": "https://example.com/files/ubuntu.iso",
+          "name": "ubuntu.iso",
+          "state": "downloading",
+          "length": 6114656256,
+          "done": 2527000000,
+          "bps": 126900000,
+          "note": null,
+          "cables": [
+            {
+              "name": "Wi-Fi",
+              "bytes": 1210000000,
+              "bps": 38400000,
+              "connections": 4,
+              "notes": []
+            },
+            {
+              "name": "Ethernet 2",
+              "bytes": 1317000000,
+              "bps": 88500000,
+              "connections": 8,
+              "notes": []
+            },
+            {
+              "name": "Ethernet 3",
+              "bytes": 0,
+              "bps": 0,
+              "connections": 0,
+              "notes": [
+                "sits out: the server gave this cable another version of the file (\"7b1d\", not \"a3f0\")"
+              ]
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "url": "https://example.com/files/photo.jpg",
+          "name": "photo (1).jpg",
+          "state": "done",
+          "length": 2400000,
+          "done": 2400000,
+          "bps": 0,
+          "note": null,
+          "cables": [
+            {
+              "name": "Wi-Fi",
+              "bytes": 2400000,
+              "bps": 0,
+              "connections": 0,
+              "notes": []
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "url": "https://example.com/files/gone.zip",
+          "name": null,
+          "state": "failed",
+          "length": null,
+          "done": 0,
+          "bps": 0,
+          "note": "finding https://example.com/files/gone.zip through 192.0.2.10: https://example.com/files/gone.zip answered 404 Not Found",
+          "cables": [
+            {
+              "name": "Wi-Fi",
+              "bytes": 0,
+              "bps": 0,
+              "connections": 0,
+              "notes": [
+                "finding https://example.com/files/gone.zip through 192.0.2.10: https://example.com/files/gone.zip answered 404 Not Found"
+              ]
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "url": "https://example.com/files/notes.pdf",
+          "name": null,
+          "state": "waiting",
+          "length": null,
+          "done": 0,
+          "bps": 0,
+          "note": null,
+          "cables": []
+        },
+        {
+          "id": 5,
+          "url": "https://example.com/files/video.mp4",
+          "name": null,
+          "state": "starting",
+          "length": null,
+          "done": 0,
+          "bps": 0,
+          "note": null,
+          "cables": []
+        }
+      ]
+    }
+  },
+  {
     "type": "change",
     "table": {
       "links": [

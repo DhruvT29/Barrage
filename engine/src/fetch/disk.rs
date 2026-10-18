@@ -1,6 +1,6 @@
 //! The file on disk: full size before any data arrives, written at offsets
 //! by many workers at once, and named only when complete, never over another
-//! file.
+//! file. And the folder it goes to unless told otherwise.
 //!
 //! NOT SPARSE
 //!
@@ -131,6 +131,59 @@ fn rename_new(part: &Path, name: &str) -> io::Result<()> {
     std::fs::remove_file(part)
 }
 
+/// The user's Downloads folder, wherever they have moved it: only the shell
+/// knows, since `%USERPROFILE%\Downloads` is just where it starts out.
+#[cfg(windows)]
+pub fn downloads_folder() -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
+
+    let mut path = std::ptr::null_mut();
+    // SAFETY: the folder id is a static the call only reads, a null token
+    // means this user, and `path` is where the shell puts the string it
+    // allocates.
+    let result = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Downloads,
+            // The flags are declared signed, the parameter unsigned; it is 0.
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut path,
+        )
+    };
+    let found = if result >= 0 && !path.is_null() {
+        // SAFETY: on success `path` is a NUL-terminated wide string, read
+        // up to its NUL and copied out before it is freed.
+        let wide = unsafe {
+            let mut len = 0;
+            while *path.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(path, len)
+        };
+        Ok(PathBuf::from(OsString::from_wide(wide)))
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    };
+    // SAFETY: the shell's own string, freed once, whether or not the call
+    // succeeded, as its documentation requires. Freeing null does nothing.
+    unsafe { CoTaskMemFree(path.cast()) };
+    found
+}
+
+/// Elsewhere, `Downloads` in the home folder.
+#[cfg(not(windows))]
+pub fn downloads_folder() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "HOME is not set"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +227,14 @@ mod tests {
         let dir = Folder::new("size");
         let (_, part, _file) = create_part(&dir.0, "big.bin", 5 << 20).unwrap();
         assert_eq!(std::fs::metadata(part).unwrap().len(), 5 << 20);
+    }
+
+    /// The default for `barrage --downloads`. Every Windows profile has one,
+    /// moved or not.
+    #[test]
+    fn the_downloads_folder_is_found() {
+        let dir = downloads_folder().unwrap();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(dir.is_dir(), "{}", dir.display());
     }
 }

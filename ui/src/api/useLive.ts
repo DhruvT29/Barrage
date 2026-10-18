@@ -50,6 +50,9 @@ export function useLive(
       socket = s
       s.onmessage = (event) => {
         const message = JSON.parse(event.data) as LiveMessage
+        // Not drawn yet. It carries no table, so it must leave the links as
+        // they are.
+        if (message.type === 'downloads') return
         failures = 0
         // Each socket starts with a whole table: it replaces whatever the
         // last socket left, nothing is merged.

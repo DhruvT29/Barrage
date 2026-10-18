@@ -24,10 +24,11 @@ tracing-subscriber = "0.3.23"
 
 # brg-links redraws its table in place, which a Windows console only allows
 # once asked. A finished download is named with MoveFileExW, which unlike
-# std's rename never replaces a file. Already in the tree through tokio, so
-# no new code is fetched.
+# std's rename never replaces a file. Downloads go to the user's Downloads
+# folder, wherever they have moved it, which only SHGetKnownFolderPath
+# knows. Already in the tree through tokio, so no new code is fetched.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Com"] }
 
 [dev-dependencies]
 futures-util = "0.3.34"

@@ -1,7 +1,7 @@
-//! `barrage`: the engine and its web page. Phase 2's deliverable.
+//! `barrage`: the engine and its web page.
 //!
 //! ```text
-//! barrage [--port N] [--no-open] [--log FILE] [--static DIR]
+//! barrage [--port N] [--no-open] [--log FILE] [--static DIR] [--downloads DIR]
 //! ```
 //!
 //! Starts the link watcher, serves the page and its API at this machine's
@@ -12,7 +12,8 @@
 //!
 //! The page is read from `engine/static`, where `pnpm --dir ui build` puts
 //! it, or from `--static DIR`. Until it is built, the browser gets a note
-//! saying how.
+//! saying how. Downloads go to the user's Downloads folder, or to
+//! `--downloads DIR`, which must already exist.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,10 +22,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use barrage::LinkHandle;
 use barrage::api::{DEFAULT_PORT, bind, serve};
+use barrage::fetch::downloads_folder;
 use barrage::links::render::changes;
 use barrage::links::watch::LinkTable;
 
-const USAGE: &str = "usage: barrage [--port N] [--no-open] [--log FILE] [--static DIR]";
+const USAGE: &str =
+    "usage: barrage [--port N] [--no-open] [--log FILE] [--static DIR] [--downloads DIR]";
 
 /// Where the built page is unless `--static` says otherwise: `engine/static`,
 /// fixed when this program is compiled.
@@ -52,6 +55,7 @@ async fn run() -> anyhow::Result<()> {
     if let Some(path) = &options.log {
         barrage::logging::to_file(path, &[])?;
     }
+    let downloads = downloads_dir(options.downloads)?;
     // The port first: a taken one stops here, before any probe or speed test
     // has spent data.
     let listener = bind(options.port).await?;
@@ -61,6 +65,7 @@ async fn run() -> anyhow::Result<()> {
 
     let url = format!("http://{}", listener.local_addr()?);
     println!("BARRAGE on {url}. Ctrl+C to stop.");
+    println!("Downloads go to {}.", downloads.display());
     if !options.static_dir.join("index.html").is_file() {
         println!("The page is not built yet: run `pnpm --dir ui build`, then reload it.");
     }
@@ -70,13 +75,32 @@ async fn run() -> anyhow::Result<()> {
         println!("Could not open the browser ({e}). Open {url} yourself.");
     }
 
-    serve(listener, handle, options.static_dir, async {
+    serve(listener, handle, downloads, options.static_dir, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await?;
     tracing::info!("stopped");
     println!("stopped.");
     Ok(())
+}
+
+/// The folder downloads go to: `--downloads DIR`, else the user's Downloads
+/// folder, as a full path. It must exist: a mistyped name stops here, rather
+/// than every download failing later.
+fn downloads_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let dir = match given {
+        Some(dir) => dir,
+        None => downloads_folder()
+            .context("cannot find the Downloads folder. Name one with --downloads DIR")?,
+    };
+    let dir = std::path::absolute(&dir)
+        .with_context(|| format!("cannot use {} as the download folder", dir.display()))?;
+    anyhow::ensure!(
+        dir.is_dir(),
+        "there is no folder {} to download into. Name one that exists with --downloads DIR",
+        dir.display()
+    );
+    Ok(dir)
 }
 
 /// Log each change to the links, as `brg-links --log` does. Nothing is
@@ -102,6 +126,8 @@ struct Options {
     open: bool,
     log: Option<PathBuf>,
     static_dir: PathBuf,
+    /// `None`: the user's Downloads folder.
+    downloads: Option<PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -110,6 +136,7 @@ fn parse_args() -> anyhow::Result<Args> {
         open: true,
         log: None,
         static_dir: PathBuf::from(STATIC_DIR),
+        downloads: None,
     };
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -129,6 +156,10 @@ fn parse_args() -> anyhow::Result<Args> {
             Some("--static") => {
                 let dir = args.next().context("--static needs a folder")?;
                 options.static_dir = PathBuf::from(dir);
+            }
+            Some("--downloads") => {
+                let dir = args.next().context("--downloads needs a folder")?;
+                options.downloads = Some(PathBuf::from(dir));
             }
             Some("-h" | "--help") => return Ok(Args::Help),
             _ => anyhow::bail!("unexpected argument {arg:?}\n{USAGE}"),

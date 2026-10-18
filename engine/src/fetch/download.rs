@@ -618,11 +618,21 @@ impl Download {
             links,
             note: self.note.clone(),
         };
+        // Every tick publishes, but only a change wakes the readers: a
+        // download that is waiting or done would otherwise send each open
+        // page the same status several times a second.
         self.job
             .status
-            .send_modify(|all| match all.iter_mut().find(|s| s.id == status.id) {
-                Some(slot) => *slot = status,
-                None => all.push(status),
+            .send_if_modified(|all| match all.iter_mut().find(|s| s.id == status.id) {
+                Some(slot) if *slot == status => false,
+                Some(slot) => {
+                    *slot = status;
+                    true
+                }
+                None => {
+                    all.push(status);
+                    true
+                }
             });
     }
 }

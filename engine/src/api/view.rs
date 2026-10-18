@@ -1,14 +1,16 @@
-//! The link table as the UI reads it.
+//! The link table and the downloads as the UI reads them.
 //!
 //! Every figure says the same as `brg-links`: the state words, whole
 //! milliseconds, and the change lines, which come from
 //! [`links::render::changes`](crate::links::render::changes) rather than being
 //! worked out again in the UI. An unknown figure is `null`, never zero.
 //! Addresses are strings, so the JSON does not depend on how serde encodes an
-//! `IpAddr`.
+//! `IpAddr`. A download is shown by cable, not by address: a cable's bytes
+//! and speed are what its addresses really carried, added up.
 
 use serde::Serialize;
 
+use crate::fetch::{DownloadStatus, LinkShare, Phase};
 use crate::links::render::{cable_speed, cables_in_order, changes, state_word};
 use crate::links::{Link, LinkState, shared_upstreams};
 
@@ -76,8 +78,70 @@ pub struct NotCounted {
     pub why: &'static str,
 }
 
+/// Every download since the engine started, and the speed they make together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DownloadsView {
+    pub live: LiveSpeed,
+    /// In the order they were added.
+    pub list: Vec<DownloadView>,
+}
+
+/// The live download speed: what the downloads that are downloading are
+/// fetching right now, all together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveSpeed {
+    /// The sum of the parts, in bits per second.
+    pub bps: u64,
+    /// One per cable carrying data, its speed in every download added up, in
+    /// the order it first appears in the list. A cable carrying nothing has
+    /// no part.
+    pub parts: Vec<SpeedPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpeedPart {
+    pub name: String,
+    pub bps: u64,
+}
+
+/// One download.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DownloadView {
+    pub id: u64,
+    /// The URL as it was given.
+    pub url: String,
+    /// The file's name in the download folder; null until the file is found.
+    pub name: Option<String>,
+    /// `"starting"`, `"waiting"`, `"downloading"`, `"done"` or `"failed"`.
+    pub state: &'static str,
+    /// In bytes; null while the server has not said.
+    pub length: Option<u64>,
+    /// Bytes written.
+    pub done: u64,
+    /// In bits per second.
+    pub bps: u64,
+    /// Why it failed, or what to know about it.
+    pub note: Option<String>,
+    pub cables: Vec<CableShare>,
+}
+
+/// One cable's part in a download: its addresses' shares added up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CableShare {
+    pub name: String,
+    /// Bytes its addresses wrote to the file.
+    pub bytes: u64,
+    /// In bits per second, 0 unless downloading.
+    pub bps: u64,
+    /// Connections open for this download right now.
+    pub connections: u32,
+    /// Each of its addresses' notes, in order, each said once.
+    pub notes: Vec<String>,
+}
+
 /// What the live socket sends: the whole table when a client connects, then
-/// the table again on every change, with the lines saying what changed.
+/// the downloads, then each change to either: the table with the lines saying
+/// what changed, or the downloads again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveMessage {
@@ -87,6 +151,9 @@ pub enum LiveMessage {
     Change {
         table: TableView,
         lines: Vec<String>,
+    },
+    Downloads {
+        downloads: DownloadsView,
     },
 }
 
@@ -259,6 +326,90 @@ fn link_view(link: &Link) -> LinkView {
     }
 }
 
+pub fn downloads_view(all: &[DownloadStatus]) -> DownloadsView {
+    let list: Vec<DownloadView> = all.iter().map(download_view).collect();
+
+    let mut parts: Vec<SpeedPart> = Vec::new();
+    let downloading = all
+        .iter()
+        .zip(&list)
+        .filter(|(status, _)| status.phase == Phase::Downloading);
+    for (_, download) in downloading {
+        for cable in download.cables.iter().filter(|c| c.bps > 0) {
+            match parts.iter_mut().find(|p| p.name == cable.name) {
+                Some(part) => part.bps += cable.bps,
+                None => parts.push(SpeedPart {
+                    name: cable.name.clone(),
+                    bps: cable.bps,
+                }),
+            }
+        }
+    }
+
+    DownloadsView {
+        live: LiveSpeed {
+            bps: parts.iter().map(|p| p.bps).sum(),
+            parts,
+        },
+        list,
+    }
+}
+
+fn download_view(status: &DownloadStatus) -> DownloadView {
+    DownloadView {
+        id: status.id.as_u64(),
+        url: status.url.clone(),
+        name: status.name.clone(),
+        state: phase_word(status.phase),
+        length: status.length,
+        done: status.done,
+        bps: status.bps,
+        note: status.note.clone(),
+        cables: cable_shares(&status.links),
+    }
+}
+
+fn phase_word(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Starting => "starting",
+        Phase::Waiting => "waiting",
+        Phase::Downloading => "downloading",
+        Phase::Done => "done",
+        Phase::Failed => "failed",
+    }
+}
+
+/// Each cable's addresses' shares added up, in the order the cable's first
+/// address joined.
+fn cable_shares(links: &[LinkShare]) -> Vec<CableShare> {
+    let mut cables: Vec<CableShare> = Vec::new();
+    for link in links {
+        let i = match cables.iter().position(|c| c.name == link.name) {
+            Some(i) => i,
+            None => {
+                cables.push(CableShare {
+                    name: link.name.clone(),
+                    bytes: 0,
+                    bps: 0,
+                    connections: 0,
+                    notes: Vec::new(),
+                });
+                cables.len() - 1
+            }
+        };
+        let cable = &mut cables[i];
+        cable.bytes += link.bytes;
+        cable.bps += link.bps;
+        cable.connections += link.connections;
+        if let Some(note) = &link.note
+            && !cable.notes.contains(note)
+        {
+            cable.notes.push(note.clone());
+        }
+    }
+    cables
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
@@ -267,6 +418,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::fetch::DownloadId;
     use crate::links::model::{Addr, LinkId};
     use crate::links::render::changes;
     use crate::links::{Link, LinkState};
@@ -383,6 +535,13 @@ mod tests {
         assert_eq!(change["type"], "change");
         assert_eq!(change["table"]["links"][0]["name"], "Wi-Fi");
         assert!(change["lines"].is_array());
+
+        let downloads = serde_json::to_value(LiveMessage::Downloads {
+            downloads: downloads_view(&[download(1, Phase::Starting, vec![])]),
+        })
+        .unwrap();
+        assert_eq!(downloads["type"], "downloads");
+        assert_eq!(downloads["downloads"]["list"][0]["id"], 1);
     }
 
     /// The feed on the page and the log `brg-links --log` writes are the
@@ -744,6 +903,217 @@ mod tests {
         assert_eq!(table.links[0].rtt_ms, Some(55));
     }
 
+    fn share(
+        link: u64,
+        name: &str,
+        bytes: u64,
+        bps: u64,
+        connections: u32,
+        note: Option<&str>,
+    ) -> LinkShare {
+        LinkShare {
+            link: LinkId::new(link),
+            name: name.to_string(),
+            bytes,
+            bps,
+            connections,
+            note: note.map(String::from),
+        }
+    }
+
+    /// A download whose totals are its links' shares, as the engine sends.
+    fn download(id: u64, phase: Phase, links: Vec<LinkShare>) -> DownloadStatus {
+        DownloadStatus {
+            id: DownloadId::new(id),
+            url: format!("https://example.com/{id}.iso"),
+            name: Some(format!("{id}.iso")),
+            phase,
+            length: Some(400_000_000),
+            done: links.iter().map(|l| l.bytes).sum(),
+            bps: links.iter().map(|l| l.bps).sum(),
+            links,
+            note: None,
+        }
+    }
+
+    fn cable(name: &str, bytes: u64, bps: u64, connections: u32, notes: &[&str]) -> CableShare {
+        CableShare {
+            name: name.to_string(),
+            bytes,
+            bps,
+            connections,
+            notes: notes.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    fn speed(name: &str, bps: u64) -> SpeedPart {
+        SpeedPart {
+            name: name.to_string(),
+            bps,
+        }
+    }
+
+    /// Several addresses can be one cable (PLAN.md section 3.6, item 11). On
+    /// screen a cable is what its addresses really carried, added up, with
+    /// each address's note, in the order the cable first joined.
+    #[test]
+    fn a_cables_addresses_add_up_to_one_share() {
+        let whole = "sits out: the server sends the file only whole, so one cable fetches it";
+        let status = download(
+            1,
+            Phase::Downloading,
+            vec![
+                share(
+                    2,
+                    "Ethernet 2",
+                    6_000_000,
+                    40_000_000,
+                    4,
+                    Some("the IPv4 note"),
+                ),
+                share(1, "Wi-Fi", 3_000_000, 20_000_000, 4, None),
+                share(
+                    3,
+                    "Ethernet 2",
+                    2_000_000,
+                    9_000_000,
+                    2,
+                    Some("the IPv6 note"),
+                ),
+                // The same words from two addresses are said once.
+                share(4, "Ethernet 3", 0, 0, 0, Some(whole)),
+                share(5, "Ethernet 3", 0, 0, 0, Some(whole)),
+            ],
+        );
+        assert_eq!(
+            downloads_view(&[status]).list[0].cables,
+            vec![
+                cable(
+                    "Ethernet 2",
+                    8_000_000,
+                    49_000_000,
+                    6,
+                    &["the IPv4 note", "the IPv6 note"]
+                ),
+                cable("Wi-Fi", 3_000_000, 20_000_000, 4, &[]),
+                cable("Ethernet 3", 0, 0, 0, &[whole]),
+            ]
+        );
+    }
+
+    /// The hero's "Downloading at": every download that is downloading, by
+    /// cable. The engine already sends 0 for the others; the view does not
+    /// count on it.
+    #[test]
+    fn the_live_speed_counts_only_downloads_that_are_downloading() {
+        let all = [
+            download(
+                1,
+                Phase::Downloading,
+                vec![
+                    share(1, "Wi-Fi", 1, 30_000_000, 4, None),
+                    share(2, "Ethernet 2", 1, 50_000_000, 4, None),
+                ],
+            ),
+            download(
+                2,
+                Phase::Done,
+                vec![share(1, "Wi-Fi", 1, 99_000_000, 0, None)],
+            ),
+            download(
+                3,
+                Phase::Waiting,
+                vec![share(3, "Ethernet 4", 1, 77_000_000, 0, None)],
+            ),
+            download(
+                4,
+                Phase::Failed,
+                vec![share(1, "Wi-Fi", 1, 66_000_000, 0, None)],
+            ),
+            download(
+                5,
+                Phase::Starting,
+                vec![share(1, "Wi-Fi", 1, 55_000_000, 0, None)],
+            ),
+            // Ethernet 2 in a second download adds to its part. Ethernet 3,
+            // carrying nothing, has no part.
+            download(
+                6,
+                Phase::Downloading,
+                vec![
+                    share(2, "Ethernet 2", 1, 20_000_000, 4, None),
+                    share(4, "Ethernet 3", 0, 0, 0, Some("sits out")),
+                ],
+            ),
+        ];
+        assert_eq!(
+            downloads_view(&all).live,
+            LiveSpeed {
+                bps: 100_000_000,
+                parts: vec![speed("Wi-Fi", 30_000_000), speed("Ethernet 2", 70_000_000)],
+            }
+        );
+    }
+
+    #[test]
+    fn every_phase_has_its_word() {
+        let phases = [
+            (Phase::Starting, "starting"),
+            (Phase::Waiting, "waiting"),
+            (Phase::Downloading, "downloading"),
+            (Phase::Done, "done"),
+            (Phase::Failed, "failed"),
+        ];
+        for (phase, word) in phases {
+            let view = downloads_view(&[download(1, phase, vec![])]);
+            assert_eq!(view.list[0].state, word);
+        }
+    }
+
+    /// Before the file is found its name and length are unknown: null, never
+    /// an empty name or 0 bytes.
+    #[test]
+    fn a_download_becomes_the_json_the_ui_reads() {
+        let starting = DownloadStatus {
+            id: DownloadId::new(7),
+            url: "https://example.com/a.iso".to_string(),
+            name: None,
+            phase: Phase::Starting,
+            length: None,
+            done: 0,
+            bps: 0,
+            links: vec![],
+            note: None,
+        };
+        let done = download(
+            8,
+            Phase::Done,
+            vec![share(1, "Wi-Fi", 400_000_000, 0, 0, None)],
+        );
+        assert_eq!(
+            serde_json::to_value(downloads_view(&[starting, done])).unwrap(),
+            json!({
+                "live": { "bps": 0, "parts": [] },
+                "list": [
+                    {
+                        "id": 7, "url": "https://example.com/a.iso", "name": null,
+                        "state": "starting", "length": null, "done": 0, "bps": 0,
+                        "note": null, "cables": []
+                    },
+                    {
+                        "id": 8, "url": "https://example.com/8.iso", "name": "8.iso",
+                        "state": "done", "length": 400000000, "done": 400000000, "bps": 0,
+                        "note": null,
+                        "cables": [{
+                            "name": "Wi-Fi", "bytes": 400000000, "bps": 0,
+                            "connections": 0, "notes": []
+                        }]
+                    }
+                ]
+            })
+        );
+    }
+
     /// The page's copy of the contract: messages exactly as this engine
     /// sends them, written out as TypeScript, so the page's type check holds
     /// every field to `types.ts` and `contract.test.tsx` renders them.
@@ -826,14 +1196,77 @@ mod tests {
         (before, after)
     }
 
+    /// A download in every state, on the sample's cables: one downloading
+    /// over Wi-Fi and both of Ethernet 2's addresses while Ethernet 3 sits
+    /// out with its note, and one failed with the note its link gave.
+    fn contract_downloads() -> Vec<DownloadStatus> {
+        let gone = "https://example.com/files/gone.zip";
+        let not_found = format!("finding {gone} through 192.0.2.10: {gone} answered 404 Not Found");
+        let other = "sits out: the server gave this cable another version of the file \
+                     (\"7b1d\", not \"a3f0\")";
+        let mut downloading = download(
+            1,
+            Phase::Downloading,
+            vec![
+                share(1, "Wi-Fi", 1_210_000_000, 38_400_000, 4, None),
+                share(2, "Ethernet 2", 905_000_000, 61_000_000, 4, None),
+                share(3, "Ethernet 2", 412_000_000, 27_500_000, 4, None),
+                share(4, "Ethernet 3", 0, 0, 0, Some(other)),
+            ],
+        );
+        downloading.url = "https://example.com/files/ubuntu.iso".to_string();
+        downloading.name = Some("ubuntu.iso".to_string());
+        downloading.length = Some(6_114_656_256);
+
+        let mut done = download(
+            2,
+            Phase::Done,
+            vec![share(1, "Wi-Fi", 2_400_000, 0, 0, None)],
+        );
+        done.url = "https://example.com/files/photo.jpg".to_string();
+        done.name = Some("photo (1).jpg".to_string());
+        done.length = Some(2_400_000);
+
+        let mut failed = download(
+            3,
+            Phase::Failed,
+            vec![share(1, "Wi-Fi", 0, 0, 0, Some(&not_found))],
+        );
+        failed.url = gone.to_string();
+        (failed.name, failed.length, failed.note) = (None, None, Some(not_found.clone()));
+
+        let waiting = DownloadStatus {
+            id: DownloadId::new(4),
+            url: "https://example.com/files/notes.pdf".to_string(),
+            name: None,
+            phase: Phase::Waiting,
+            length: None,
+            done: 0,
+            bps: 0,
+            links: vec![],
+            note: None,
+        };
+        let starting = DownloadStatus {
+            id: DownloadId::new(5),
+            url: "https://example.com/files/video.mp4".to_string(),
+            phase: Phase::Starting,
+            ..waiting.clone()
+        };
+        vec![downloading, done, failed, waiting, starting]
+    }
+
     /// Fails when the engine's JSON changes and the page's copy does not,
     /// which is what made a renamed field leave both test suites green.
+    /// The messages come in the order the socket sends them.
     #[test]
     fn the_ui_contract_file_is_up_to_date() {
         let (before, after) = contract_sample();
         let messages = [
             LiveMessage::Table {
                 table: table_view(&before),
+            },
+            LiveMessage::Downloads {
+                downloads: downloads_view(&contract_downloads()),
             },
             change_message(&before, &after),
         ];

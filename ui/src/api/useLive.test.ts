@@ -114,6 +114,18 @@ test('a change replaces the table and adds its lines to the top of the feed', ()
   ])
 })
 
+test('a downloads message leaves the table and the feed as they are', () => {
+  const e = engine()
+  const { result } = renderHook(() => useLive(URL, e.open))
+  e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
+  e.last().send({ type: 'change', table: table(link(1, 'Wi-Fi')), lines: ['a line'] })
+  const before = result.current
+
+  e.last().send({ type: 'downloads', downloads: { live: { bps: 0, parts: [] }, list: [] } })
+
+  expect(result.current).toEqual(before)
+})
+
 test('a closed socket shows disconnected and keeps the last table', () => {
   const e = engine()
   const { result } = renderHook(() => useLive(URL, e.open))

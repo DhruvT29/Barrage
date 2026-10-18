@@ -17,18 +17,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use axum::extract::{Request, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRef, Request, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router, middleware};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::LinkHandle;
+use crate::fetch::{AddError, AddRequest, Downloads};
 use crate::links::watch::LinkTable;
 
-pub use view::{LinkView, LiveMessage, TableView, change_message, table_view};
+pub use view::{
+    DownloadsView, LinkView, LiveMessage, TableView, change_message, downloads_view, table_view,
+};
 
 /// The port `barrage` listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7700;
@@ -45,23 +51,35 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
     })
 }
 
-/// The API alone: `GET /api/links`, the table as JSON, and `GET /api/live`,
-/// the table as a WebSocket stream of [`LiveMessage`]s. Any other address
-/// under `/api` answers `404`. Every route answers only this machine's own
-/// pages, and none may be framed ([`guard`]).
+/// The API alone:
+///
+/// - `GET /api/links`: the table as JSON.
+/// - `GET /api/live`: the table and the downloads as a WebSocket stream of
+///   [`LiveMessage`]s.
+/// - `POST /api/downloads`: start one. The body is JSON, `{"url": string,
+///   "cables"?: string[]}`, sent as `application/json`. It answers `201
+///   {"id"}`, `400 {"error"}` for a body or URL it cannot use, `409 {"error",
+///   "id"}` for a URL already downloading, with that download's id, and `415
+///   {"error"}` for anything not JSON. A form on another site can only send
+///   the kinds that last refuses, and anything else from a page needs the
+///   browser to ask first, which this server never answers.
+/// - `GET /api/downloads`: every download, as [`DownloadsView`].
+///
+/// Any other address under `/api` answers `404`. Every route answers only
+/// this machine's own pages, and none may be framed ([`guard`]).
 ///
 /// It holds a copy of the table, never the [`LinkHandle`]. A reader does not
 /// keep the watcher alive, so stopping the engine ends every live stream,
 /// instead of each open page keeping the engine running.
-pub fn router(table: LinkTable) -> Router {
-    guarded(api(table))
+pub fn router(table: LinkTable, downloads: Downloads) -> Router {
+    guarded(api(table, downloads))
 }
 
 /// What `barrage` serves: the API, as [`router`], and the built page from
 /// `static_dir` at every other address, all under the same [`guard`].
-pub fn app(table: LinkTable, static_dir: PathBuf) -> Router {
+pub fn app(table: LinkTable, downloads: Downloads, static_dir: PathBuf) -> Router {
     let dir = Arc::new(static_dir);
-    guarded(api(table).fallback(move |request: Request| page(Arc::clone(&dir), request)))
+    guarded(api(table, downloads).fallback(move |request: Request| page(Arc::clone(&dir), request)))
 }
 
 /// How long the live streams get to send their close frames once the
@@ -70,6 +88,7 @@ pub fn app(table: LinkTable, static_dir: PathBuf) -> Router {
 const CLOSE_GRACE: Duration = Duration::from_millis(250);
 
 /// Serve [`app`] on `listener` until `stop` completes, then stop the engine.
+/// Downloads go to `downloads_dir`.
 ///
 /// The handle is dropped the moment `stop` fires, while the server finishes.
 /// That stops the watcher, which ends every live stream with a close frame.
@@ -80,10 +99,12 @@ const CLOSE_GRACE: Duration = Duration::from_millis(250);
 pub async fn serve(
     listener: TcpListener,
     links: LinkHandle,
+    downloads_dir: PathBuf,
     static_dir: PathBuf,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let app = app(links.table(), static_dir);
+    let downloads = Downloads::new(links.table(), downloads_dir);
+    let app = app(links.table(), downloads, static_dir);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             stop.await;
@@ -95,24 +116,89 @@ pub async fn serve(
     Ok(())
 }
 
-fn api(table: LinkTable) -> Router {
+/// What the routes reach. Each handler takes only the half it needs.
+#[derive(Clone)]
+struct Engine {
+    table: LinkTable,
+    downloads: Downloads,
+}
+
+impl FromRef<Engine> for LinkTable {
+    fn from_ref(engine: &Engine) -> Self {
+        engine.table.clone()
+    }
+}
+
+impl FromRef<Engine> for Downloads {
+    fn from_ref(engine: &Engine) -> Self {
+        engine.downloads.clone()
+    }
+}
+
+fn api(table: LinkTable, downloads: Downloads) -> Router {
     Router::new()
         .route("/api/links", get(links))
         .route("/api/live", get(live::upgrade))
+        .route("/api/downloads", get(list_downloads).post(add_download))
         // Any other address under /api is a route this engine does not have,
         // a typo or one a newer page expects. Left to the page's fallback it
         // would answer 200 with index.html, which a JSON client cannot read.
         .route("/api", any(no_such_route))
         .route("/api/", any(no_such_route))
         .route("/api/{*rest}", any(no_such_route))
-        .with_state(table)
+        .with_state(Engine { table, downloads })
 }
 
-async fn no_such_route() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({ "error": "no such API route" })),
-    )
+async fn no_such_route() -> Response {
+    refuse(StatusCode::NOT_FOUND, "no such API route")
+}
+
+/// A refusal, in the JSON every API route answers with.
+fn refuse(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({ "error": error }))).into_response()
+}
+
+/// The body of `POST /api/downloads`. A field it does not know is refused,
+/// not ignored: `cable` for `cables`, ignored, would quietly download through
+/// every cable.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddBody {
+    url: String,
+    cables: Option<Vec<String>>,
+}
+
+async fn add_download(
+    State(downloads): State<Downloads>,
+    body: Result<Json<AddBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(JsonRejection::MissingJsonContentType(_)) => {
+            return refuse(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "send the download as JSON, with Content-Type: application/json",
+            );
+        }
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, &e.body_text()),
+    };
+    let request = AddRequest {
+        url: body.url,
+        cables: body.cables,
+    };
+    match downloads.add(request).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id.as_u64() }))).into_response(),
+        Err(e @ AddError::AlreadyRunning(id)) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": e.to_string(), "id": id.as_u64() })),
+        )
+            .into_response(),
+        Err(e) => refuse(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn list_downloads(State(downloads): State<Downloads>) -> Json<DownloadsView> {
+    Json(downloads_view(&downloads.status().borrow()))
 }
 
 fn guarded(router: Router) -> Router {
