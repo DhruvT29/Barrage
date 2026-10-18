@@ -9,12 +9,21 @@
 //! missed, and an event for a link it never saw cannot reach it (PLAN.md
 //! item 14). Every usable link, or only the named cables, finds the file
 //! from the URL itself, through its own redirects. The first to answer fixes
-//! the file: its name, its length, and a full-size `.part` in the download
-//! folder. Every chunk of [`plan`] goes on one pile, and each link that found
-//! the file gets its workers, which take chunks until none are left. A
-//! worker reports what it wrote and the rest of its chunk goes back on the
-//! pile. Once every byte is written the file is flushed to disk and named,
-//! and the download is done.
+//! the file: its name, its length, its version, and a full-size `.part` in
+//! the download folder. Every chunk of [`plan`] goes on one pile, and each
+//! link that found the same file gets its workers, which take chunks until
+//! none are left. A worker reports what it wrote and the rest of its chunk
+//! goes back on the pile. Once every byte is written the file is flushed to
+//! disk and named, and the download is done.
+//!
+//! WHEN THE SERVER AND THE LINKS DISAGREE
+//!
+//! A link whose node sent another version or length of the file, or no
+//! pieces, sits out with a note ([`differs`]). A file that changes on the
+//! server mid-download ends the download, the `.part` left in place, rather
+//! than be stitched from two versions. A server that sends no pieces, or no
+//! length, is fetched whole through the link that found it first, and the
+//! download cannot resume if that link drops.
 //!
 //! With no usable link it waits. With usable links that have all failed, it
 //! fails, and says why.
@@ -34,11 +43,15 @@ use tokio::task::{self, JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::disk::{create_part, name_finished};
-use super::remote::{Remote, find};
+use super::remote::{Remote, differs, find};
 use super::worker::{Exit, Outcome, Report, Worker};
 use super::{DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, plan};
 use crate::links::watch::LinkTable;
 use crate::links::{Link, LinkId};
+
+/// The download's note when the server sends the file only whole.
+const ONLY_WHOLE: &str = "the server sends this file only whole, not in pieces, so it comes \
+                          through one cable, and cannot resume if that cable drops";
 
 /// Everything one download starts from.
 pub(crate) struct Job {
@@ -97,12 +110,24 @@ struct Member {
 
 /// The file once a link has found it.
 struct Open {
+    /// The file as the link that found it first described it.
+    fixed: Remote,
     part: PathBuf,
     file: Arc<File>,
-    length: u64,
     done: Ranges,
-    pile: flume::Sender<Range<u64>>,
-    taken: flume::Receiver<Range<u64>>,
+    mode: Mode,
+}
+
+enum Mode {
+    /// Pieces, off one pile, from every link that agrees about the file.
+    Pieces {
+        length: u64,
+        pile: flume::Sender<Range<u64>>,
+        taken: flume::Receiver<Range<u64>>,
+    },
+    /// The whole file through one link, for a server that sends no pieces
+    /// or no length.
+    Whole { carrier: LinkId, started: bool },
 }
 
 enum Event {
@@ -171,11 +196,20 @@ impl Download {
                     ),
                 };
                 if let Some(link) = self.finding.remove(&task) {
-                    self.found(link, found);
+                    self.found(link, found).await;
                 }
             }
             Event::Report(report) => self.reported(report).await,
             Event::WorkerEnded(ended) => {
+                // A worker sends its last report before it ends, and both can
+                // be ready at once. Hear the report first, or its link could
+                // look idle with its work not yet handed back.
+                while let Ok(report) = self.reports.try_recv() {
+                    self.reported(report).await;
+                    if self.ended.is_some() {
+                        return;
+                    }
+                }
                 let (task, exit) = match ended {
                     Ok(done) => done,
                     Err(e) => (e.id(), Some(format!("a connection stopped: {e}"))),
@@ -255,14 +289,14 @@ impl Download {
             .is_none_or(|cables| cables.iter().any(|c| c == name))
     }
 
-    /// A present link starts taking part: workers at once if it has found
-    /// the file already, else it finds it first.
+    /// A present link starts taking part: at once if it has found the file
+    /// already, else once it finds it.
     fn join(&mut self, link: LinkId) {
         let Some(member) = self.members.iter().find(|m| m.id == link) else {
             return;
         };
         if member.remote.is_some() && self.file.is_some() {
-            self.spawn_workers(link);
+            self.take_part(link);
             return;
         }
         let (local, url) = (member.local, self.job.url.clone());
@@ -281,7 +315,7 @@ impl Download {
         }
     }
 
-    fn found(&mut self, link: LinkId, found: anyhow::Result<Remote>) {
+    async fn found(&mut self, link: LinkId, found: anyhow::Result<Remote>) {
         let Some(member) = self.member(link) else {
             return;
         };
@@ -298,46 +332,63 @@ impl Download {
         };
         member.note = None;
         member.remote = Some(remote.clone());
-        if self.file.is_none()
-            && let Err(note) = self.open(&remote)
-        {
-            self.fail(note);
-            return;
+        if self.file.is_none() {
+            if let Err(note) = self.open(&remote, link) {
+                self.fail(note);
+                return;
+            }
+            if self.length == Some(0) {
+                // Nothing to fetch.
+                self.finish().await;
+                return;
+            }
         }
-        self.spawn_workers(link);
+        self.take_part(link);
     }
 
-    /// Fix the file as `remote` describes it: a full-size `.part`, and every
-    /// chunk on the pile.
-    fn open(&mut self, remote: &Remote) -> Result<(), String> {
-        let Some(length) = remote.length.filter(|_| remote.ranges) else {
-            return Err(
-                "the server sends this file only whole, not in pieces, which this build \
-                 cannot download yet"
-                    .to_string(),
-            );
-        };
-        let (name, part, file) = create_part(&self.job.dir, &remote.name, length)?;
-        let (pile, taken) = flume::unbounded();
+    /// Fix the file as `remote`, found through `link`, describes it: a
+    /// full-size `.part`, and every chunk on the pile, or the whole file for
+    /// `link` alone when the server sends no pieces or no length.
+    fn open(&mut self, remote: &Remote, link: LinkId) -> Result<(), String> {
+        let size = remote.length.unwrap_or(0);
+        let (name, part, file) = create_part(&self.job.dir, &remote.name, size)?;
         let done = Ranges::new();
-        for chunk in plan(length, &done) {
-            let _ = pile.send(chunk);
-        }
+        let mode = match remote.length.filter(|_| remote.ranges) {
+            Some(length) => {
+                let (pile, taken) = flume::unbounded();
+                for chunk in plan(length, &done) {
+                    let _ = pile.send(chunk);
+                }
+                Mode::Pieces {
+                    length,
+                    pile,
+                    taken,
+                }
+            }
+            None => {
+                self.note = Some(ONLY_WHOLE.to_string());
+                Mode::Whole {
+                    carrier: link,
+                    started: false,
+                }
+            }
+        };
         self.name = Some(name);
-        self.length = Some(length);
+        self.length = remote.length;
         self.file = Some(Open {
+            fixed: remote.clone(),
             part,
             file: Arc::new(file),
-            length,
             done,
-            pile,
-            taken,
+            mode,
         });
         Ok(())
     }
 
-    fn spawn_workers(&mut self, link: LinkId) {
-        let Some(open) = &self.file else {
+    /// Start `link`'s workers, if it agrees about the file: its own
+    /// `workers_per_link` on the pile, or the one fetching the whole file.
+    fn take_part(&mut self, link: LinkId) {
+        let Some(open) = &mut self.file else {
             return;
         };
         let Some(member) = self.members.iter_mut().find(|m| m.id == link) else {
@@ -346,20 +397,46 @@ impl Download {
         let Some(remote) = &member.remote else {
             return;
         };
-        for _ in 0..self.job.config.workers_per_link {
-            let worker = Worker {
-                link,
-                local: member.local,
-                url: remote.url.clone(),
-                length: open.length,
-                file: open.file.clone(),
-                pile: open.taken.clone(),
-                reports: self.reports_tx.clone(),
-                written: member.written.clone(),
-                stop: member.stop.subscribe(),
-                read_deadline: self.job.config.read_deadline,
-            };
-            let task = self.workers.spawn(worker.run());
+        let worker = || Worker {
+            link,
+            local: member.local,
+            url: remote.url.clone(),
+            validator: remote.validator.clone(),
+            file: open.file.clone(),
+            reports: self.reports_tx.clone(),
+            written: member.written.clone(),
+            stop: member.stop.subscribe(),
+            read_deadline: self.job.config.read_deadline,
+        };
+        let mut started = Vec::new();
+        match &mut open.mode {
+            Mode::Pieces { length, taken, .. } => {
+                if let Some(why) = differs(&open.fixed, remote) {
+                    member.note = Some(why);
+                    return;
+                }
+                for _ in 0..self.job.config.workers_per_link {
+                    started.push(self.workers.spawn(worker().run(taken.clone(), *length)));
+                }
+            }
+            Mode::Whole {
+                carrier,
+                started: going,
+            } => {
+                if *carrier != link {
+                    member.note = Some(
+                        "sits out: the server sends the file only whole, so one cable fetches it"
+                            .to_string(),
+                    );
+                    return;
+                }
+                if !*going {
+                    *going = true;
+                    started.push(self.workers.spawn(worker().run_whole(self.length)));
+                }
+            }
+        }
+        for task in started {
             self.working.insert(task.id(), link);
             member.workers += 1;
         }
@@ -372,25 +449,54 @@ impl Download {
         let Range { start, end } = report.range;
         let written_to = start + report.written;
         open.done.insert(start..written_to);
-        if written_to < end {
-            // Only what is still missing goes back.
-            let _ = open.pile.send(written_to..end);
-        }
-        let complete = open.done.is_complete(open.length);
+        let whole = match &open.mode {
+            Mode::Pieces { pile, .. } => {
+                if written_to < end {
+                    // Only what is still missing goes back.
+                    let _ = pile.send(written_to..end);
+                }
+                false
+            }
+            Mode::Whole { .. } => true,
+        };
+        let complete = match &open.mode {
+            Mode::Pieces { length, .. } => open.done.is_complete(*length),
+            Mode::Whole { .. } => report.outcome == Outcome::Done,
+        };
         let part = open.part.clone();
-        match report.outcome {
-            Outcome::Done | Outcome::Short | Outcome::Stopped => {}
-            Outcome::Failed(why) => {
+        match (whole, report.outcome) {
+            (_, Outcome::Changed(why)) => return self.fail(why),
+            (_, Outcome::Disk(why)) => {
+                return self.fail(format!("cannot write {}: {why}", part.display()));
+            }
+            (false, Outcome::Failed(why)) => {
                 if let Some(member) = self.member(report.link) {
                     member.note = Some(why);
                 }
             }
-            Outcome::Disk(why) => {
-                self.fail(format!("cannot write {}: {why}", part.display()));
-                return;
+            (false, _) | (true, Outcome::Done) => {}
+            (true, Outcome::Stopped) => {
+                return self.fail(
+                    "the cable carrying the file went away, and this server sends it only \
+                     whole, so the download cannot resume"
+                        .to_string(),
+                );
+            }
+            (true, outcome) => {
+                let why = match outcome {
+                    Outcome::Failed(why) => why,
+                    _ => "the file ended early".to_string(),
+                };
+                return self.fail(format!(
+                    "{why}; this server sends the file only whole, so the download cannot resume"
+                ));
             }
         }
         if complete {
+            if whole && self.length.is_none() {
+                // Only now is the length known: what arrived before the end.
+                self.length = Some(written_to);
+            }
             self.finish().await;
         }
     }
@@ -402,14 +508,10 @@ impl Download {
             return;
         };
         let Open {
-            part,
-            file,
-            pile,
-            taken,
-            ..
+            part, file, mode, ..
         } = open;
         // A closed pile ends the workers waiting on it, and a stop the rest.
-        drop((pile, taken));
+        drop(mode);
         for member in &self.members {
             member.stop.send_replace(true);
         }
@@ -452,7 +554,7 @@ impl Download {
     }
 
     /// Links are usable, yet none is finding the file or fetching it: every
-    /// one has failed, so the download fails, with the last reason.
+    /// one has failed or sits out, so the download fails, with a reason.
     fn check_stuck(&mut self) {
         if self.ended.is_some() {
             return;

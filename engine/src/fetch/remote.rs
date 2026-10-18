@@ -72,6 +72,51 @@ pub enum Validator {
     LastModified(String),
 }
 
+impl Validator {
+    /// As it goes in `If-Range`.
+    pub fn value(&self) -> &str {
+        match self {
+            Validator::ETag(tag) => tag,
+            Validator::LastModified(date) => date,
+        }
+    }
+}
+
+/// Why a link that found `other` cannot fetch pieces of the file `fixed`
+/// describes, or `None` when it can (PLAN.md Review Focus 1: a CDN picks a
+/// node per public address, and nodes can hold different versions).
+///
+/// It must send pieces, of a file the same length, of the same version when
+/// both validators are of one kind. A tag and a date, or one missing, cannot
+/// tell two versions apart, so they are not compared; the length still is,
+/// and `If-Range` with the link's own validator guards each piece.
+pub fn differs(fixed: &Remote, other: &Remote) -> Option<String> {
+    if !other.ranges {
+        return Some("sits out: the server sends this cable the file only whole".to_string());
+    }
+    if other.length != fixed.length {
+        let size =
+            |length: Option<u64>| length.map_or("unknown size".into(), |l| format!("{l} bytes"));
+        return Some(format!(
+            "sits out: the server gave this cable a file of {}, not {}, rather than mix two files",
+            size(other.length),
+            size(fixed.length)
+        ));
+    }
+    match (&fixed.validator, &other.validator) {
+        (Some(Validator::ETag(ours)), Some(Validator::ETag(theirs)))
+        | (Some(Validator::LastModified(ours)), Some(Validator::LastModified(theirs)))
+            if ours != theirs =>
+        {
+            Some(format!(
+                "sits out: the server gave this cable another version of the file ({theirs}, not \
+                 {ours})"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The file at `url` as the link that owns `local` sees it, after that
 /// link's redirects.
 pub async fn find(local: IpAddr, url: &Url) -> anyhow::Result<Remote> {
@@ -231,4 +276,78 @@ fn number(headers: &HeaderMap, name: HeaderName) -> Option<u64> {
 
 fn header_text(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
     headers.get(name)?.to_str().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote(length: Option<u64>, ranges: bool, validator: Option<Validator>) -> Remote {
+        Remote {
+            url: Url::parse("http://example.com/x.iso").unwrap(),
+            length,
+            ranges,
+            validator,
+            name: "x.iso".to_string(),
+        }
+    }
+
+    fn etag(tag: &str) -> Option<Validator> {
+        Some(Validator::ETag(tag.to_string()))
+    }
+
+    fn date(date: &str) -> Option<Validator> {
+        Some(Validator::LastModified(date.to_string()))
+    }
+
+    #[test]
+    fn the_same_file_agrees() {
+        let fixed = remote(Some(100), true, etag("\"a\""));
+        assert_eq!(differs(&fixed, &fixed.clone()), None);
+        // Another node's URL is still the same file.
+        let mut elsewhere = fixed.clone();
+        elsewhere.url = Url::parse("http://cdn.example.com/x.iso").unwrap();
+        assert_eq!(differs(&fixed, &elsewhere), None);
+    }
+
+    #[test]
+    fn a_link_without_pieces_sits_out() {
+        let fixed = remote(Some(100), true, None);
+        let note = differs(&fixed, &remote(Some(100), false, None)).unwrap();
+        assert!(note.contains("only whole"), "{note}");
+    }
+
+    #[test]
+    fn another_length_sits_out() {
+        let fixed = remote(Some(100), true, None);
+        let note = differs(&fixed, &remote(Some(90), true, None)).unwrap();
+        assert!(note.contains("90 bytes") && note.contains("100"), "{note}");
+        assert!(differs(&fixed, &remote(None, true, None)).is_some());
+    }
+
+    #[test]
+    fn another_version_sits_out() {
+        let fixed = remote(Some(100), true, etag("\"a\""));
+        let note = differs(&fixed, &remote(Some(100), true, etag("\"b\""))).unwrap();
+        assert!(
+            note.contains("another version") && note.contains("\"b\""),
+            "{note}"
+        );
+
+        let dated = remote(Some(100), true, date("Sat, 17 Oct 2026 10:00:00 GMT"));
+        let other = remote(Some(100), true, date("Sun, 18 Oct 2026 10:00:00 GMT"));
+        assert!(differs(&dated, &other).is_some());
+    }
+
+    /// One side's validator says nothing about the other's: a tag and a
+    /// date, or one missing, cannot show two versions apart.
+    #[test]
+    fn validators_of_different_kinds_are_not_compared() {
+        let tagged = remote(Some(100), true, etag("\"a\""));
+        let dated = remote(Some(100), true, date("Sat, 17 Oct 2026 10:00:00 GMT"));
+        let bare = remote(Some(100), true, None);
+        assert_eq!(differs(&tagged, &dated), None);
+        assert_eq!(differs(&tagged, &bare), None);
+        assert_eq!(differs(&bare, &tagged), None);
+    }
 }

@@ -464,3 +464,183 @@ async fn a_file_no_link_can_find_fails_with_the_reason() {
         "left a file"
     );
 }
+
+// When the server and the links disagree (Task 6).
+
+/// The cable's share in `status`, by name.
+fn share<'a>(status: &'a DownloadStatus, name: &str) -> &'a barrage::fetch::LinkShare {
+    status
+        .links
+        .iter()
+        .find(|l| l.name == name)
+        .unwrap_or_else(|| panic!("no share for {name}: {status:?}"))
+}
+
+/// Review Focus 1: a CDN node holding another version. The Wi-Fi comes up
+/// first, so its version is the one fixed; Ethernet 2's node then sends
+/// another, and Ethernet 2 must take no part.
+#[tokio::test]
+async fn a_link_sent_a_different_file_sits_out_and_says_why() {
+    let mut steps = vec![vec![wifi()]; 5];
+    steps.push(vec![wifi(), ethernet()]);
+    let links = links(steps);
+    let length = 20 * MIB;
+    let file = File::new(length)
+        .rate(4 * MIB)
+        .etag("\"a\"")
+        .etag_for(ETHERNET, "\"b\"");
+    let (server, dir, downloads, id) = start("versions.bin", file, &links).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("versions.bin"), length);
+    let seen = server.seen();
+    // Its probe, and nothing more.
+    assert_eq!(seen.iter().filter(|s| s.source == ip(ETHERNET)).count(), 1);
+    let note = share(&end, "Ethernet 2").note.clone().unwrap_or_default();
+    assert!(note.contains("another version"), "{note}");
+    // Every piece asked for the version the download was fixed to.
+    for piece in seen.iter().filter(|s| !is_probe(s)) {
+        assert_eq!(piece.if_range.as_deref(), Some("\"a\""), "{piece:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_file_that_changes_mid_download_fails_rather_than_mix_versions() {
+    let links = both();
+    let file = File::new(20 * MIB)
+        .rate(4 * MIB)
+        .etag("\"v1\"")
+        .replaced_after(5, "\"v2\"");
+    let (_server, dir, downloads, id) = start("changes.bin", file, &links).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Failed, "{end:?}");
+    let note = end.note.unwrap_or_default();
+    assert!(note.contains("changed"), "{note}");
+    assert!(!dir.0.join("changes.bin").exists());
+    // Left for a later download to decide about.
+    assert!(dir.0.join("changes.bin.part").exists());
+}
+
+/// A change only the length shows: the same ETag, a longer file.
+#[tokio::test]
+async fn a_file_whose_length_changes_mid_download_fails_too() {
+    let links = both();
+    let file = File::new(20 * MIB)
+        .rate(4 * MIB)
+        .etag("\"same\"")
+        .grows_after(5, 21 * MIB);
+    let (_server, dir, downloads, id) = start("grows.bin", file, &links).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Failed, "{end:?}");
+    let note = end.note.unwrap_or_default();
+    assert!(note.contains("length"), "{note}");
+    assert!(!dir.0.join("grows.bin").exists());
+}
+
+#[tokio::test]
+async fn a_link_with_no_address_for_the_host_sits_out() {
+    let ipv6 = cand_idx(3, "Ethernet 3", "::1", true);
+    let links = links(vec![vec![wifi(), ipv6]]);
+    let length = 4 * MIB;
+    let (_server, dir, downloads, id) = start("v4.bin", File::new(length), &links).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("v4.bin"), length);
+    let share = share(&end, "Ethernet 3");
+    assert_eq!(share.bytes, 0);
+    let note = share.note.clone().unwrap_or_default();
+    assert!(note.contains("only IPv4 addresses"), "{note}");
+}
+
+#[tokio::test]
+async fn a_server_without_ranges_is_fetched_whole_through_one_link() {
+    let links = both();
+    let length = 8 * MIB;
+    let file = File::new(length).no_ranges().rate(8 * MIB);
+    let (server, dir, downloads, id) = start("whole.bin", file, &links).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("whole.bin"), length);
+    let note = end.note.clone().unwrap_or_default();
+    assert!(note.contains("only whole"), "{note}");
+    // The probes asked for a range; the file itself came in one plain GET.
+    let seen = server.seen();
+    let plain: Vec<&Seen> = seen.iter().filter(|s| s.range.is_none()).collect();
+    assert_eq!(plain.len(), 1, "{plain:?}");
+    let carriers = end.links.iter().filter(|l| l.bytes > 0).count();
+    assert_eq!(carriers, 1);
+    // The other says why it took no part.
+    for idle in end.links.iter().filter(|l| l.bytes == 0) {
+        let note = idle.note.clone().unwrap_or_default();
+        assert!(note.contains("only whole"), "{idle:?}");
+    }
+}
+
+/// Nothing can pick up where a whole download broke off, so it fails, and
+/// says so, rather than start again from nothing behind the user's back.
+#[tokio::test]
+async fn a_whole_download_that_breaks_off_cannot_resume() {
+    let links = both();
+    let server = Server::start().await;
+    // Wi-Fi alone, so it carries the file; its probe uses up the first cut.
+    let file = File::new(8 * MIB)
+        .no_ranges()
+        .rate(8 * MIB)
+        .cut(WIFI, 2 * MIB, 2);
+    server.at("/breaks.bin", Answer::File(file));
+    let dir = Folder::new("breaks");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), config());
+    let id = downloads
+        .add(AddRequest {
+            url: server.url("/breaks.bin").to_string(),
+            cables: Some(vec!["Wi-Fi".to_string()]),
+        })
+        .await
+        .unwrap();
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Failed, "{end:?}");
+    let note = end.note.unwrap_or_default();
+    assert!(note.contains("cannot resume"), "{note}");
+    assert!(!dir.0.join("breaks.bin").exists());
+}
+
+#[tokio::test]
+async fn a_server_without_a_length_is_fetched_whole_too() {
+    let links = both();
+    let length = 4 * MIB;
+    let file = File::new(length).no_ranges().no_length().rate(4 * MIB);
+    let (_server, dir, downloads, id) = start("chunked.bin", file, &links).await;
+
+    let running = wait_for(&downloads, id, "data", |s| {
+        s.phase == Phase::Downloading && s.done > 0
+    })
+    .await;
+    assert_eq!(running.length, None);
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_eq!((end.done, end.length), (length, Some(length)));
+    assert_same(&dir.read("chunked.bin"), length);
+}
+
+/// Nothing to fetch, through ranges (a 416 saying 0) or without them (a 200
+/// with no body): done at once, an empty file.
+#[tokio::test]
+async fn an_empty_file_is_done_at_once() {
+    let links = both();
+    for (name, file) in [
+        ("empty.bin", File::new(0)),
+        ("empty-whole.bin", File::new(0).no_ranges()),
+    ] {
+        let (_server, dir, downloads, id) = start(name, file, &links).await;
+        let end = ended(&downloads, id).await;
+        assert_eq!(end.phase, Phase::Done, "{name}: {end:?}");
+        assert_eq!(end.length, Some(0));
+        assert!(dir.read(name).is_empty());
+    }
+}

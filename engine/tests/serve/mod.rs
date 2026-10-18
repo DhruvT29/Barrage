@@ -28,6 +28,8 @@ use tokio::net::TcpListener;
 
 /// What one path answers.
 #[derive(Clone, Debug)]
+// A handful of scripts per test, so the size of a File in each is nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Answer {
     File(File),
     /// This status with this `Location`, written exactly as given.
@@ -68,6 +70,22 @@ pub struct File {
     /// `Content-Range` that says so.
     pub from_the_top: bool,
     pub cuts: Vec<Cut>,
+    /// The ETag one source is sent instead of `etag`: another version of the
+    /// file, as one CDN node might hold.
+    pub etag_for: Vec<(IpAddr, String)>,
+    /// The file as it is once replaced, after some requests.
+    pub replaced: Option<Replaced>,
+    /// Requests for this file so far, from every source.
+    requests: Arc<AtomicUsize>,
+}
+
+/// The file after it is replaced on the server: from the `after`th request
+/// on, its ETag, its length, or both, are these.
+#[derive(Clone, Debug)]
+pub struct Replaced {
+    after: usize,
+    etag: Option<String>,
+    length: Option<u64>,
 }
 
 /// Close the connection partway through some answers to one source.
@@ -102,7 +120,38 @@ impl File {
             past_the_range: false,
             from_the_top: false,
             cuts: Vec::new(),
+            etag_for: Vec::new(),
+            replaced: None,
+            requests: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn etag_for(mut self, source: &str, tag: &str) -> Self {
+        self.etag_for
+            .push((source.parse().unwrap(), tag.to_string()));
+        self
+    }
+
+    /// Replace the file with a new version, ETag `tag`, after `after`
+    /// requests.
+    pub fn replaced_after(mut self, after: usize, tag: &str) -> Self {
+        self.replaced = Some(Replaced {
+            after,
+            etag: Some(tag.to_string()),
+            length: None,
+        });
+        self
+    }
+
+    /// Make the file `length` bytes long after `after` requests, keeping its
+    /// ETag: a change only the length shows.
+    pub fn grows_after(mut self, after: usize, length: u64) -> Self {
+        self.replaced = Some(Replaced {
+            after,
+            etag: None,
+            length: Some(length),
+        });
+        self
     }
 
     pub fn no_ranges(mut self) -> Self {
@@ -174,6 +223,7 @@ pub struct Seen {
     pub method: Method,
     pub path: String,
     pub range: Option<String>,
+    pub if_range: Option<String>,
     /// Body bytes handed to the connection so far.
     pub sent: Arc<AtomicU64>,
     pub started: Instant,
@@ -305,14 +355,23 @@ async fn answer(
     request: Request,
 ) -> Response {
     let path = request.uri().path().to_string();
-    let range = request
-        .headers()
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    // In a block, so no borrow of the request lives on across an await: its
+    // body is not Sync, which would make this handler's future not Send.
+    let (range, if_range) = {
+        let text = |name| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        (text(header::RANGE), text(header::IF_RANGE))
+    };
     let script = shared.routes.lock().unwrap().get(&path).cloned();
     let plan = match &script {
-        Some(Answer::File(file)) => Some(file.plan(range.as_deref(), peer.ip())),
+        Some(Answer::File(file)) => {
+            Some(file.plan(range.as_deref(), if_range.as_deref(), peer.ip()))
+        }
         _ => None,
     };
     let sent = Arc::new(AtomicU64::new(0));
@@ -322,6 +381,7 @@ async fn answer(
         method: request.method().clone(),
         path,
         range,
+        if_range,
         sent: sent.clone(),
         started: Instant::now(),
         finished: finished.clone(),
@@ -371,6 +431,9 @@ struct Plan {
     /// Where the file's own bytes end; past it, [`NOT_THE_FILE`].
     real_until: u64,
     cut: Option<u64>,
+    /// The file as this request finds it.
+    length: u64,
+    etag: Option<String>,
 }
 
 enum Kind {
@@ -380,14 +443,21 @@ enum Kind {
 }
 
 impl File {
-    fn plan(&self, range: Option<&str>, source: IpAddr) -> Plan {
-        let asked = range.filter(|_| self.ranges).and_then(parse_range);
+    fn plan(&self, range: Option<&str>, if_range: Option<&str>, source: IpAddr) -> Plan {
+        let (length, etag) = self.version(source);
+        // If-Range: the range only for the version the client names, else
+        // the whole file, so a client never gets a piece of another version.
+        let current =
+            |v: &str| etag.as_deref() == Some(v) || self.last_modified.as_deref() == Some(v);
+        let asked = range
+            .filter(|_| self.ranges && if_range.is_none_or(current))
+            .and_then(parse_range);
         let (kind, range, real_until) = match asked {
-            Some((start, _)) if start >= self.length => (Kind::Unsatisfiable, 0..0, 0),
+            Some((start, _)) if start >= length => (Kind::Unsatisfiable, 0..0, 0),
             Some((start, last)) => {
-                let asked_end = last.map_or(self.length, |last| (last + 1).min(self.length));
+                let asked_end = last.map_or(length, |last| (last + 1).min(length));
                 let mut end = if self.past_the_range {
-                    self.length
+                    length
                 } else {
                     asked_end
                 };
@@ -395,11 +465,12 @@ impl File {
                     end = end.min(start + most);
                 }
                 if self.from_the_top {
-                    return self.plan_from_the_top(end - start);
+                    (Kind::Partial, 0..end - start, end - start)
+                } else {
+                    (Kind::Partial, start..end, asked_end)
                 }
-                (Kind::Partial, start..end, asked_end)
             }
-            None => (Kind::Whole, 0..self.length, self.length),
+            None => (Kind::Whole, 0..length, length),
         };
         let cut = self.cuts.iter().find_map(|c| {
             (c.source == source && range.end - range.start > c.after && c.take())
@@ -410,17 +481,25 @@ impl File {
             range,
             real_until,
             cut,
+            length,
+            etag,
         }
     }
 
-    /// As many bytes as were asked for, from the top of the file.
-    fn plan_from_the_top(&self, length: u64) -> Plan {
-        Plan {
-            kind: Kind::Partial,
-            range: 0..length,
-            real_until: length,
-            cut: None,
-        }
+    /// The file's length and ETag for this request from `source`, counting
+    /// it.
+    fn version(&self, source: IpAddr) -> (u64, Option<String>) {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst);
+        let replaced = self.replaced.as_ref().filter(|r| n >= r.after);
+        let length = replaced.and_then(|r| r.length).unwrap_or(self.length);
+        let etag = replaced
+            .and_then(|r| r.etag.clone())
+            .or_else(|| {
+                let own = self.etag_for.iter().find(|(s, _)| *s == source);
+                own.map(|(_, tag)| tag.clone())
+            })
+            .or_else(|| self.etag.clone());
+        (length, etag)
     }
 }
 
@@ -430,6 +509,7 @@ fn serve_file(
     sent: Arc<AtomicU64>,
     finished: Arc<OnceLock<Instant>>,
 ) -> Response {
+    let (length, etag) = (plan.length, plan.etag.clone());
     let mut response = match plan.kind {
         Kind::Unsatisfiable => {
             let _ = finished.set(Instant::now());
@@ -437,7 +517,7 @@ fn serve_file(
             set(
                 &mut response,
                 header::CONTENT_RANGE,
-                format!("bytes */{}", file.length),
+                format!("bytes */{length}"),
             );
             response
         }
@@ -445,7 +525,7 @@ fn serve_file(
             let Range { start, end } = plan.range.clone();
             let mut response = Response::new(body(file, plan, sent, finished));
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
-            let content_range = format!("bytes {start}-{}/{}", end - 1, file.length);
+            let content_range = format!("bytes {start}-{}/{length}", end - 1);
             set(&mut response, header::CONTENT_RANGE, content_range);
             set(
                 &mut response,
@@ -457,17 +537,13 @@ fn serve_file(
         Kind::Whole => {
             let mut response = Response::new(body(file, plan, sent, finished));
             if file.send_length {
-                set(
-                    &mut response,
-                    header::CONTENT_LENGTH,
-                    file.length.to_string(),
-                );
+                set(&mut response, header::CONTENT_LENGTH, length.to_string());
             }
             response
         }
     };
-    if let Some(tag) = &file.etag {
-        set(&mut response, header::ETAG, tag.clone());
+    if let Some(tag) = etag {
+        set(&mut response, header::ETAG, tag);
     }
     if let Some(date) = &file.last_modified {
         set(&mut response, header::LAST_MODIFIED, date.clone());
