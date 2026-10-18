@@ -1,5 +1,8 @@
 // The engine's JSON, field for field, as `engine/src/api/view.rs` writes it.
-// That file is the contract: change both together.
+// contract.ts holds messages the engine really sent, written by its own test:
+// the type check holds them to these types and contract.test.tsx renders
+// them, so a field changed on one side only fails the build or the tests.
+// After changing view.rs, refresh contract.ts as its header says.
 
 /** The engine's state words, the same ones `brg-links` prints. */
 export type LinkState = 'probing' | 'up' | 'portal' | 'degraded' | 'down'

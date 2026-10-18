@@ -743,4 +743,127 @@ mod tests {
         assert!(lines.is_empty());
         assert_eq!(table.links[0].rtt_ms, Some(55));
     }
+
+    /// The page's copy of the contract: messages exactly as this engine
+    /// sends them, written out as TypeScript, so the page's type check holds
+    /// every field to `types.ts` and `contract.test.tsx` renders them.
+    const CONTRACT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ui/src/api/contract.ts");
+
+    const CONTRACT_HEADER: &str = concat!(
+        "// Messages exactly as the engine sends them, written by its test\n",
+        "// `the_ui_contract_file_is_up_to_date` (engine/src/api/view.rs). Do not\n",
+        "// edit: `satisfies` holds them to types.ts whenever the page is\n",
+        "// type-checked (`pnpm build`), and contract.test.tsx renders them. After\n",
+        "// changing the engine's JSON, set BARRAGE_WRITE_CONTRACT=1 and run, from\n",
+        "// engine/: cargo test --lib the_ui_contract_file\n",
+        "import type { LiveMessage } from './types'\n",
+        "\n",
+    );
+
+    /// One of everything the page draws: every state word and every reason a
+    /// cable is left out of the sum, a cable with an IPv4 and an IPv6
+    /// address, a degraded address beside a portal one, and two cables on one
+    /// connection. The change adds an address and a speed, so it has lines.
+    fn contract_sample() -> (Vec<Link>, Vec<Link>) {
+        let portal = |id, name, addr, rtt_ms| Link {
+            rtt: Some(Duration::from_millis(rtt_ms)),
+            ..link(id, name, addr, LinkState::Portal)
+        };
+        let after = vec![
+            up(1, "Wi-Fi", "192.0.2.10", 40, 57_600_000, "203.0.113.7"),
+            up(
+                2,
+                "Ethernet 2",
+                "198.51.100.20",
+                120,
+                141_000_000,
+                "203.0.113.50",
+            ),
+            up(
+                3,
+                "Ethernet 2",
+                "2001:db8::20",
+                95,
+                141_000_000,
+                "2001:db8::20",
+            ),
+            up(
+                4,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                41_000_000,
+                "203.0.113.7",
+            ),
+            with_state(
+                up(
+                    5,
+                    "Ethernet 4",
+                    "198.51.100.40",
+                    300,
+                    9_400_000,
+                    "198.51.100.40",
+                ),
+                LinkState::Degraded,
+            ),
+            portal(6, "Ethernet 4", "2001:db8::40", 60),
+            unmeasured(7, "Ethernet 5", "192.0.2.50", "203.0.113.90"),
+            portal(8, "Ethernet 6", "192.0.2.60", 80),
+            link(9, "Ethernet 7", "192.0.2.70", LinkState::Probing),
+            link(10, "Ethernet 8", "192.0.2.80", LinkState::Down),
+        ];
+        let before = after
+            .iter()
+            .filter(|l| l.id.as_u64() != 3)
+            .map(|l| match l.id.as_u64() {
+                4 => Link {
+                    down_bps: None,
+                    ..l.clone()
+                },
+                _ => l.clone(),
+            })
+            .collect();
+        (before, after)
+    }
+
+    /// Fails when the engine's JSON changes and the page's copy does not,
+    /// which is what made a renamed field leave both test suites green.
+    #[test]
+    fn the_ui_contract_file_is_up_to_date() {
+        let (before, after) = contract_sample();
+        let messages = [
+            LiveMessage::Table {
+                table: table_view(&before),
+            },
+            change_message(&before, &after),
+        ];
+        let json = serde_json::to_string_pretty(&messages).unwrap();
+        let wanted =
+            format!("{CONTRACT_HEADER}export const messages = {json} satisfies LiveMessage[]\n");
+        if std::env::var_os("BARRAGE_WRITE_CONTRACT").is_some() {
+            std::fs::write(CONTRACT, &wanted).unwrap();
+        }
+
+        // Git may hand the file out with Windows line endings.
+        let found = std::fs::read_to_string(CONTRACT)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        if found != wanted {
+            let line = found
+                .lines()
+                .zip(wanted.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| found.lines().count().min(wanted.lines().count()));
+            panic!(
+                "ui/src/api/contract.ts no longer matches what this engine sends. First \
+                 difference, line {}: the file has {:?}, the engine sends {:?}. If the JSON \
+                 is meant to change, set BARRAGE_WRITE_CONTRACT=1 and run cargo test --lib \
+                 the_ui_contract_file to refresh it, then make the page agree: pnpm build \
+                 type-checks it and pnpm test renders it.",
+                line + 1,
+                found.lines().nth(line),
+                wanted.lines().nth(line),
+            );
+        }
+    }
 }
