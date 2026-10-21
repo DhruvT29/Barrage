@@ -40,7 +40,7 @@ pub use chunk::plan;
 pub use disk::downloads_folder;
 pub use name::{file_name, free_name};
 pub use ranges::Ranges;
-pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Remote, Validator, find};
+pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Remote, Validator, find, retry_after};
 
 /// Every download the engine runs, and what each is doing. Cheap to clone:
 /// the clones share the downloads.
@@ -114,6 +114,9 @@ pub struct DownloadConfig {
     /// again. Each failure in a row doubles it, up to `rest_max`.
     pub rest_first: Duration,
     pub rest_max: Duration,
+    /// The longest `Retry-After` a link waits out when the server refuses
+    /// its last connection; asked to wait longer, it sits the download out.
+    pub max_retry_after: Duration,
 }
 
 impl Default for DownloadConfig {
@@ -128,6 +131,8 @@ impl Default for DownloadConfig {
             retry_connection: Duration::from_secs(1),
             rest_first: Duration::from_secs(5),
             rest_max: Duration::from_secs(60),
+            // Cloudflare answered Retry-After: 3311 in phase 2.
+            max_retry_after: Duration::from_secs(60),
         }
     }
 }

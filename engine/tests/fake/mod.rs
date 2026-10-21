@@ -62,6 +62,19 @@ pub struct Fake {
     /// When set, the interface list is whatever this holds at each poll, and
     /// the script is not used.
     live: Option<Live>,
+    /// Probe answers a test switches while the watcher runs, per address.
+    switches: HashMap<IpAddr, Switch>,
+}
+
+/// A probe answer a test changes while the watcher runs: a link that stops
+/// working, and works again, under the same id.
+#[derive(Clone)]
+pub struct Switch(Arc<Mutex<ProbeVerdict>>);
+
+impl Switch {
+    pub fn set(&self, verdict: ProbeVerdict) {
+        *self.0.lock().unwrap() = verdict;
+    }
 }
 
 /// An interface list a test changes while the watcher runs, so a link comes
@@ -99,6 +112,14 @@ impl Fake {
             ..Self::default()
         };
         (fake, live)
+    }
+
+    /// Probes of `ip` answer whatever the returned [`Switch`] holds, at first
+    /// `Working`.
+    pub fn switched(mut self, ip: &str) -> (Self, Switch) {
+        let switch = Switch(Arc::new(Mutex::new(ProbeVerdict::Working)));
+        self.switches.insert(ip.parse().unwrap(), switch.clone());
+        (self, switch)
     }
 
     /// Probe answers for `ip`, in order; the last one repeats.
@@ -216,7 +237,10 @@ impl Network for Fake {
         let verdict = match self.verdicts.lock().unwrap().get_mut(&addr) {
             Some(queue) if queue.len() > 1 && !fail => queue.pop_front().unwrap(),
             Some(queue) => *queue.front().unwrap(),
-            None => ProbeVerdict::Working,
+            None => self
+                .switches
+                .get(&addr)
+                .map_or(ProbeVerdict::Working, |s| *s.0.lock().unwrap()),
         };
         async move {
             if hang {

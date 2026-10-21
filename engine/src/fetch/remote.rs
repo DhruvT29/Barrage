@@ -27,6 +27,7 @@
 //! shrink.
 
 use std::net::IpAddr;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail, ensure};
 use reqwest::header::{
@@ -115,6 +116,19 @@ pub fn differs(fixed: &Remote, other: &Remote) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// How long a `Retry-After` header asks to wait, from `now`: whole seconds,
+/// or until an HTTP date in any of HTTP's three forms. A date already past
+/// is no wait; more seconds than a clock can hold are as long as can be.
+/// `None` for anything else, which is as good as no header.
+pub fn retry_after(header: &str, now: SystemTime) -> Option<Duration> {
+    let text = header.trim();
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(text.parse().map_or(Duration::MAX, Duration::from_secs));
+    }
+    let when = httpdate::parse_http_date(text).ok()?;
+    Some(when.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 /// The file at `url` as the link that owns `local` sees it, after that

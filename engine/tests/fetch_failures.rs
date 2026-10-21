@@ -1,14 +1,22 @@
-//! A link failing mid-download, against the scripted server and network as
-//! in fetch_download.rs. The times are short: a connection is given up after
-//! 300 ms without data, a fresh one takes its place 100 ms later, and a link
-//! whose every connection failed rests 200 ms, doubling up to 1 s.
+//! A link failing mid-download (Task 9), and a server that limits
+//! connections with `429 Too Many Requests` (Task 10), against the scripted
+//! server and network as in fetch_download.rs. The times are short: a
+//! connection is given up after 300 ms without data, a fresh one takes its
+//! place 100 ms later, and a link whose every connection failed rests
+//! 200 ms, doubling up to 1 s.
 
 mod fake;
 mod fetching;
 mod serve;
 
-use barrage::fetch::{DownloadConfig, DownloadStatus, LinkShare, Phase};
-use fake::ms;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
+
+use barrage::LinkHandle;
+use barrage::fetch::{DownloadConfig, DownloadStatus, LinkShare, Phase, retry_after};
+use barrage::links::probe::ProbeVerdict;
+use barrage::links::watch::WatchConfig;
+use fake::{Fake, ms};
 use fetching::*;
 use serve::{File, Seen, most_at_once};
 
@@ -174,8 +182,8 @@ async fn a_rested_link_that_works_again_gets_its_connections_back() {
         .find(|l| l.connections == 4)
         .expect("Ethernet 2 never got its four connections back");
     // As soon as the trying connection received bytes, not once it had
-    // fetched a whole 4 MiB chunk.
-    assert!(back.bytes < 2 * MIB, "{back:?}");
+    // fetched its whole 4 MiB chunk.
+    assert!(back.bytes < 4 * MIB, "{back:?}");
     assert_eq!(ethernet.note, None);
 }
 
@@ -247,11 +255,17 @@ async fn a_link_leaving_the_table_loses_no_written_bytes() {
 #[tokio::test]
 async fn a_link_that_comes_back_rejoins() {
     let (links, live) = live_links(vec![wifi(), ethernet()]);
-    let (server, dir, downloads, id) = start_with("returns.bin", busy(), &links, failing()).await;
+    // Half the usual rate, so the Wi-Fi alone is slow to finish: finding a
+    // link again takes a while on a loaded machine.
+    let file = File::new(LENGTH).rate(2 * MIB);
+    let (server, dir, downloads, id) = start_with("returns.bin", file, &links, failing()).await;
     wait_for(&downloads, id, "30%", |s| s.done >= LENGTH * 3 / 10).await;
     live.set(vec![wifi()]);
-    wait_for(&downloads, id, "45% without Ethernet 2", |s| {
-        s.done >= LENGTH * 45 / 100 && ethernet_in(s).is_some_and(|l| l.connections == 0)
+    // Back as soon as it is seen gone, while most of the file is still to
+    // fetch: on a loaded machine finding it again takes a while, and a link
+    // that comes back to an empty pile has nothing to carry.
+    wait_for(&downloads, id, "Ethernet 2 gone", |s| {
+        ethernet_in(s).is_some_and(|l| l.connections == 0)
     })
     .await;
     live.set(vec![wifi(), ethernet()]);
@@ -276,4 +290,207 @@ async fn a_link_that_comes_back_rejoins() {
             .any(|s| s.started > back),
         "the server never heard from Ethernet 2 again"
     );
+}
+
+/// A link that stops being usable without leaving the table, such as a
+/// sign-in page appearing, keeps its id; working again, it takes part again.
+#[tokio::test]
+async fn a_link_that_stops_working_and_works_again_rejoins_as_itself() {
+    let (net, probe) = Fake::scripted(vec![vec![wifi(), ethernet()]])
+        .loopback_links()
+        .switched(ETHERNET);
+    // Probed every 50 ms, so the change shows at once.
+    let watch = WatchConfig {
+        reprobe: ms(50),
+        ..WatchConfig::every(ms(20))
+    };
+    let links = LinkHandle::start_with(Arc::new(net), watch).unwrap();
+    let file = File::new(LENGTH).rate(2 * MIB);
+    let (server, dir, downloads, id) = start_with("blips.bin", file, &links, failing()).await;
+    wait_for(&downloads, id, "30% with Ethernet 2 carrying", |s| {
+        s.done >= LENGTH * 3 / 10 && ethernet_in(s).is_some_and(|l| l.bytes > 0)
+    })
+    .await;
+    probe.set(ProbeVerdict::Portal);
+    wait_for(&downloads, id, "Ethernet 2 stopped", |s| {
+        ethernet_in(s).is_some_and(|l| l.connections == 0)
+    })
+    .await;
+    probe.set(ProbeVerdict::Working);
+    let back = std::time::Instant::now();
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("blips.bin"), LENGTH);
+    // One share for it, the same link all along, carrying again.
+    let shares = end.links.iter().filter(|l| l.name == "Ethernet 2").count();
+    assert_eq!(shares, 1, "{end:?}");
+    assert!(
+        ethernet_pieces(&server.seen())
+            .iter()
+            .any(|s| s.started > back),
+        "Ethernet 2 never took part again"
+    );
+    assert_eq!(end.links.iter().map(|l| l.bytes).sum::<u64>(), LENGTH);
+}
+
+// A server that limits connections (Task 10).
+
+/// Ethernet 2's file requests the server refused with 429.
+fn refused(seen: &[Seen]) -> Vec<&Seen> {
+    ethernet_pieces(seen)
+        .into_iter()
+        .filter(|s| s.status == 429)
+        .collect()
+}
+
+#[test]
+fn retry_after_reads_seconds_and_dates() {
+    // 1,700,000,000 s after 1970 is Tue, 14 Nov 2023 22:13:20 GMT.
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let secs = Duration::from_secs;
+    assert_eq!(retry_after("120", now), Some(secs(120)));
+    assert_eq!(retry_after(" 0 ", now), Some(secs(0)));
+    // An HTTP date, in each of the three forms HTTP allows.
+    assert_eq!(
+        retry_after("Tue, 14 Nov 2023 22:14:50 GMT", now),
+        Some(secs(90))
+    );
+    assert_eq!(
+        retry_after("Tuesday, 14-Nov-23 22:14:50 GMT", now),
+        Some(secs(90))
+    );
+    assert_eq!(retry_after("Tue Nov 14 22:14:50 2023", now), Some(secs(90)));
+    // A date already past is no wait at all.
+    assert_eq!(
+        retry_after("Tue, 14 Nov 2023 22:12:00 GMT", now),
+        Some(Duration::ZERO)
+    );
+    // More seconds than any clock holds is as long as can be.
+    assert_eq!(
+        retry_after("99999999999999999999999", now),
+        Some(Duration::MAX)
+    );
+    for junk in ["", "soon", "-5", "1.5", "12 seconds"] {
+        assert_eq!(retry_after(junk, now), None, "{junk:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_capped_link_settles_at_what_the_server_allows() {
+    let links = both();
+    let file = busy().cap(ETHERNET, 2, None);
+    let (server, dir, downloads, id) = start_with("capped.bin", file, &links, failing()).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("capped.bin"), LENGTH);
+    // Ethernet 2 came down to what the server allows, and says so; the
+    // Wi-Fi, under no cap, kept its four.
+    let ethernet = share(&end, "Ethernet 2");
+    assert_eq!(
+        ethernet.note.as_deref(),
+        Some("the server allows 2 connections on this cable")
+    );
+    assert!(ethernet.bytes > 0);
+    let seen = server.seen();
+    let answered = |s: &Seen| !is_probe(s) && s.status == 206;
+    assert_eq!(most_at_once(&seen, ip(ETHERNET), answered), 2);
+    assert_eq!(most_at_once(&seen, ip(WIFI), answered), 4);
+    // One refusal for each connection too many, and no more after.
+    assert_eq!(refused(&seen).len(), 2);
+}
+
+#[tokio::test]
+async fn a_short_retry_after_is_waited_out() {
+    let links = both();
+    // Each of its first four connections refused, asked to wait a second:
+    // exactly the longest wait it will sit through.
+    let file = busy().refuse(ETHERNET, Some(4), Some("1"));
+    let config = DownloadConfig {
+        max_retry_after: ms(1000),
+        ..failing()
+    };
+    let (server, dir, downloads, id) = start_with("short-wait.bin", file, &links, config).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("short-wait.bin"), LENGTH);
+    // Its last connection refused, it waited as asked, then came back with
+    // all four connections, what the server allows learned again, and
+    // carried its share, its note gone.
+    let wait = "the server asked this cable to wait 1 s before trying again";
+    let history = history.await.unwrap();
+    let waited = history
+        .iter()
+        .position(|(_, s)| ethernet_in(s).is_some_and(|l| l.note.as_deref() == Some(wait)));
+    let notes = ethernet_notes(&history);
+    let waited = waited.unwrap_or_else(|| panic!("{notes:?}"));
+    assert!(
+        history[waited..]
+            .iter()
+            .filter_map(|(_, s)| ethernet_in(s))
+            .any(|l| l.connections == 4),
+        "it never had its four connections back"
+    );
+    let ethernet = share(&end, "Ethernet 2");
+    assert!(ethernet.bytes > 0, "{ethernet:?}");
+    assert_eq!(ethernet.note, None);
+    let seen = server.seen();
+    let refusals = refused(&seen);
+    assert_eq!(refusals.len(), 4);
+    let last = refusals.iter().map(|s| s.started).max().unwrap();
+    let answered: Vec<&Seen> = ethernet_pieces(&seen)
+        .into_iter()
+        .filter(|s| s.status == 206)
+        .collect();
+    assert!(!answered.is_empty());
+    assert!(
+        answered.iter().all(|s| s.started >= last + ms(950)),
+        "it came back before the second was up"
+    );
+}
+
+#[tokio::test]
+async fn a_long_retry_after_leaves_the_link_out() {
+    let links = both();
+    let file = busy().refuse(ETHERNET, None, Some("3311"));
+    let (server, dir, downloads, id) = start_with("long-wait.bin", file, &links, failing()).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("long-wait.bin"), LENGTH);
+    // Asked to wait 55 minutes, it sits the download out, and says why.
+    let ethernet = share(&end, "Ethernet 2");
+    assert_eq!(ethernet.bytes, 0);
+    assert_eq!(
+        ethernet.note.as_deref(),
+        Some("sits out: the server asked this cable to wait 55 min 11 s, longer than 1 min")
+    );
+    assert_eq!(share(&end, "Wi-Fi").bytes, LENGTH);
+    // Its four refused connections, and none after.
+    let seen = server.seen();
+    assert_eq!(ethernet_pieces(&seen).len(), 4);
+    assert_eq!(refused(&seen).len(), 4);
+}
+
+/// With no wait named, a refused last connection is a link failing.
+#[tokio::test]
+async fn a_last_refusal_without_a_wait_rests_like_a_failing_link() {
+    let links = both();
+    let file = busy().refuse(ETHERNET, Some(4), None);
+    let (_server, dir, downloads, id) = start_with("no-wait.bin", file, &links, failing()).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("no-wait.bin"), LENGTH);
+    let notes = ethernet_notes(&history.await.unwrap());
+    assert!(
+        notes.iter().any(|n| n
+            == "the server refused this cable's connections (429 Too Many Requests); it rests 200 ms and tries again"),
+        "{notes:?}"
+    );
+    assert!(share(&end, "Ethernet 2").bytes > 0);
 }

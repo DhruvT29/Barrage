@@ -30,22 +30,25 @@
 //! receiving, so each worker notes when its own last received bytes. An
 //! answer that arrives but cannot be used, an unexpected status or a piece
 //! of the wrong bytes, is no fault of the connection: that worker ends, and
-//! no other takes its place.
+//! no other takes its place. A `429 Too Many Requests` is neither: the
+//! server allows fewer connections through this address, and may say how
+//! long to wait. That worker ends too, and its link holds one fewer
+//! (PLAN.md item 8).
 
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use reqwest::header::{CONTENT_RANGE, IF_RANGE, RANGE};
+use reqwest::header::{CONTENT_RANGE, IF_RANGE, RANGE, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode, Url};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use super::disk::write_all_at;
-use super::remote::{Validator, content_range};
+use super::remote::{Validator, content_range, retry_after};
 use super::wait_words;
 use crate::links::{LinkId, bind};
 
@@ -103,6 +106,10 @@ pub(crate) enum Outcome {
     /// The server's answer cannot be used: an unexpected status, a piece of
     /// other bytes, an answer with nothing in it. The worker ends.
     Failed(String),
+    /// The server refused the connection with `429 Too Many Requests`, and
+    /// asked to wait this long if it said. The worker ends; its link holds
+    /// one connection fewer (PLAN.md item 8).
+    Capped(Option<Duration>),
     /// The file on the server is not the one being fetched any more. The
     /// download ends.
     Changed(String),
@@ -218,6 +225,14 @@ impl Worker {
             } else {
                 "the server stopped sending pieces partway through the download".into()
             }));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let wait = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| retry_after(v, SystemTime::now()));
+            return Err(Outcome::Capped(wait));
         }
         if status != StatusCode::PARTIAL_CONTENT {
             return Err(Outcome::Failed(format!(

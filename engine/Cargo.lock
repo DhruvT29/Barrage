@@ -101,6 +101,7 @@ dependencies = [
  "dns-lookup",
  "flume",
  "futures-util",
+ "httpdate",
  "if-addrs",
  "open",
  "reqwest",

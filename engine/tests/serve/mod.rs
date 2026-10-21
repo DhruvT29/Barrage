@@ -72,6 +72,8 @@ pub struct File {
     pub from_the_top: bool,
     pub cuts: Vec<Cut>,
     pub stalls: Vec<Stall>,
+    pub caps: Vec<Cap>,
+    pub refusals: Vec<Refusal>,
     /// The ETag one source is sent instead of `etag`: another version of the
     /// file, as one CDN node might hold.
     pub etag_for: Vec<(IpAddr, String)>,
@@ -128,6 +130,58 @@ impl Stall {
     }
 }
 
+/// Answer `429 Too Many Requests` to one source's pieces beyond a number open
+/// at once, as a server that limits connections per address does.
+#[derive(Clone, Debug)]
+pub struct Cap {
+    source: IpAddr,
+    most: usize,
+    retry_after: Option<String>,
+    /// The source's pieces being answered now.
+    open: Arc<AtomicUsize>,
+}
+
+impl Cap {
+    /// Room for one more piece, held until the guard is dropped, or `None`.
+    fn enter(&self) -> Option<Slot> {
+        self.open
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.most).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Slot(self.open.clone()))
+    }
+}
+
+/// One piece's place under a [`Cap`], given back when its answer ends.
+pub struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Answer `429 Too Many Requests` to some of one source's pieces, whatever
+/// else is open.
+#[derive(Clone, Debug)]
+pub struct Refusal {
+    source: IpAddr,
+    /// How many are left to refuse; `None`, every one.
+    left: Option<Arc<AtomicUsize>>,
+    retry_after: Option<String>,
+}
+
+impl Refusal {
+    /// Use up one refusal, if any are left.
+    fn take(&self) -> bool {
+        self.left.as_ref().is_none_or(|left| {
+            left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        })
+    }
+}
+
 impl File {
     pub fn new(length: u64) -> Self {
         Self {
@@ -144,6 +198,8 @@ impl File {
             from_the_top: false,
             cuts: Vec::new(),
             stalls: Vec::new(),
+            caps: Vec::new(),
+            refusals: Vec::new(),
             etag_for: Vec::new(),
             replaced: None,
             requests: Arc::new(AtomicUsize::new(0)),
@@ -249,6 +305,29 @@ impl File {
         });
         self
     }
+
+    /// Refuse with 429 any piece for `source` while `most` of its pieces are
+    /// being answered, sending this `Retry-After` if any. Probes pass.
+    pub fn cap(mut self, source: &str, most: usize, retry_after: Option<&str>) -> Self {
+        self.caps.push(Cap {
+            source: source.parse().unwrap(),
+            most,
+            retry_after: retry_after.map(str::to_string),
+            open: Arc::new(AtomicUsize::new(0)),
+        });
+        self
+    }
+
+    /// Refuse with 429 the next `times` pieces for `source`, or with `None`
+    /// every one, sending this `Retry-After` if any. Probes pass.
+    pub fn refuse(mut self, source: &str, times: Option<usize>, retry_after: Option<&str>) -> Self {
+        self.refusals.push(Refusal {
+            source: source.parse().unwrap(),
+            left: times.map(|n| Arc::new(AtomicUsize::new(n))),
+            retry_after: retry_after.map(str::to_string),
+        });
+        self
+    }
 }
 
 /// One request, as the server saw it.
@@ -268,6 +347,8 @@ pub struct Seen {
     pub cut: Option<u64>,
     /// The file offset at which this answer stalls, if it does.
     pub stall: Option<u64>,
+    /// The answer's status; 0 for one never sent.
+    pub status: u16,
 }
 
 impl Seen {
@@ -413,6 +494,14 @@ async fn answer(
     };
     let sent = Arc::new(AtomicU64::new(0));
     let finished = Arc::new(OnceLock::new());
+    let code = match (&script, &plan) {
+        (_, Some(plan)) => plan.status(),
+        (Some(Answer::Silent), _) => 0,
+        (Some(Answer::Status(code) | Answer::Redirect(code, _) | Answer::Headers(code, _)), _) => {
+            *code
+        }
+        _ => 404,
+    };
     shared.seen.lock().unwrap().push(Seen {
         source: peer.ip(),
         method: request.method().clone(),
@@ -424,12 +513,27 @@ async fn answer(
         finished: finished.clone(),
         cut: plan.as_ref().and_then(|p| p.cut),
         stall: plan.as_ref().and_then(|p| p.stall),
+        status: code,
     });
 
     let finish_now = || {
         let _ = finished.set(Instant::now());
     };
     match (script, plan) {
+        (
+            Some(Answer::File(_)),
+            Some(Plan {
+                refused: Some(wait),
+                ..
+            }),
+        ) => {
+            finish_now();
+            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+            if let Some(wait) = wait {
+                set(&mut response, header::RETRY_AFTER, wait);
+            }
+            response
+        }
         (Some(Answer::File(file)), Some(plan)) => serve_file(&file, plan, sent, finished),
         (Some(Answer::Silent), _) => std::future::pending().await,
         (Some(Answer::Status(code)), _) => {
@@ -471,9 +575,24 @@ struct Plan {
     cut: Option<u64>,
     /// The file offset where the answer stops sending, if it stalls.
     stall: Option<u64>,
+    /// Refused with 429, and the `Retry-After` sent with it, if any.
+    refused: Option<Option<String>>,
+    /// Its place under a [`Cap`], held for as long as it is answered.
+    slot: Option<Slot>,
     /// The file as this request finds it.
     length: u64,
     etag: Option<String>,
+}
+
+impl Plan {
+    fn status(&self) -> u16 {
+        match (&self.refused, &self.kind) {
+            (Some(_), _) => 429,
+            (None, Kind::Whole) => 200,
+            (None, Kind::Partial) => 206,
+            (None, Kind::Unsatisfiable) => 416,
+        }
+    }
 }
 
 enum Kind {
@@ -512,13 +631,30 @@ impl File {
             }
             None => (Kind::Whole, 0..length, length),
         };
+        let piece = range.end - range.start > PROBE_BYTES && matches!(kind, Kind::Partial);
+        // A piece is refused before anything else is decided about it.
+        let (mut refused, mut slot) = (None, None);
+        if piece {
+            if let Some(r) = self
+                .refusals
+                .iter()
+                .find(|r| r.source == source && r.take())
+            {
+                refused = Some(r.retry_after.clone());
+            } else if let Some(cap) = self.caps.iter().find(|c| c.source == source) {
+                match cap.enter() {
+                    Some(held) => slot = Some(held),
+                    None => refused = Some(cap.retry_after.clone()),
+                }
+            }
+        }
+        let answered = refused.is_none();
         let cut = self.cuts.iter().find_map(|c| {
-            (c.source == source && range.end - range.start > c.after && c.take())
+            (answered && c.source == source && range.end - range.start > c.after && c.take())
                 .then_some(range.start + c.after)
         });
-        let piece = range.end - range.start > PROBE_BYTES;
         let stall = self.stalls.iter().find_map(|s| {
-            (s.source == source && piece && s.take()).then_some(range.start + s.after)
+            (answered && s.source == source && piece && s.take()).then_some(range.start + s.after)
         });
         Plan {
             kind,
@@ -526,6 +662,8 @@ impl File {
             real_until,
             cut,
             stall,
+            refused,
+            slot,
             length,
             etag,
         }
@@ -625,8 +763,9 @@ fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
 }
 
 /// Marks the answer finished when the body is dropped: at its end, or when
-/// the client goes away.
-struct Finish(Arc<OnceLock<Instant>>);
+/// the client goes away. Its place under a [`Cap`], if it holds one, is given
+/// back then too.
+struct Finish(Arc<OnceLock<Instant>>, Option<Slot>);
 
 impl Drop for Finish {
     fn drop(&mut self) {
@@ -647,7 +786,8 @@ fn body(file: &File, plan: Plan, sent: Arc<AtomicU64>, finished: Arc<OnceLock<In
         .map_or(end, |bytes| end.min(start.saturating_add(bytes)))
         .min(plan.stall.unwrap_or(end));
     let began = tokio::time::Instant::now();
-    let pieces = futures_util::stream::unfold((start, Finish(finished)), move |(at, mark)| {
+    let mark = Finish(finished, plan.slot);
+    let pieces = futures_util::stream::unfold((start, mark), move |(at, mark)| {
         let sent = sent.clone();
         async move {
             if at >= end {

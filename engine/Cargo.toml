@@ -12,6 +12,9 @@ dns-lookup = "4.0.2"
 # The chunk pile: many workers take from one channel, which tokio's own
 # channels do not allow. Only the async half, no fairness or select extras.
 flume = { version = "0.12.0", default-features = false, features = ["async"] }
+# A Retry-After can be an HTTP date, in any of HTTP's three forms. Already in
+# the tree through hyper, so no new code is fetched.
+httpdate = "1.0.3"
 if-addrs = "0.15.0"
 open = "5.4.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }

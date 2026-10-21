@@ -40,6 +40,18 @@
 //! being usable, is stopped at once, without waiting for a deadline; if it
 //! comes back, it does so under a new id, as a new member.
 //!
+//! WHEN THE SERVER LIMITS CONNECTIONS
+//!
+//! A `429 Too Many Requests` is a ceiling, not a failure (PLAN.md item 8):
+//! servers cap connections per address, and each link has an address of its
+//! own. Each 429 ends the connection that got it and nothing takes its
+//! place, so the link settles at what the server takes, never below one,
+//! while the others keep theirs. When its last connection is refused, the
+//! link waits as long as `Retry-After` asks, up to `max_retry_after`, and
+//! sits the download out if asked to wait longer; with no `Retry-After` it
+//! rests as a failing link. A link that works again after waiting may hold
+//! all its connections again, and learns the ceiling afresh.
+//!
 //! With no usable link it waits. When every usable link has given up, on a
 //! file it could not find or answers it could not use, and none is resting,
 //! it fails, and says why.
@@ -636,6 +648,7 @@ impl Download {
                 }
             }
             (false, Outcome::Broken(why)) => self.broken(report.link, why),
+            (false, Outcome::Capped(wait)) => self.capped(report.link, wait),
             (false, Outcome::Done | Outcome::Short) => self.worked(report.link),
             (false, Outcome::Stopped) | (true, Outcome::Done) => {}
             (true, Outcome::Stopped) => {
@@ -665,7 +678,9 @@ impl Download {
     }
 
     /// A chunk came through `link`. After a rest, that brings back the rest
-    /// of its connections, and its rests start short again.
+    /// of its connections, all it may hold, so that what a server allowed
+    /// before it asked the link to wait is learned again; and its rests
+    /// start short again.
     fn worked(&mut self, link: LinkId) {
         let rest_first = self.job.config.rest_first;
         let Some(member) = self.member(link) else {
@@ -678,6 +693,54 @@ impl Download {
         member.backoff = rest_first;
         member.note = None;
         self.add_workers(link, usize::MAX);
+    }
+
+    /// The server refused a connection on `link` with 429: it allows fewer
+    /// connections through this address (PLAN.md item 8). The refused one
+    /// ends and nothing takes its place, so the link settles at what the
+    /// server takes, and says so, while the other links keep their own.
+    /// Counting refusals, rather than looking at who is receiving, does not
+    /// depend on which answer arrives first. Its last connection is never
+    /// counted away: refused too, the link waits as long as the server asked,
+    /// sits the download out if that is longer than `max_retry_after`, or
+    /// rests as a failing link when the server did not say.
+    fn capped(&mut self, link: LinkId, wait: Option<Duration>) {
+        let most = self.job.config.max_retry_after;
+        let Some(member) = self.member(link) else {
+            return;
+        };
+        if !member.present || member.resting.is_some() {
+            return;
+        }
+        let left = member.workers;
+        if left > 0 {
+            member.note = Some(format!(
+                "the server allows {left} connection{} on this cable",
+                if left == 1 { "" } else { "s" }
+            ));
+            return;
+        }
+        match wait {
+            Some(wait) if wait > most => {
+                member.refills.clear();
+                member.note = Some(format!(
+                    "sits out: the server asked this cable to wait {}, longer than {}",
+                    wait_words(wait),
+                    wait_words(most)
+                ));
+            }
+            Some(wait) => {
+                let note = format!(
+                    "the server asked this cable to wait {} before trying again",
+                    wait_words(wait)
+                );
+                self.pause(link, wait, note);
+            }
+            None => self.rest(
+                link,
+                "the server refused this cable's connections (429 Too Many Requests)".to_string(),
+            ),
+        }
     }
 
     /// A connection on `link` failed, and has already given up its seat. If
@@ -712,8 +775,8 @@ impl Download {
             .any(|s| s.link == link && heard_within(s.heard.load(Ordering::SeqCst), now, window))
     }
 
-    /// Stop every connection of `link` and let it rest before one tries
-    /// again, saying why.
+    /// Let a failing `link` rest before one connection tries again, each rest
+    /// in a row twice the last, saying why.
     fn rest(&mut self, link: LinkId, why: String) {
         let rest_max = self.job.config.rest_max;
         let Some(member) = self.member(link) else {
@@ -721,16 +784,23 @@ impl Download {
         };
         let rest = member.backoff;
         member.backoff = next_rest(rest, rest_max);
+        let note = format!("{why}; it rests {} and tries again", wait_words(rest));
+        self.pause(link, rest, note);
+    }
+
+    /// Stop every connection of `link` for `rest`, with `note` saying why,
+    /// after which one connection tries again.
+    fn pause(&mut self, link: LinkId, rest: Duration, note: String) {
+        let Some(member) = self.member(link) else {
+            return;
+        };
         member.resting = Some(Instant::now() + rest);
         member.refills.clear();
         member.trial = false;
         // Its workers stop on the old signal; the next ones listen to a new.
         member.stop.send_replace(true);
         member.stop = watch::channel(false).0;
-        member.note = Some(format!(
-            "{why}; it rests {} and tries again",
-            wait_words(rest)
-        ));
+        member.note = Some(note);
     }
 
     /// When something is next due: a rest ending, or a fresh connection.
