@@ -55,14 +55,30 @@
 //! With no usable link it waits. When every usable link has given up, on a
 //! file it could not find or answers it could not use, and none is resting,
 //! it fails, and says why.
+//!
+//! WHEN THE ENGINE STOPS
+//!
+//! Progress is saved beside the `.part` (`saved.rs`) at most every
+//! `save_every`, with what each connection has written of the chunk it is
+//! on, and once more at the end: when the engine stops, every connection
+//! stops and reports what it wrote first, and a download that fails saves
+//! what it had before it shows as failed. Each save flushes the `.part`
+//! first, and runs in the background, one at a time, so a slow disk holds
+//! back the progress on it, never the download.
+//!
+//! The next engine, given the same URL, looks for that progress under the
+//! names the file would be given, in the order they are tried, and if the
+//! server's file is still the same length and version, fetches only what is
+//! missing. Otherwise it starts over and says why. A file the server sends
+//! only whole cannot be picked up again, so no progress is kept for it.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Url;
@@ -70,11 +86,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::disk::{create_part, name_finished};
+use super::disk::{create_part, name_finished, reopen_part};
+use super::name::{names_like, taken};
 use super::remote::{Remote, differs, find};
+use super::saved::{Saved, load, progress_path, save};
 use super::worker::{Exit, Outcome, Report, Worker, stamp};
 use super::{
-    DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, plan, wait_words,
+    DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, plan, same_file,
+    size_words, wait_words,
 };
 use crate::links::watch::LinkTable;
 use crate::links::{Link, LinkId};
@@ -94,6 +113,8 @@ pub(crate) struct Job {
     pub dir: PathBuf,
     pub config: DownloadConfig,
     pub status: Arc<watch::Sender<Vec<DownloadStatus>>>,
+    /// Becomes true when the engine stops.
+    pub stopping: watch::Receiver<bool>,
 }
 
 /// Run the download to its end, publishing its status as it goes.
@@ -125,6 +146,41 @@ struct Download {
     reports_tx: mpsc::UnboundedSender<Report>,
     reports: mpsc::UnboundedReceiver<Report>,
     table_open: bool,
+    /// Bytes an earlier engine had written, picked up on resuming.
+    resumed: u64,
+    /// Where the progress is saved; `None` before the file is found, and for
+    /// a file fetched whole.
+    progress_file: Option<PathBuf>,
+    saved_at: Instant,
+    /// The save running in the background, if one is: never more than one.
+    saving: Option<task::JoinHandle<()>>,
+    /// The progress as it stood when the download failed, saved once its
+    /// loop has ended.
+    last_progress: Option<Snapshot>,
+}
+
+/// The progress at one moment, and what saving it needs.
+struct Snapshot {
+    saved: Saved,
+    /// The `.part`, flushed to disk before progress counting its bytes is
+    /// saved.
+    part: Arc<File>,
+    path: PathBuf,
+}
+
+impl Snapshot {
+    /// Flush the `.part`, then save the progress: never the other way round,
+    /// or a power cut could leave progress claiming bytes the disk lost.
+    fn write(self) {
+        let saved = self
+            .part
+            .sync_data()
+            .and_then(|()| save(&self.path, &self.saved));
+        if let Err(e) = saved {
+            // The next save may manage: one missed costs a second's progress.
+            tracing::debug!(error = %e, "saving a download's progress failed");
+        }
+    }
 }
 
 /// One worker, as the coordinator follows it.
@@ -132,6 +188,8 @@ struct Seat {
     link: LinkId,
     /// When its connection last received bytes (`Worker::heard`).
     heard: Arc<AtomicU64>,
+    /// What it has written of the chunk it is on (`Worker::doing`).
+    doing: Arc<Mutex<Option<Range<u64>>>>,
 }
 
 /// One link's part in the download.
@@ -197,6 +255,7 @@ enum Event {
     Table(bool),
     Wake,
     Tick,
+    Shutdown,
 }
 
 impl Download {
@@ -220,6 +279,11 @@ impl Download {
             reports_tx,
             reports,
             table_open: true,
+            resumed: 0,
+            progress_file: None,
+            saved_at: Instant::now(),
+            saving: None,
+            last_progress: None,
         }
     }
 
@@ -243,14 +307,23 @@ impl Download {
                 () = tokio::time::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
                     Some(Event::Wake)
                 }
+                // The engine stopping, or the registry gone with it.
+                _ = self.job.stopping.wait_for(|&stop| stop) => Some(Event::Shutdown),
                 _ = tick.tick() => Some(Event::Tick),
             };
             if let Some(event) = event {
                 self.handle(event).await;
             }
             self.check_stuck();
-            self.publish();
+            if self.ended.is_none() {
+                self.publish();
+            }
         }
+        // A download that failed keeps what it had for the next attempt,
+        // saved before it shows as ended, so adding it again at once finds it.
+        let last = self.last_progress.take();
+        self.save_now(last).await;
+        self.publish();
     }
 
     async fn handle(&mut self, event: Event) {
@@ -324,7 +397,101 @@ impl Download {
                         self.worked(link);
                     }
                 }
+                if self.saved_at.elapsed() >= self.job.config.save_every {
+                    self.save_soon();
+                }
             }
+            Event::Shutdown => self.shut_down().await,
+        }
+    }
+
+    /// The engine is stopping: every connection stops and reports what it
+    /// wrote, and the progress is saved for the next engine.
+    async fn shut_down(&mut self) {
+        for member in &self.members {
+            member.stop.send_replace(true);
+        }
+        while let Some(ended) = self.workers.join_next_with_id().await {
+            while let Ok(report) = self.reports.try_recv() {
+                self.reported(report).await;
+            }
+            if let Ok((task, _)) | Err(task) = ended.map_err(|e| e.id())
+                && let Some(seat) = self.working.remove(&task)
+            {
+                self.release(seat);
+            }
+        }
+        while let Ok(report) = self.reports.try_recv() {
+            self.reported(report).await;
+        }
+        if self.ended.is_some() {
+            // The last report finished it, or failed it.
+            return;
+        }
+        let snapshot = self.snapshot();
+        self.save_now(snapshot).await;
+        self.file = None;
+        self.note = Some(if self.progress_file.is_some() {
+            "stopped with barrage; adding it again carries on from here".to_string()
+        } else {
+            "stopped with barrage; adding it again starts it over".to_string()
+        });
+        self.ended = Some(Phase::Failed);
+    }
+
+    /// The progress now, with what saving it needs: the bytes written, every
+    /// chunk reported and what each connection has written of the chunk it
+    /// is on. `None` for a file fetched whole, or not yet found.
+    fn snapshot(&self) -> Option<Snapshot> {
+        let open = self.file.as_ref()?;
+        let Mode::Pieces { length, .. } = open.mode else {
+            return None;
+        };
+        let path = self.progress_file.clone()?;
+        let mut done = open.done.clone();
+        for seat in self.seats.values() {
+            if let Some(range) = seat.doing.lock().unwrap().clone() {
+                done.insert(range);
+            }
+        }
+        let saved = Saved {
+            url: self.job.url.to_string(),
+            length,
+            validator: open.fixed.validator.clone(),
+            done: done.as_slice().iter().map(|r| (r.start, r.end)).collect(),
+        };
+        Some(Snapshot {
+            saved,
+            part: open.file.clone(),
+            path,
+        })
+    }
+
+    /// Save the progress in the background, unless the last save is still
+    /// going: a slow disk holds back the progress on it, never the download.
+    fn save_soon(&mut self) {
+        if self.saving.as_ref().is_some_and(|s| !s.is_finished()) {
+            return;
+        }
+        self.saved_at = Instant::now();
+        if let Some(snapshot) = self.snapshot() {
+            self.saving = Some(tokio::task::spawn_blocking(move || snapshot.write()));
+        }
+    }
+
+    /// Wait for the save going in the background, if one is.
+    async fn saved(&mut self) {
+        if let Some(saving) = self.saving.take() {
+            let _ = saving.await;
+        }
+    }
+
+    /// Save `snapshot` now, after any save already going, so the last word
+    /// on disk is this one.
+    async fn save_now(&mut self, snapshot: Option<Snapshot>) {
+        self.saved().await;
+        if let Some(snapshot) = snapshot {
+            let _ = tokio::task::spawn_blocking(move || snapshot.write()).await;
         }
     }
 
@@ -435,8 +602,8 @@ impl Download {
                 self.fail(note);
                 return;
             }
-            if self.length == Some(0) {
-                // Nothing to fetch.
+            if self.nothing_missing() {
+                // An empty file, or one an earlier engine had all of.
                 self.finish().await;
                 return;
             }
@@ -444,19 +611,34 @@ impl Download {
         self.take_part(link);
     }
 
+    fn nothing_missing(&self) -> bool {
+        self.length == Some(0)
+            || self.file.as_ref().is_some_and(
+                |o| matches!(o.mode, Mode::Pieces { length, .. } if o.done.is_complete(length)),
+            )
+    }
+
     /// Fix the file as `remote`, found through `link`, describes it: a
-    /// full-size `.part`, and every chunk on the pile, or the whole file for
-    /// `link` alone when the server sends no pieces or no length.
+    /// full-size `.part` and the chunks still missing on the pile, or the
+    /// whole file for `link` alone when the server sends no pieces or no
+    /// length.
     fn open(&mut self, remote: &Remote, link: LinkId) -> Result<(), String> {
-        let size = remote.length.unwrap_or(0);
-        let (name, part, file) = create_part(&self.job.dir, &remote.name, size)?;
-        let done = Ranges::new();
-        let mode = match remote.length.filter(|_| remote.ranges) {
+        let pieces = remote.length.filter(|_| remote.ranges);
+        let (name, part, file, done) = match pieces {
+            Some(length) => self.resume(remote, length)?,
+            None => {
+                let size = remote.length.unwrap_or(0);
+                let (name, part, file) = create_part(&self.job.dir, &remote.name, size)?;
+                (name, part, file, Ranges::new())
+            }
+        };
+        let mode = match pieces {
             Some(length) => {
                 let (pile, taken) = flume::unbounded();
                 for chunk in plan(length, &done) {
                     let _ = pile.send(chunk);
                 }
+                self.progress_file = Some(progress_path(&part));
                 Mode::Pieces {
                     length,
                     pile,
@@ -481,6 +663,63 @@ impl Download {
             mode,
         });
         Ok(())
+    }
+
+    /// The `.part` for a file `length` bytes long fetched in pieces, and what
+    /// is done of it: the one an earlier engine left for this URL, with what
+    /// it had written, if the server's file is still the same; else a new one.
+    fn resume(
+        &mut self,
+        remote: &Remote,
+        length: u64,
+    ) -> Result<(String, PathBuf, File, Ranges), String> {
+        let dir = self.job.dir.clone();
+        if let Some((name, saved)) = self.earlier(&remote.name) {
+            let part = dir.join(format!("{name}.part"));
+            let kept = agrees(&saved, length, remote).and_then(|done| {
+                reopen_part(&part, length)
+                    .map(|file| (file, done))
+                    .map_err(|_| "what the last attempt left could not be opened; started again")
+            });
+            match kept {
+                Ok((file, done)) => {
+                    self.resumed = done.covered();
+                    self.note = Some(format!(
+                        "resumed: {} were already here",
+                        size_words(self.resumed)
+                    ));
+                    return Ok((name, part, file, done));
+                }
+                Err(why) => {
+                    // Its own leftovers, for this very URL: it starts again
+                    // in their place.
+                    let _ = std::fs::remove_file(progress_path(&part));
+                    let _ = std::fs::remove_file(&part);
+                    self.note = Some(why.to_string());
+                }
+            }
+        }
+        let (name, part, file) = create_part(&dir, &remote.name, length)?;
+        Ok((name, part, file, Ranges::new()))
+    }
+
+    /// Progress an earlier engine saved for this URL, under one of the names
+    /// a file called `name` would be given, in the order they are tried, up
+    /// to the first that is free: where a new download would start.
+    fn earlier(&self, name: &str) -> Option<(String, Saved)> {
+        let dir = &self.job.dir;
+        for candidate in names_like(name) {
+            if !taken(dir, &candidate) {
+                return None;
+            }
+            let part = dir.join(format!("{candidate}.part"));
+            if let Some(saved) = load(&progress_path(&part))
+                && Url::parse(&saved.url).is_ok_and(|url| same_file(&url, &self.job.url))
+            {
+                return Some((candidate, saved));
+            }
+        }
+        None
     }
 
     /// Start `link`'s workers, if it agrees about the file: as many as it
@@ -575,11 +814,13 @@ impl Download {
         let seat = self.next_seat;
         self.next_seat += 1;
         let heard = Arc::new(AtomicU64::new(0));
+        let doing = Arc::new(Mutex::new(None));
         self.seats.insert(
             seat,
             Seat {
                 link,
                 heard: heard.clone(),
+                doing: doing.clone(),
             },
         );
         member.workers += 1;
@@ -588,6 +829,7 @@ impl Download {
             seat,
             heard,
             epoch: self.epoch,
+            doing,
             local: member.local,
             url: remote.url.clone(),
             validator: remote.validator.clone(),
@@ -617,6 +859,14 @@ impl Download {
         let Range { start, end } = report.range;
         let written_to = start + report.written;
         open.done.insert(start..written_to);
+        // Counted in `done` now. The worker may have begun its next chunk
+        // already, which it says itself, so only this one's is cleared.
+        if let Some(seat) = self.seats.get(&report.seat) {
+            let mut doing = seat.doing.lock().unwrap();
+            if doing.as_ref().is_some_and(|r| r.start == start) {
+                *doing = None;
+            }
+        }
         let whole = match &open.mode {
             Mode::Pieces { pile, .. } => {
                 if written_to < end {
@@ -849,8 +1099,10 @@ impl Download {
         for member in &self.members {
             member.stop.send_replace(true);
         }
-        // No worker may still hold the file when it is renamed.
+        // No worker may still hold the file when it is renamed, nor a save,
+        // which could also bring back the progress about to be removed.
         while self.workers.join_next().await.is_some() {}
+        self.saved().await;
         self.working.clear();
         self.seats.clear();
         for member in &mut self.members {
@@ -869,13 +1121,19 @@ impl Download {
             Ok(Ok(name)) => {
                 self.name = Some(name);
                 self.ended = Some(Phase::Done);
+                // Done: nothing is left to pick up.
+                if let Some(path) = self.progress_file.take() {
+                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+                }
             }
             Ok(Err(note)) => self.fail(note),
             Err(e) => self.fail(e.to_string()),
         }
     }
 
-    /// End the download with `note`. The `.part` is left where it is.
+    /// End the download with `note`. The `.part` is left where it is, and
+    /// what it has is saved once the download has stopped, for a later
+    /// attempt to decide about.
     fn fail(&mut self, note: String) {
         if self.ended.is_some() {
             return;
@@ -883,6 +1141,7 @@ impl Download {
         for member in &self.members {
             member.stop.send_replace(true);
         }
+        self.last_progress = self.snapshot();
         self.file = None;
         self.note = Some(note);
         self.ended = Some(Phase::Failed);
@@ -947,7 +1206,9 @@ impl Download {
             name: self.name.clone(),
             phase,
             length: self.length,
-            done: links.iter().map(|l| l.bytes).sum(),
+            // What was already here counts toward the file, but is no
+            // cable's share.
+            done: self.resumed + links.iter().map(|l| l.bytes).sum::<u64>(),
             bps: links.iter().map(|l| l.bps).sum(),
             links,
             note: self.note.clone(),
@@ -969,6 +1230,30 @@ impl Download {
                 }
             });
     }
+}
+
+/// What `saved` says is done of a file `length` bytes long, if it is still
+/// the file `remote` describes: the same length, and the same version, which
+/// the server must have named. Otherwise why it starts again: bytes of two
+/// versions are never stitched into one file.
+fn agrees(saved: &Saved, length: u64, remote: &Remote) -> Result<Ranges, &'static str> {
+    if saved.validator.is_none() {
+        return Err(
+            "nothing from the server told whether the file was still the same, so it started \
+             again",
+        );
+    }
+    if saved.length != length || saved.validator != remote.validator {
+        return Err("the file changed on the server; started again");
+    }
+    let mut done = Ranges::new();
+    for &(start, end) in &saved.done {
+        if start >= end || end > length {
+            return Err("the progress saved for it did not fit the file; started again");
+        }
+        done.insert(start..end);
+    }
+    Ok(done)
 }
 
 /// The rest after `rest`, for a link failing again: twice as long, up to

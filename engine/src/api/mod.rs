@@ -87,15 +87,21 @@ pub fn app(table: LinkTable, downloads: Downloads, static_dir: PathBuf) -> Route
 /// than see the connection break.
 const CLOSE_GRACE: Duration = Duration::from_millis(250);
 
+/// How long the downloads get to stop and save their progress when the
+/// engine stops.
+const SAVE_GRACE: Duration = Duration::from_secs(2);
+
 /// Serve [`app`] on `listener` until `stop` completes, then stop the engine.
 /// Downloads go to `downloads_dir`.
 ///
-/// The handle is dropped the moment `stop` fires, while the server finishes.
-/// That stops the watcher, which ends every live stream with a close frame.
-/// Dropping it after the server returns works too with axum 0.8.9, whose
-/// graceful shutdown does not wait for connections that became WebSockets
-/// (checked on 2026-10-14 by swapping the order: the test still passed).
-/// This order does not depend on that.
+/// When `stop` fires, the downloads stop first and save their progress, for
+/// at most [`SAVE_GRACE`]: with the links gone first, each would see its
+/// links vanish and fail. Then the handle is dropped, while the server
+/// finishes. That stops the watcher, which ends every live stream with a
+/// close frame. Dropping it after the server returns works too with axum
+/// 0.8.9, whose graceful shutdown does not wait for connections that became
+/// WebSockets (checked on 2026-10-14 by swapping the order: the test still
+/// passed). This order does not depend on that.
 pub async fn serve(
     listener: TcpListener,
     links: LinkHandle,
@@ -104,10 +110,11 @@ pub async fn serve(
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let downloads = Downloads::new(links.table(), downloads_dir);
-    let app = app(links.table(), downloads, static_dir);
+    let app = app(links.table(), downloads.clone(), static_dir);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             stop.await;
+            let _ = tokio::time::timeout(SAVE_GRACE, downloads.shutdown()).await;
             drop(links);
         })
         .await

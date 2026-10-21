@@ -1,9 +1,10 @@
 //! A link failing mid-download (Task 9), and a server that limits
 //! connections with `429 Too Many Requests` (Task 10), against the scripted
-//! server and network as in fetch_download.rs. The times are short: a
-//! connection is given up after 300 ms without data, a fresh one takes its
-//! place 100 ms later, and a link whose every connection failed rests
-//! 200 ms, doubling up to 1 s.
+//! server and network as in fetch_download.rs. The times are short: a fresh
+//! connection takes a failed one's place 100 ms later, a link whose every
+//! connection failed rests 200 ms, doubling up to 1 s, and in the tests that
+//! stall connections on purpose, a connection is given up after 300 ms
+//! without data.
 
 mod fake;
 mod fetching;
@@ -20,14 +21,25 @@ use fake::{Fake, ms};
 use fetching::*;
 use serve::{File, Seen, most_at_once};
 
-/// Short failure times, so a test takes a few seconds.
+/// Short failure times, so a test takes a few seconds. The read deadline
+/// stays the usual one: with several suites at once, a working connection
+/// can go 300 ms unscheduled, and a test that stalls nothing would see it
+/// given up as silent.
 fn failing() -> DownloadConfig {
     DownloadConfig {
-        read_deadline: ms(300),
         retry_connection: ms(100),
         rest_first: ms(200),
         rest_max: ms(1000),
         ..config()
+    }
+}
+
+/// [`failing`], for the tests that stall connections on purpose: a
+/// connection is given up after 300 ms without data.
+fn stalling() -> DownloadConfig {
+    DownloadConfig {
+        read_deadline: ms(300),
+        ..failing()
     }
 }
 
@@ -66,11 +78,12 @@ fn ethernet_pieces(seen: &[Seen]) -> Vec<&Seen> {
 async fn one_stalled_connection_is_retried_while_its_link_keeps_working() {
     let links = both();
     let file = busy().stalls(ETHERNET, 256 * KIB, Some(1));
-    // A full second for the deadline: on a loaded machine a healthy
-    // connection can go 300 ms unscheduled, which would rightly read as
-    // a link with no data.
+    // Two seconds for the deadline: with several suites at once, a healthy
+    // connection can go a whole second unscheduled, which would rightly
+    // read as a link with no data.
+    let deadline = ms(2000);
     let patient = DownloadConfig {
-        read_deadline: ms(1000),
+        read_deadline: deadline,
         ..failing()
     };
     let (server, dir, downloads, id) = start_with("one-stall.bin", file, &links, patient).await;
@@ -101,7 +114,7 @@ async fn one_stalled_connection_is_retried_while_its_link_keeps_working() {
     assert!(counts.iter().all(|&n| n >= 3), "{counts:?}");
     // Once the stalled one was given up it was three, then a fresh
     // connection made it four again.
-    let given_up = tokio::time::Instant::from_std(stalled.started + ms(1000));
+    let given_up = tokio::time::Instant::from_std(stalled.started + deadline);
     let after: Vec<u32> = history
         .iter()
         .filter(|(at, s)| *at >= given_up && s.phase == Phase::Downloading)
@@ -115,7 +128,7 @@ async fn one_stalled_connection_is_retried_while_its_link_keeps_working() {
 async fn a_link_whose_every_connection_stalls_rests_and_its_work_moves() {
     let links = both();
     let file = busy().stalls(ETHERNET, 0, None);
-    let (server, dir, downloads, id) = start_with("all-stall.bin", file, &links, failing()).await;
+    let (server, dir, downloads, id) = start_with("all-stall.bin", file, &links, stalling()).await;
     let history = record(&downloads, id);
 
     let end = ended(&downloads, id).await;
@@ -159,7 +172,7 @@ async fn a_rested_link_that_works_again_gets_its_connections_back() {
     let links = both();
     // Its first four answers stall; after that the link works.
     let file = busy().stalls(ETHERNET, 0, Some(4));
-    let (_server, dir, downloads, id) = start_with("recovers.bin", file, &links, failing()).await;
+    let (_server, dir, downloads, id) = start_with("recovers.bin", file, &links, stalling()).await;
     let history = record(&downloads, id);
 
     let end = ended(&downloads, id).await;
@@ -216,7 +229,7 @@ async fn with_one_connection_a_failure_rests_the_link() {
 async fn a_lone_link_that_rests_does_not_fail_the_download() {
     let links = links(vec![vec![wifi()]]);
     let file = File::new(8 * MIB).rate(4 * MIB).stalls(WIFI, 0, Some(4));
-    let (_server, dir, downloads, id) = start_with("lone.bin", file, &links, failing()).await;
+    let (_server, dir, downloads, id) = start_with("lone.bin", file, &links, stalling()).await;
     let history = record(&downloads, id);
 
     let end = ended(&downloads, id).await;

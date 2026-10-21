@@ -30,7 +30,10 @@ mobile data. Across the top, both tabs show the combined speed available, or
 while anything downloads the live download speed; beside them, every change as
 it happens. Ctrl+C stops `barrage`; the open page says "disconnected,
 retrying", keeps what it last showed, and comes back by itself when `barrage`
-runs again (`--no-open` avoids a second tab).
+runs again (`--no-open` avoids a second tab). A download cut short, by Ctrl+C
+or by `barrage` being closed or crashing, picks up where it was when its link
+is added again, as long as the server's file is still the same version; its
+progress is kept beside it in `<name>.part.json`.
 
 Working on the page: run `barrage`, then `pnpm --dir ui dev`, which serves the
 page with live reload and passes `/api` to the engine. `pnpm --dir ui test`

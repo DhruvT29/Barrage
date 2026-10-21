@@ -35,6 +35,7 @@ use reqwest::header::{
     LOCATION, RANGE,
 };
 use reqwest::{Response, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 
 use super::name::file_name;
 use crate::links::bind;
@@ -65,11 +66,15 @@ pub struct Remote {
 /// What identifies this version of the file. Sent back as `If-Range`, it
 /// makes a server whose file has changed answer with the whole new file
 /// rather than a piece of it, so no file is ever stitched from two versions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Saved with a download's progress as `{"etag": ...}` or
+/// `{"last_modified": ...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Validator {
     /// A strong entity tag, quotes included, as the server sent it.
+    #[serde(rename = "etag")]
     ETag(String),
     /// The `Last-Modified` date, as the server sent it.
+    #[serde(rename = "last_modified")]
     LastModified(String),
 }
 

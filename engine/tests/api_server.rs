@@ -529,6 +529,56 @@ async fn stopping_closes_every_page_and_returns() {
     );
 }
 
+/// Stopping the engine stops every download first, each saving its progress
+/// beside its `.part` for the next engine, and still returns promptly.
+#[tokio::test]
+async fn stopping_saves_each_downloads_progress() {
+    let dir = Folder::new("stop-saves");
+    let files = Server::start().await;
+    // Every answer held after its first MiB: far from done when the engine
+    // stops, however slowly the test runs.
+    files.at(
+        "/big.bin",
+        Answer::File(File::new(40 << 20).stall_after(1 << 20).etag("\"v1\"")),
+    );
+    let listener = bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        wifi_to_the_file_server(),
+        dir.0.clone(),
+        dir.0.clone(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let (status, _) = post(addr, json!({"url": files.url("/big.bin").to_string()})).await;
+    assert_eq!(status, 201);
+    listed_where(addr, "bytes", |list| {
+        list["list"][0]["done"].as_u64() > Some(0)
+    })
+    .await;
+
+    stop.send(()).unwrap();
+    let returned = timeout(Duration::from_secs(4), server).await;
+    assert!(
+        matches!(returned, Ok(Ok(Ok(())))),
+        "the server did not return within 4 s: {returned:?}"
+    );
+    let saved = std::fs::read_to_string(dir.0.join("big.bin.part.json"))
+        .expect("no progress saved beside the .part");
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    let done: u64 = saved["done"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[1].as_u64().unwrap() - r[0].as_u64().unwrap())
+        .sum();
+    assert!(done > 0, "{saved}");
+    assert!(dir.0.join("big.bin.part").exists());
+}
+
 /// The page is under the same rule as the API: this machine's own pages
 /// only, so DNS rebinding gets nothing from it either.
 #[tokio::test]

@@ -55,6 +55,24 @@ pub(crate) fn create_part(
     ))
 }
 
+/// The `.part` an earlier engine left at `part`, opened to write the rest
+/// of it: it must still be there, and still `length` bytes long.
+pub(crate) fn reopen_part(part: &Path, length: u64) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(part)
+        .map_err(|e| format!("cannot open {}: {e}", part.display()))?;
+    match file.metadata() {
+        Ok(meta) if meta.len() == length => Ok(file),
+        Ok(meta) => Err(format!(
+            "{} is {} bytes, not the file's {length}",
+            part.display(),
+            meta.len()
+        )),
+        Err(e) => Err(format!("cannot read {}: {e}", part.display())),
+    }
+}
+
 /// Write all of `data` at `offset`, without moving any shared position, so
 /// many threads can write one file at once.
 pub(crate) fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> io::Result<()> {

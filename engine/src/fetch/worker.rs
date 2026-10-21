@@ -38,8 +38,8 @@
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use reqwest::header::{CONTENT_RANGE, IF_RANGE, RANGE, RETRY_AFTER};
@@ -64,6 +64,9 @@ pub(crate) struct Worker {
     pub heard: Arc<AtomicU64>,
     /// What `heard` is measured from.
     pub epoch: Instant,
+    /// What this worker has written of the chunk it is on, from the chunk's
+    /// start, so progress saved between its reports has it too.
+    pub doing: Arc<Mutex<Option<Range<u64>>>>,
     /// The link's address. The worker binds its own client to it.
     pub local: IpAddr,
     /// The file as this link found it, after its redirects.
@@ -184,6 +187,7 @@ impl Worker {
     /// Fetch `range` of a file `length` bytes long and write what arrives of
     /// it: how many bytes from its start were written, and how it ended.
     async fn piece(&mut self, client: &Client, range: &Range<u64>, length: u64) -> (u64, Outcome) {
+        *self.doing.lock().unwrap() = Some(range.start..range.start);
         let asked = format!("bytes={}-{}", range.start, range.end - 1);
         let mut request = client.get(self.url.clone()).header(RANGE, asked);
         if let Some(validator) = &self.validator {
@@ -314,7 +318,10 @@ impl Worker {
             let full = gathered.len() == (stop_at - at) as usize;
             if gathered.len() >= WRITE_PIECE || full {
                 match self.write(at, &mut gathered).await {
-                    Ok(n) => at += n,
+                    Ok(n) => {
+                        at += n;
+                        *self.doing.lock().unwrap() = Some(from..at);
+                    }
                     Err(why) => return (at - from, Some(Outcome::Disk(why))),
                 }
             }
@@ -325,7 +332,10 @@ impl Worker {
         // Whatever arrived is the file's, however the answer ended.
         if !gathered.is_empty() {
             match self.write(at, &mut gathered).await {
-                Ok(n) => at += n,
+                Ok(n) => {
+                    at += n;
+                    *self.doing.lock().unwrap() = Some(from..at);
+                }
                 Err(why) => return (at - from, Some(Outcome::Disk(why))),
             }
         }

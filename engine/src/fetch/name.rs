@@ -72,15 +72,23 @@ pub fn file_name(disposition: Option<&str>, url: &Url) -> String {
 /// folder that cannot be read makes every name look taken, and the last one
 /// tried then fails to be created, with the folder's own error.
 pub fn free_name(dir: &Path, name: &str) -> String {
-    if !taken(dir, name) {
-        return name.to_string();
+    let mut last = String::new();
+    for candidate in names_like(name) {
+        if !taken(dir, &candidate) {
+            return candidate;
+        }
+        last = candidate;
     }
+    last
+}
+
+/// The names [`free_name`] tries, in its order: `name`, then `stem (1).ext`,
+/// `stem (2).ext` and so on, up to [`MAX_NUMBER`]. A download looking for
+/// its own progress from an earlier engine looks in the same order.
+pub(crate) fn names_like(name: &str) -> impl Iterator<Item = String> + '_ {
     let (stem, extension) = split_extension(name);
-    let numbered = |n: u64| format!("{stem} ({n}){extension}");
-    (1..=MAX_NUMBER)
-        .map(numbered)
-        .find(|candidate| !taken(dir, candidate))
-        .unwrap_or_else(|| numbered(MAX_NUMBER))
+    std::iter::once(name.to_string())
+        .chain((1..=MAX_NUMBER).map(move |n| format!("{stem} ({n}){extension}")))
 }
 
 /// The highest number [`free_name`] tries.
@@ -89,7 +97,7 @@ const MAX_NUMBER: u64 = 999;
 /// Whether `dir` holds `name` or its `.part`. Anything that cannot be checked
 /// counts as taken: a file this cannot see is still one it must not
 /// overwrite.
-fn taken(dir: &Path, name: &str) -> bool {
+pub(crate) fn taken(dir: &Path, name: &str) -> bool {
     !nothing_at(&dir.join(name)) || !nothing_at(&dir.join(format!("{name}.part")))
 }
 

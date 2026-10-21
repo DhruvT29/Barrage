@@ -9,8 +9,9 @@
 //! | `ranges` | [`Ranges`]: the bytes done (pure) |
 //! | `chunk` | [`plan`]: the chunks still to fetch (pure) |
 //! | `name` | [`file_name`], [`free_name`]: safe names, never one taken |
-//! | `remote` | [`find`]: what one link sees at the URL |
+//! | `remote` | [`find`]: what one link sees at the URL; [`retry_after`] |
 //! | `disk` | the `.part`: full size at once, written at offsets, named last; the Downloads folder |
+//! | `saved` | the progress beside the `.part`, so the next engine resumes it |
 //! | `worker` | one connection: a chunk, its bytes, a report |
 //! | `download` | one download's coordinator, the owner of its state |
 //!
@@ -22,16 +23,18 @@ mod download;
 pub mod name;
 pub mod ranges;
 pub mod remote;
+mod saved;
 mod worker;
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Url;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::links::LinkId;
 use crate::links::watch::LinkTable;
@@ -55,6 +58,11 @@ struct Inner {
     config: DownloadConfig,
     next: AtomicU64,
     status: Arc<watch::Sender<Vec<DownloadStatus>>>,
+    /// Becomes true when the engine stops: every download stops and saves
+    /// its progress.
+    stopping: watch::Sender<bool>,
+    /// Every download's coordinator, so stopping can wait for them.
+    running: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// A URL to download.
@@ -117,6 +125,9 @@ pub struct DownloadConfig {
     /// The longest `Retry-After` a link waits out when the server refuses
     /// its last connection; asked to wait longer, it sits the download out.
     pub max_retry_after: Duration,
+    /// How often a download's progress is saved beside its `.part`, so an
+    /// engine that is killed loses no more than this much of it.
+    pub save_every: Duration,
 }
 
 impl Default for DownloadConfig {
@@ -133,6 +144,7 @@ impl Default for DownloadConfig {
             rest_max: Duration::from_secs(60),
             // Cloudflare answered Retry-After: 3311 in phase 2.
             max_retry_after: Duration::from_secs(60),
+            save_every: Duration::from_secs(1),
         }
     }
 }
@@ -213,6 +225,8 @@ impl Downloads {
                 config,
                 next: AtomicU64::new(0),
                 status: Arc::new(status),
+                stopping: watch::channel(false).0,
+                running: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -256,7 +270,7 @@ impl Downloads {
             true
         });
         let id = added.expect("the status closure always runs")?;
-        tokio::spawn(download::run(download::Job {
+        let task = tokio::spawn(download::run(download::Job {
             id,
             given: request.url,
             url,
@@ -265,13 +279,28 @@ impl Downloads {
             dir: self.inner.dir.clone(),
             config: self.inner.config.clone(),
             status: self.inner.status.clone(),
+            stopping: self.inner.stopping.subscribe(),
         }));
+        let mut running = self.inner.running.lock().unwrap();
+        running.retain(|task| !task.is_finished());
+        running.push(task);
         Ok(id)
     }
 
     /// Every download's status, updated as they run.
     pub fn status(&self) -> watch::Receiver<Vec<DownloadStatus>> {
         self.inner.status.subscribe()
+    }
+
+    /// Stop every download: each one's connections stop and report what they
+    /// wrote, and its progress is saved, so the next engine resumes it.
+    /// Returns once every download has.
+    pub async fn shutdown(&self) {
+        self.inner.stopping.send_replace(true);
+        let running = std::mem::take(&mut *self.inner.running.lock().unwrap());
+        for task in running {
+            let _ = task.await;
+        }
     }
 }
 
@@ -296,7 +325,7 @@ fn running(phase: Phase) -> bool {
 /// Whether two addresses fetch the same file. Both are parsed, so the host's
 /// case and a default port already agree. The fragment is never sent to the
 /// server, so it cannot make another file.
-fn same_file(a: &Url, b: &Url) -> bool {
+pub(crate) fn same_file(a: &Url, b: &Url) -> bool {
     let sent = |url: &Url| {
         let mut url = url.clone();
         url.set_fragment(None);
@@ -326,9 +355,38 @@ pub(crate) fn wait_words(wait: Duration) -> String {
     }
 }
 
+/// A size as the notes write it, as the page writes sizes: whole bytes below
+/// a kB, then one decimal, in powers of 1000, so "8.8 MB" and "1.2 GB". A
+/// size that rounds up to 1000 of one unit is 1.0 of the next.
+pub(crate) fn size_words(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["kB", "MB", "GB", "TB", "PB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    let mut unit = 0;
+    while format!("{value:.1}").parse::<f64>().unwrap_or(value) >= 1000.0 && unit < UNITS.len() - 1
+    {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_size_is_written_as_the_page_writes_it() {
+        assert_eq!(size_words(0), "0 B");
+        assert_eq!(size_words(999), "999 B");
+        assert_eq!(size_words(1000), "1.0 kB");
+        assert_eq!(size_words(8_762_927), "8.8 MB");
+        assert_eq!(size_words(1_200_000_000), "1.2 GB");
+        assert_eq!(size_words(999_949), "999.9 kB");
+        assert_eq!(size_words(999_950), "1.0 MB");
+    }
 
     #[test]
     fn a_wait_is_written_in_the_unit_that_reads_best() {
