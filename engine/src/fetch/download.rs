@@ -25,8 +25,24 @@
 //! length, is fetched whole through the link that found it first, and the
 //! download cannot resume if that link drops.
 //!
-//! With no usable link it waits. With usable links that have all failed, it
-//! fails, and says why.
+//! WHEN A CONNECTION OR A LINK FAILS
+//!
+//! Detection is local, diagnosis is global (PLAN.md section 3.5). A worker
+//! reports its connection broken and ends; the coordinator, which sees every
+//! connection, decides what that means. If another connection on the same
+//! link received bytes within the read deadline, the connection was bad, not
+//! the link: a fresh one takes its place after `retry_connection`. If none
+//! did, the link is failing for this download: all its connections stop,
+//! what they wrote stays written and the rest of their chunks go back on the
+//! pile for the other links, and it rests, `rest_first` doubling with each
+//! rest in a row up to `rest_max`, before one connection tries again. That
+//! one working brings back the rest. A link that leaves the table, or stops
+//! being usable, is stopped at once, without waiting for a deadline; if it
+//! comes back, it does so under a new id, as a new member.
+//!
+//! With no usable link it waits. When every usable link has given up, on a
+//! file it could not find or answers it could not use, and none is resting,
+//! it fails, and says why.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -44,8 +60,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::disk::{create_part, name_finished};
 use super::remote::{Remote, differs, find};
-use super::worker::{Exit, Outcome, Report, Worker};
-use super::{DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, plan};
+use super::worker::{Exit, Outcome, Report, Worker, stamp};
+use super::{
+    DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, plan, wait_words,
+};
 use crate::links::watch::LinkTable;
 use crate::links::{Link, LinkId};
 
@@ -84,10 +102,24 @@ struct Download {
     finds: JoinSet<anyhow::Result<Remote>>,
     finding: HashMap<task::Id, LinkId>,
     workers: JoinSet<Exit>,
-    working: HashMap<task::Id, LinkId>,
+    /// Each running worker's seat, by its task.
+    working: HashMap<task::Id, u64>,
+    /// Every worker that has neither ended nor reported its end, by seat:
+    /// its link's connections.
+    seats: HashMap<u64, Seat>,
+    next_seat: u64,
+    /// What the workers' `heard` is measured from.
+    epoch: Instant,
     reports_tx: mpsc::UnboundedSender<Report>,
     reports: mpsc::UnboundedReceiver<Report>,
     table_open: bool,
+}
+
+/// One worker, as the coordinator follows it.
+struct Seat {
+    link: LinkId,
+    /// When its connection last received bytes (`Worker::heard`).
+    heard: Arc<AtomicU64>,
 }
 
 /// One link's part in the download.
@@ -100,7 +132,23 @@ struct Member {
     finding: bool,
     /// The file as this link found it.
     remote: Option<Remote>,
+    /// Found the file the download is fetching, so its workers may take
+    /// pieces of it.
+    agrees: bool,
+    /// Its connections: workers that have neither ended nor reported their
+    /// end.
     workers: u32,
+    /// When fresh connections are due, one each, in place of connections
+    /// that failed while the link kept working.
+    refills: Vec<Instant>,
+    /// Resting until then, with no connections.
+    resting: Option<Instant>,
+    /// Its next rest: `rest_first`, doubled by each rest in a row up to
+    /// `rest_max`.
+    backoff: Duration,
+    /// One connection is trying the link after a rest; its first chunk
+    /// brings back the rest.
+    trial: bool,
     /// Bytes this link's workers wrote, counted by them.
     written: Arc<AtomicU64>,
     stop: watch::Sender<bool>,
@@ -135,6 +183,7 @@ enum Event {
     Report(Report),
     WorkerEnded(Result<(task::Id, Exit), JoinError>),
     Table(bool),
+    Wake,
     Tick,
 }
 
@@ -153,6 +202,9 @@ impl Download {
             finding: HashMap::new(),
             workers: JoinSet::new(),
             working: HashMap::new(),
+            seats: HashMap::new(),
+            next_seat: 0,
+            epoch: Instant::now(),
             reports_tx,
             reports,
             table_open: true,
@@ -166,6 +218,7 @@ impl Download {
         let mut tick = tokio::time::interval(self.job.config.publish_every);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         while self.ended.is_none() {
+            let wake = self.next_wake();
             let event = tokio::select! {
                 found = self.finds.join_next_with_id(), if !self.finds.is_empty() => {
                     found.map(Event::Found)
@@ -175,6 +228,9 @@ impl Download {
                     ended.map(Event::WorkerEnded)
                 }
                 open = self.job.table.changed(), if self.table_open => Some(Event::Table(open)),
+                () = tokio::time::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
+                    Some(Event::Wake)
+                }
                 _ = tick.tick() => Some(Event::Tick),
             };
             if let Some(event) = event {
@@ -214,12 +270,13 @@ impl Download {
                     Ok(done) => done,
                     Err(e) => (e.id(), Some(format!("a connection stopped: {e}"))),
                 };
-                if let Some(link) = self.working.remove(&task)
-                    && let Some(member) = self.member(link)
-                {
-                    member.workers -= 1;
-                    if exit.is_some() {
-                        member.note = exit;
+                if let Some(seat) = self.working.remove(&task) {
+                    // Still seated means it ended without a last report: it
+                    // failed before it asked for anything.
+                    let link = self.seats.get(&seat).map(|s| s.link);
+                    self.release(seat);
+                    if let (Some(link), Some(why)) = (link, exit) {
+                        self.broken(link, why);
                     }
                 }
             }
@@ -231,11 +288,29 @@ impl Download {
                 self.table_open = false;
                 self.fail("the link watcher stopped".to_string());
             }
+            Event::Wake => self.wake(),
             Event::Tick => {
                 let (now, window) = (Instant::now(), self.job.config.speed_window);
                 for member in &mut self.members {
                     let bytes = member.written.load(Ordering::SeqCst);
                     member.speed.sample(now, bytes, window);
+                }
+                // A link trying again after a rest works once its connection
+                // receives bytes: the rest need not wait for a whole chunk.
+                let trying: Vec<LinkId> = self
+                    .members
+                    .iter()
+                    .filter(|m| m.trial)
+                    .map(|m| m.id)
+                    .collect();
+                for link in trying {
+                    let heard = self
+                        .seats
+                        .values()
+                        .any(|s| s.link == link && s.heard.load(Ordering::SeqCst) > 0);
+                    if heard {
+                        self.worked(link);
+                    }
                 }
             }
         }
@@ -252,14 +327,20 @@ impl Download {
             if member.present && !wanted.iter().any(|link| link.id == member.id) {
                 member.present = false;
                 member.stop.send_replace(true);
+                // Whatever it was waiting to do no longer applies.
+                member.refills.clear();
+                member.resting = None;
+                member.trial = false;
             }
         }
         for link in wanted {
             match self.members.iter().position(|m| m.id == link.id) {
                 Some(at) if self.members[at].present => {}
                 Some(at) => {
-                    self.members[at].present = true;
-                    self.members[at].stop = watch::channel(false).0;
+                    let member = &mut self.members[at];
+                    member.present = true;
+                    member.stop = watch::channel(false).0;
+                    member.backoff = self.job.config.rest_first;
                     self.join(link.id);
                 }
                 None => {
@@ -270,7 +351,12 @@ impl Download {
                         present: true,
                         finding: false,
                         remote: None,
+                        agrees: false,
                         workers: 0,
+                        refills: Vec::new(),
+                        resting: None,
+                        backoff: self.job.config.rest_first,
+                        trial: false,
                         written: Arc::new(AtomicU64::new(0)),
                         stop: watch::channel(false).0,
                         note: None,
@@ -385,8 +471,9 @@ impl Download {
         Ok(())
     }
 
-    /// Start `link`'s workers, if it agrees about the file: its own
-    /// `workers_per_link` on the pile, or the one fetching the whole file.
+    /// Start `link`'s workers, if it agrees about the file: as many as it
+    /// may hold, taking pieces off the pile, or the one fetching the whole
+    /// file.
     fn take_part(&mut self, link: LinkId) {
         let Some(open) = &mut self.file else {
             return;
@@ -397,27 +484,14 @@ impl Download {
         let Some(remote) = &member.remote else {
             return;
         };
-        let worker = || Worker {
-            link,
-            local: member.local,
-            url: remote.url.clone(),
-            validator: remote.validator.clone(),
-            file: open.file.clone(),
-            reports: self.reports_tx.clone(),
-            written: member.written.clone(),
-            stop: member.stop.subscribe(),
-            read_deadline: self.job.config.read_deadline,
-        };
-        let mut started = Vec::new();
-        match &mut open.mode {
-            Mode::Pieces { length, taken, .. } => {
+        let whole = match &mut open.mode {
+            Mode::Pieces { .. } => {
                 if let Some(why) = differs(&open.fixed, remote) {
                     member.note = Some(why);
                     return;
                 }
-                for _ in 0..self.job.config.workers_per_link {
-                    started.push(self.workers.spawn(worker().run(taken.clone(), *length)));
-                }
+                member.agrees = true;
+                false
             }
             Mode::Whole {
                 carrier,
@@ -430,15 +504,97 @@ impl Download {
                     );
                     return;
                 }
-                if !*going {
-                    *going = true;
-                    started.push(self.workers.spawn(worker().run_whole(self.length)));
+                if *going {
+                    return;
                 }
+                *going = true;
+                true
             }
+        };
+        if whole {
+            let length = self.length;
+            if let Some((seat, worker)) = self.seat(link) {
+                let task = self.workers.spawn(worker.run_whole(length));
+                self.working.insert(task.id(), seat);
+            }
+        } else {
+            self.add_workers(link, usize::MAX);
         }
-        for task in started {
-            self.working.insert(task.id(), link);
-            member.workers += 1;
+    }
+
+    /// Start up to `n` more workers on `link`, taking pieces, never past as
+    /// many as it may hold: one while it is trying after a rest, else
+    /// `workers_per_link`. None while it rests.
+    fn add_workers(&mut self, link: LinkId, n: usize) {
+        let Some(Open {
+            mode: Mode::Pieces { length, taken, .. },
+            ..
+        }) = &self.file
+        else {
+            return;
+        };
+        let (length, taken) = (*length, taken.clone());
+        let Some(member) = self.members.iter().find(|m| m.id == link) else {
+            return;
+        };
+        if !member.present || !member.agrees || member.resting.is_some() {
+            return;
+        }
+        let most = if member.trial {
+            1
+        } else {
+            self.job.config.workers_per_link
+        };
+        let room = most.saturating_sub(member.workers) as usize;
+        for _ in 0..n.min(room) {
+            let Some((seat, worker)) = self.seat(link) else {
+                return;
+            };
+            let task = self.workers.spawn(worker.run(taken.clone(), length));
+            self.working.insert(task.id(), seat);
+        }
+    }
+
+    /// A new worker for `link`, given a seat, counted among its connections.
+    fn seat(&mut self, link: LinkId) -> Option<(u64, Worker)> {
+        let open = self.file.as_ref()?;
+        let member = self.members.iter_mut().find(|m| m.id == link)?;
+        let remote = member.remote.as_ref()?;
+        let seat = self.next_seat;
+        self.next_seat += 1;
+        let heard = Arc::new(AtomicU64::new(0));
+        self.seats.insert(
+            seat,
+            Seat {
+                link,
+                heard: heard.clone(),
+            },
+        );
+        member.workers += 1;
+        let worker = Worker {
+            link,
+            seat,
+            heard,
+            epoch: self.epoch,
+            local: member.local,
+            url: remote.url.clone(),
+            validator: remote.validator.clone(),
+            file: open.file.clone(),
+            reports: self.reports_tx.clone(),
+            written: member.written.clone(),
+            stop: member.stop.subscribe(),
+            read_deadline: self.job.config.read_deadline,
+        };
+        Some((seat, worker))
+    }
+
+    /// `seat`'s worker has ended, or reported an end: it is no longer one of
+    /// its link's connections.
+    fn release(&mut self, seat: u64) {
+        if let Some(gone) = self.seats.remove(&seat)
+            && let Some(member) = self.member(gone.link)
+        {
+            member.workers -= 1;
         }
     }
 
@@ -464,6 +620,11 @@ impl Download {
             Mode::Whole { .. } => report.outcome == Outcome::Done,
         };
         let part = open.part.clone();
+        // A worker carries on after a chunk it got; after anything else it
+        // is ending, and no longer one of its link's connections.
+        if !matches!(report.outcome, Outcome::Done | Outcome::Short) {
+            self.release(report.seat);
+        }
         match (whole, report.outcome) {
             (_, Outcome::Changed(why)) => return self.fail(why),
             (_, Outcome::Disk(why)) => {
@@ -474,7 +635,9 @@ impl Download {
                     member.note = Some(why);
                 }
             }
-            (false, _) | (true, Outcome::Done) => {}
+            (false, Outcome::Broken(why)) => self.broken(report.link, why),
+            (false, Outcome::Done | Outcome::Short) => self.worked(report.link),
+            (false, Outcome::Stopped) | (true, Outcome::Done) => {}
             (true, Outcome::Stopped) => {
                 return self.fail(
                     "the cable carrying the file went away, and this server sends it only \
@@ -484,7 +647,7 @@ impl Download {
             }
             (true, outcome) => {
                 let why = match outcome {
-                    Outcome::Failed(why) => why,
+                    Outcome::Failed(why) | Outcome::Broken(why) => why,
                     _ => "the file ended early".to_string(),
                 };
                 return self.fail(format!(
@@ -498,6 +661,107 @@ impl Download {
                 self.length = Some(written_to);
             }
             self.finish().await;
+        }
+    }
+
+    /// A chunk came through `link`. After a rest, that brings back the rest
+    /// of its connections, and its rests start short again.
+    fn worked(&mut self, link: LinkId) {
+        let rest_first = self.job.config.rest_first;
+        let Some(member) = self.member(link) else {
+            return;
+        };
+        if !member.trial {
+            return;
+        }
+        member.trial = false;
+        member.backoff = rest_first;
+        member.note = None;
+        self.add_workers(link, usize::MAX);
+    }
+
+    /// A connection on `link` failed, and has already given up its seat. If
+    /// another of its connections received bytes within the read deadline,
+    /// the link works and the connection was bad: a fresh one follows after
+    /// `retry_connection`. If none did, the link is failing, and rests.
+    fn broken(&mut self, link: LinkId, why: String) {
+        let others_heard = self.others_heard(link);
+        let due = Instant::now() + self.job.config.retry_connection;
+        let Some(member) = self.member(link) else {
+            return;
+        };
+        // Stopped already: a rest, or the link leaving the table, came first.
+        if !member.present || member.resting.is_some() {
+            return;
+        }
+        if others_heard && !member.trial {
+            member.refills.push(due);
+        } else {
+            self.rest(link, why);
+        }
+    }
+
+    /// Whether a connection still seated on `link` received bytes within the
+    /// read deadline. The one that failed has given up its seat, so only the
+    /// others can vouch for the link.
+    fn others_heard(&self, link: LinkId) -> bool {
+        let now = stamp(self.epoch);
+        let window = self.job.config.read_deadline;
+        self.seats
+            .values()
+            .any(|s| s.link == link && heard_within(s.heard.load(Ordering::SeqCst), now, window))
+    }
+
+    /// Stop every connection of `link` and let it rest before one tries
+    /// again, saying why.
+    fn rest(&mut self, link: LinkId, why: String) {
+        let rest_max = self.job.config.rest_max;
+        let Some(member) = self.member(link) else {
+            return;
+        };
+        let rest = member.backoff;
+        member.backoff = next_rest(rest, rest_max);
+        member.resting = Some(Instant::now() + rest);
+        member.refills.clear();
+        member.trial = false;
+        // Its workers stop on the old signal; the next ones listen to a new.
+        member.stop.send_replace(true);
+        member.stop = watch::channel(false).0;
+        member.note = Some(format!(
+            "{why}; it rests {} and tries again",
+            wait_words(rest)
+        ));
+    }
+
+    /// When something is next due: a rest ending, or a fresh connection.
+    fn next_wake(&self) -> Option<Instant> {
+        self.members
+            .iter()
+            .flat_map(|m| m.resting.into_iter().chain(m.refills.iter().copied()))
+            .min()
+    }
+
+    /// Start whatever is due: one connection trying each link whose rest is
+    /// over, and fresh connections in place of failed ones.
+    fn wake(&mut self) {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        for member in &mut self.members {
+            if member.resting.is_some_and(|until| until <= now) {
+                // Trying, it may hold one connection.
+                member.resting = None;
+                member.trial = true;
+                due.push((member.id, usize::MAX));
+            }
+            let waiting = member.refills.len();
+            member.refills.retain(|&at| at > now);
+            let ready = waiting - member.refills.len();
+            if ready > 0 {
+                due.push((member.id, ready));
+            }
+        }
+        for (link, n) in due {
+            self.add_workers(link, n);
         }
     }
 
@@ -518,6 +782,7 @@ impl Download {
         // No worker may still hold the file when it is renamed.
         while self.workers.join_next().await.is_some() {}
         self.working.clear();
+        self.seats.clear();
         for member in &mut self.members {
             member.workers = 0;
         }
@@ -553,8 +818,9 @@ impl Download {
         self.ended = Some(Phase::Failed);
     }
 
-    /// Links are usable, yet none is finding the file or fetching it: every
-    /// one has failed or sits out, so the download fails, with a reason.
+    /// Links are usable, yet none is finding the file, fetching it, or
+    /// resting before it tries again: every one has failed or sits out, so
+    /// the download fails, with a reason.
     fn check_stuck(&mut self) {
         if self.ended.is_some() {
             return;
@@ -563,11 +829,9 @@ impl Download {
         if present.peek().is_none() {
             return;
         }
-        if self
-            .members
-            .iter()
-            .any(|m| m.present && (m.finding || m.workers > 0))
-        {
+        let busy =
+            |m: &Member| m.finding || m.workers > 0 || m.resting.is_some() || !m.refills.is_empty();
+        if self.members.iter().any(|m| m.present && busy(m)) {
             return;
         }
         let note = self
@@ -637,6 +901,19 @@ impl Download {
     }
 }
 
+/// The rest after `rest`, for a link failing again: twice as long, up to
+/// `most`.
+fn next_rest(rest: Duration, most: Duration) -> Duration {
+    rest.saturating_mul(2).min(most)
+}
+
+/// Whether a connection whose `heard` is this, as [`stamp`] made it, received
+/// bytes within `window` of `now`. 0 is never.
+fn heard_within(heard: u64, now: u64, window: Duration) -> bool {
+    let window = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    heard > 0 && now.saturating_sub(heard) < window
+}
+
 /// A link's speed over the last window, from its byte count at each tick.
 #[derive(Default)]
 struct Speed {
@@ -658,5 +935,38 @@ impl Speed {
         } else {
             0
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_rest_in_a_row_doubles_up_to_the_most() {
+        let most = Duration::from_secs(1);
+        let mut rest = Duration::from_millis(200);
+        let mut rests = Vec::new();
+        for _ in 0..5 {
+            rests.push(rest);
+            rest = next_rest(rest, most);
+        }
+        assert_eq!(
+            rests,
+            [200, 400, 800, 1000, 1000].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn heard_means_bytes_within_the_window() {
+        let window = Duration::from_millis(300);
+        // Never heard at all, early in a download or late.
+        assert!(!heard_within(0, 100, window));
+        assert!(!heard_within(0, 1000, window));
+        assert!(heard_within(1000, 1000, window));
+        assert!(heard_within(701, 1000, window));
+        // Exactly a window ago is too long.
+        assert!(!heard_within(700, 1000, window));
+        assert!(!heard_within(1, 1000, window));
     }
 }

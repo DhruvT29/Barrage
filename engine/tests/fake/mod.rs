@@ -12,8 +12,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use barrage::links::probe::{Probe, ProbeVerdict};
@@ -59,6 +59,21 @@ pub struct Fake {
     lookup_time: Duration,
     /// Keep loopback addresses as links, which the real filter drops.
     loopback: bool,
+    /// When set, the interface list is whatever this holds at each poll, and
+    /// the script is not used.
+    live: Option<Live>,
+}
+
+/// An interface list a test changes while the watcher runs, so a link comes
+/// or goes at a moment the test picks, such as 30% into a download, rather
+/// than at a poll it has to count.
+#[derive(Clone, Default)]
+pub struct Live(Arc<Mutex<Vec<Candidate>>>);
+
+impl Live {
+    pub fn set(&self, links: Vec<Candidate>) {
+        *self.0.lock().unwrap() = links;
+    }
 }
 
 pub const SAMPLED_BPS: u64 = 40_000_000;
@@ -73,6 +88,17 @@ impl Fake {
             script: Mutex::new(steps.into()),
             ..Self::default()
         }
+    }
+
+    /// The interfaces in `links` until the test changes them through the
+    /// returned [`Live`].
+    pub fn live(links: Vec<Candidate>) -> (Self, Live) {
+        let live = Live(Arc::new(Mutex::new(links)));
+        let fake = Self {
+            live: Some(live.clone()),
+            ..Self::default()
+        };
+        (fake, live)
     }
 
     /// Probe answers for `ip`, in order; the last one repeats.
@@ -148,6 +174,9 @@ impl Fake {
 
 impl Network for Fake {
     fn enumerate(&self) -> anyhow::Result<Vec<Candidate>> {
+        if let Some(live) = &self.live {
+            return Ok(live.0.lock().unwrap().clone());
+        }
         let mut script = self.script.lock().unwrap();
         let step = if script.len() > 1 {
             script.pop_front()

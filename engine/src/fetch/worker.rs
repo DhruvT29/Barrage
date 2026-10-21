@@ -20,9 +20,17 @@
 //! A server that sends no pieces gets one worker that fetches the whole
 //! file with a plain `GET`, from the first byte to the last.
 //!
-//! For now a failed request ends its worker, and the link carries on with
-//! the rest. Telling a bad connection from a failing link, and resting the
-//! link, comes in Task 9.
+//! WHEN A CONNECTION FAILS
+//!
+//! Every read has the read deadline on the read itself, not a watchdog
+//! beside it (PLAN.md section 3.5). A connection that goes that long without
+//! data, or whose request or answer breaks, is reported broken and its
+//! worker ends: one worker cannot tell a bad connection from a failing link.
+//! The coordinator can, from whether the link's other connections are still
+//! receiving, so each worker notes when its own last received bytes. An
+//! answer that arrives but cannot be used, an unexpected status or a piece
+//! of the wrong bytes, is no fault of the connection: that worker ends, and
+//! no other takes its place.
 
 use std::fs::File;
 use std::net::IpAddr;
@@ -34,9 +42,11 @@ use std::time::Duration;
 use reqwest::header::{CONTENT_RANGE, IF_RANGE, RANGE};
 use reqwest::{Client, Response, StatusCode, Url};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use super::disk::write_all_at;
 use super::remote::{Validator, content_range};
+use super::wait_words;
 use crate::links::{LinkId, bind};
 
 /// How much a worker gathers before writing: fewer, larger writes.
@@ -44,6 +54,13 @@ const WRITE_PIECE: usize = 256 << 10;
 
 pub(crate) struct Worker {
     pub link: LinkId,
+    /// Which of the download's workers this is, for its reports.
+    pub seat: u64,
+    /// When this worker's connection last received bytes, as [`stamp`] made
+    /// it; 0 until it has.
+    pub heard: Arc<AtomicU64>,
+    /// What `heard` is measured from.
+    pub epoch: Instant,
     /// The link's address. The worker binds its own client to it.
     pub local: IpAddr,
     /// The file as this link found it, after its redirects.
@@ -63,6 +80,7 @@ pub(crate) struct Worker {
 #[derive(Debug)]
 pub(crate) struct Report {
     pub link: LinkId,
+    pub seat: u64,
     pub range: Range<u64>,
     /// Bytes written from the range's start. The rest is still missing.
     pub written: u64,
@@ -78,7 +96,12 @@ pub(crate) enum Outcome {
     Short,
     /// The link was told to stop.
     Stopped,
-    /// The request or its answer failed. The worker ends.
+    /// The connection failed: no data within the read deadline, or the
+    /// request or its answer broke. The worker ends, and the coordinator
+    /// judges whether its link is failing.
+    Broken(String),
+    /// The server's answer cannot be used: an unexpected status, a piece of
+    /// other bytes, an answer with nothing in it. The worker ends.
     Failed(String),
     /// The file on the server is not the one being fetched any more. The
     /// download ends.
@@ -89,6 +112,12 @@ pub(crate) enum Outcome {
 
 /// Why a worker ended without a chunk to report.
 pub(crate) type Exit = Option<String>;
+
+/// Now, as a worker's `heard` holds it: milliseconds since `epoch`, plus one,
+/// so that 0 can mean never.
+pub(crate) fn stamp(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX - 1) + 1
+}
 
 enum Wait<T> {
     Got(T),
@@ -137,6 +166,7 @@ impl Worker {
     fn report(&self, range: Range<u64>, written: u64, outcome: Outcome) -> bool {
         let report = Report {
             link: self.link,
+            seat: self.seat,
             range,
             written,
             outcome,
@@ -154,7 +184,7 @@ impl Worker {
         }
         let response = match self.within(request.send()).await {
             Wait::Got(Ok(response)) => response,
-            Wait::Got(Err(e)) => return (0, Outcome::Failed(format!("asking for a piece: {e}"))),
+            Wait::Got(Err(e)) => return (0, Outcome::Broken(format!("asking for a piece: {e}"))),
             Wait::TimedOut => return (0, self.no_answer()),
             Wait::Stopped => return (0, Outcome::Stopped),
         };
@@ -220,7 +250,7 @@ impl Worker {
     async fn whole(&mut self, client: &Client, length: Option<u64>) -> (u64, Outcome) {
         let response = match self.within(client.get(self.url.clone()).send()).await {
             Wait::Got(Ok(response)) => response,
-            Wait::Got(Err(e)) => return (0, Outcome::Failed(format!("asking for the file: {e}"))),
+            Wait::Got(Err(e)) => return (0, Outcome::Broken(format!("asking for the file: {e}"))),
             Wait::TimedOut => return (0, self.no_answer()),
             Wait::Stopped => return (0, Outcome::Stopped),
         };
@@ -253,10 +283,13 @@ impl Worker {
         let mut gathered: Vec<u8> = Vec::with_capacity(WRITE_PIECE);
         let ended = loop {
             let piece = match self.within(response.chunk()).await {
-                Wait::Got(Ok(Some(piece))) => piece,
+                Wait::Got(Ok(Some(piece))) => {
+                    self.heard.store(stamp(self.epoch), Ordering::SeqCst);
+                    piece
+                }
                 Wait::Got(Ok(None)) => break None,
                 Wait::Got(Err(e)) => {
-                    break Some(Outcome::Failed(format!("the answer broke off: {e}")));
+                    break Some(Outcome::Broken(format!("the answer broke off: {e}")));
                 }
                 Wait::TimedOut => break Some(self.no_answer()),
                 Wait::Stopped => break Some(Outcome::Stopped),
@@ -313,9 +346,9 @@ impl Worker {
     }
 
     fn no_answer(&self) -> Outcome {
-        Outcome::Failed(format!(
-            "no data from the server for {:?}",
-            self.read_deadline
+        Outcome::Broken(format!(
+            "no data from the server for {}",
+            wait_words(self.read_deadline)
         ))
     }
 }

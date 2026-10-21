@@ -24,6 +24,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use barrage::fetch::PROBE_BYTES;
 use tokio::net::TcpListener;
 
 /// What one path answers.
@@ -70,6 +71,7 @@ pub struct File {
     /// `Content-Range` that says so.
     pub from_the_top: bool,
     pub cuts: Vec<Cut>,
+    pub stalls: Vec<Stall>,
     /// The ETag one source is sent instead of `etag`: another version of the
     /// file, as one CDN node might hold.
     pub etag_for: Vec<(IpAddr, String)>,
@@ -105,6 +107,27 @@ impl Cut {
     }
 }
 
+/// Stop sending partway through some answers to one source and hold the
+/// connection open, as a connection that stops carrying data does. Never a
+/// probe: the link still finds the file, then stops getting it.
+#[derive(Clone, Debug)]
+pub struct Stall {
+    source: IpAddr,
+    after: u64,
+    /// How many answers are left to stall; `None`, every one.
+    left: Option<Arc<AtomicUsize>>,
+}
+
+impl Stall {
+    /// Use up one stall, if any are left.
+    fn take(&self) -> bool {
+        self.left.as_ref().is_none_or(|left| {
+            left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        })
+    }
+}
+
 impl File {
     pub fn new(length: u64) -> Self {
         Self {
@@ -120,6 +143,7 @@ impl File {
             past_the_range: false,
             from_the_top: false,
             cuts: Vec::new(),
+            stalls: Vec::new(),
             etag_for: Vec::new(),
             replaced: None,
             requests: Arc::new(AtomicUsize::new(0)),
@@ -214,6 +238,17 @@ impl File {
         });
         self
     }
+
+    /// Stall answers to `source` once `after` bytes are sent: the next
+    /// `times` of them, or with `None` every one. A probe is never stalled.
+    pub fn stalls(mut self, source: &str, after: u64, times: Option<usize>) -> Self {
+        self.stalls.push(Stall {
+            source: source.parse().unwrap(),
+            after,
+            left: times.map(|n| Arc::new(AtomicUsize::new(n))),
+        });
+        self
+    }
 }
 
 /// One request, as the server saw it.
@@ -231,6 +266,8 @@ pub struct Seen {
     pub finished: Arc<OnceLock<Instant>>,
     /// The file offset at which this answer was cut, if it was.
     pub cut: Option<u64>,
+    /// The file offset at which this answer stalls, if it does.
+    pub stall: Option<u64>,
 }
 
 impl Seen {
@@ -386,6 +423,7 @@ async fn answer(
         started: Instant::now(),
         finished: finished.clone(),
         cut: plan.as_ref().and_then(|p| p.cut),
+        stall: plan.as_ref().and_then(|p| p.stall),
     });
 
     let finish_now = || {
@@ -431,6 +469,8 @@ struct Plan {
     /// Where the file's own bytes end; past it, [`NOT_THE_FILE`].
     real_until: u64,
     cut: Option<u64>,
+    /// The file offset where the answer stops sending, if it stalls.
+    stall: Option<u64>,
     /// The file as this request finds it.
     length: u64,
     etag: Option<String>,
@@ -476,11 +516,16 @@ impl File {
             (c.source == source && range.end - range.start > c.after && c.take())
                 .then_some(range.start + c.after)
         });
+        let piece = range.end - range.start > PROBE_BYTES;
+        let stall = self.stalls.iter().find_map(|s| {
+            (s.source == source && piece && s.take()).then_some(range.start + s.after)
+        });
         Plan {
             kind,
             range,
             real_until,
             cut,
+            stall,
             length,
             etag,
         }
@@ -599,7 +644,8 @@ fn body(file: &File, plan: Plan, sent: Arc<AtomicU64>, finished: Arc<OnceLock<In
     let rate = file.rate;
     let stop = file
         .stall_after
-        .map_or(end, |bytes| end.min(start.saturating_add(bytes)));
+        .map_or(end, |bytes| end.min(start.saturating_add(bytes)))
+        .min(plan.stall.unwrap_or(end));
     let began = tokio::time::Instant::now();
     let pieces = futures_util::stream::unfold((start, Finish(finished)), move |(at, mark)| {
         let sent = sent.clone();

@@ -107,6 +107,13 @@ pub struct DownloadConfig {
     pub publish_every: Duration,
     /// The span a speed is measured over.
     pub speed_window: Duration,
+    /// How long a fresh connection waits to take the place of one that
+    /// failed while the rest of its link kept working.
+    pub retry_connection: Duration,
+    /// How long a link whose connections all failed rests before one tries
+    /// again. Each failure in a row doubles it, up to `rest_max`.
+    pub rest_first: Duration,
+    pub rest_max: Duration,
 }
 
 impl Default for DownloadConfig {
@@ -118,6 +125,9 @@ impl Default for DownloadConfig {
             find_deadline: Duration::from_secs(20),
             publish_every: Duration::from_millis(250),
             speed_window: Duration::from_secs(2),
+            retry_connection: Duration::from_secs(1),
+            rest_first: Duration::from_secs(5),
+            rest_max: Duration::from_secs(60),
         }
     }
 }
@@ -288,4 +298,44 @@ fn same_file(a: &Url, b: &Url) -> bool {
         url
     };
     sent(a) == sent(b)
+}
+
+/// A wait as the notes write it: "300 ms", "5 s", "1.5 s", "1 min",
+/// "55 min 11 s".
+pub(crate) fn wait_words(wait: Duration) -> String {
+    let ms = wait.as_millis();
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let secs = wait.as_secs();
+    if secs < 60 {
+        return if ms.is_multiple_of(1000) {
+            format!("{secs} s")
+        } else {
+            format!("{:.1} s", wait.as_secs_f64())
+        };
+    }
+    match (secs / 60, secs % 60) {
+        (min, 0) => format!("{min} min"),
+        (min, s) => format!("{min} min {s} s"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_is_written_in_the_unit_that_reads_best() {
+        let words = |ms| wait_words(Duration::from_millis(ms));
+        assert_eq!(words(0), "0 ms");
+        assert_eq!(words(300), "300 ms");
+        assert_eq!(words(999), "999 ms");
+        assert_eq!(words(1000), "1 s");
+        assert_eq!(words(1500), "1.5 s");
+        assert_eq!(words(8000), "8 s");
+        assert_eq!(words(59_000), "59 s");
+        assert_eq!(words(60_000), "1 min");
+        assert_eq!(words(3_311_000), "55 min 11 s");
+    }
 }

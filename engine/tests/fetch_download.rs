@@ -6,159 +6,13 @@
 //! No test here touches the internet.
 
 mod fake;
+mod fetching;
 mod serve;
 
-use std::net::IpAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-
-use barrage::LinkHandle;
-use barrage::fetch::{
-    AddRequest, DownloadConfig, DownloadId, DownloadStatus, Downloads, PROBE_BYTES, Phase,
-};
-use barrage::links::Candidate;
-use barrage::links::watch::WatchConfig;
-use fake::{Fake, cand_idx, ms};
-use serve::{Answer, File, Seen, Server, content, most_at_once};
-
-const MIB: u64 = 1 << 20;
-const WIFI: &str = "127.0.0.1";
-const ETHERNET: &str = "127.0.0.2";
-
-fn wifi() -> Candidate {
-    cand_idx(1, "Wi-Fi", WIFI, true)
-}
-
-fn ethernet() -> Candidate {
-    cand_idx(2, "Ethernet 2", ETHERNET, true)
-}
-
-fn ip(text: &str) -> IpAddr {
-    text.parse().unwrap()
-}
-
-/// The links, one table per poll of the watcher, the last one repeating.
-fn links(steps: Vec<Vec<Candidate>>) -> LinkHandle {
-    let net = Fake::scripted(steps).loopback_links();
-    LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(20))).unwrap()
-}
-
-fn both() -> LinkHandle {
-    links(vec![vec![wifi(), ethernet()]])
-}
-
-/// The default worker count, with short times so a test takes a second.
-fn config() -> DownloadConfig {
-    DownloadConfig {
-        read_deadline: Duration::from_secs(5),
-        find_deadline: Duration::from_secs(5),
-        publish_every: ms(20),
-        speed_window: ms(200),
-        ..DownloadConfig::default()
-    }
-}
-
-/// A folder of its own for one test's downloads, removed afterwards.
-struct Folder(PathBuf);
-
-impl Folder {
-    fn new(name: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("barrage-download-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn read(&self, name: &str) -> Vec<u8> {
-        std::fs::read(self.0.join(name)).unwrap()
-    }
-}
-
-impl Drop for Folder {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn request(url: &reqwest::Url) -> AddRequest {
-    AddRequest {
-        url: url.to_string(),
-        cables: None,
-    }
-}
-
-/// The download's status once `wanted` holds, failing the test after 20 s.
-async fn wait_for(
-    downloads: &Downloads,
-    id: DownloadId,
-    what: &str,
-    wanted: impl Fn(&DownloadStatus) -> bool,
-) -> DownloadStatus {
-    let mut status = downloads.status();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let now = status
-            .borrow_and_update()
-            .iter()
-            .find(|s| s.id == id)
-            .cloned();
-        if let Some(now) = now.as_ref().filter(|s| wanted(s)) {
-            return now.clone();
-        }
-        match tokio::time::timeout_at(deadline, status.changed()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => panic!("the status channel closed while waiting for {what}"),
-            Err(_) => panic!("no {what} within 20 s; last status: {now:?}"),
-        }
-    }
-}
-
-async fn ended(downloads: &Downloads, id: DownloadId) -> DownloadStatus {
-    wait_for(downloads, id, "end", |s| {
-        matches!(s.phase, Phase::Done | Phase::Failed)
-    })
-    .await
-}
-
-fn is_probe(seen: &Seen) -> bool {
-    seen.asked() == Some((0, PROBE_BYTES - 1))
-}
-
-/// The file's bytes the server sent to `source`, its probes aside.
-fn served(seen: &[Seen], source: &str) -> u64 {
-    seen.iter()
-        .filter(|s| s.source == ip(source) && !is_probe(s))
-        .map(Seen::sent)
-        .sum()
-}
-
-/// The file on disk is the server's, byte for byte.
-fn assert_same(got: &[u8], length: u64) {
-    let want = content(0..length);
-    assert_eq!(got.len(), want.len(), "the file's length");
-    if let Some(at) = got.iter().zip(&want).position(|(a, b)| a != b) {
-        panic!("the file differs from the server's at byte {at}");
-    }
-}
-
-/// A rate-limited file on a new server, downloaded into a new folder.
-async fn start(
-    name: &str,
-    file: File,
-    links: &LinkHandle,
-) -> (Server, Folder, Downloads, DownloadId) {
-    let server = Server::start().await;
-    server.at(&format!("/{name}"), Answer::File(file));
-    let dir = Folder::new(name);
-    let downloads = Downloads::with_config(links.table(), dir.0.clone(), config());
-    let id = downloads
-        .add(request(&server.url(&format!("/{name}"))))
-        .await
-        .unwrap();
-    (server, dir, downloads, id)
-}
+use barrage::fetch::{AddRequest, DownloadConfig, Downloads, Phase};
+use fake::{cand_idx, ms};
+use fetching::*;
+use serve::{Answer, File, Seen, Server, most_at_once};
 
 #[tokio::test]
 async fn a_file_comes_down_through_every_link_byte_for_byte() {
@@ -466,15 +320,6 @@ async fn a_file_no_link_can_find_fails_with_the_reason() {
 }
 
 // When the server and the links disagree (Task 6).
-
-/// The cable's share in `status`, by name.
-fn share<'a>(status: &'a DownloadStatus, name: &str) -> &'a barrage::fetch::LinkShare {
-    status
-        .links
-        .iter()
-        .find(|l| l.name == name)
-        .unwrap_or_else(|| panic!("no share for {name}: {status:?}"))
-}
 
 /// Review Focus 1: a CDN node holding another version. The Wi-Fi comes up
 /// first, so its version is the one fixed; Ethernet 2's node then sends
