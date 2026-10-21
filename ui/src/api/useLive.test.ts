@@ -1,7 +1,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import type { LinkView, LiveMessage, TableView } from './types'
+import type { DownloadsView, LinkView, LiveMessage, TableView } from './types'
 import { FEED_MAX, RETRY_MS, useLive } from './useLive'
 
 /** A socket the test drives by hand, standing in for the engine. */
@@ -83,7 +83,7 @@ afterEach(() => {
 test('the first table makes it live', () => {
   const e = engine()
   const { result } = renderHook(() => useLive(URL, e.open))
-  expect(result.current).toEqual({ status: 'connecting', table: null, feed: [] })
+  expect(result.current).toEqual({ status: 'connecting', table: null, feed: [], downloads: null })
   expect(e.last().url).toBe(URL)
 
   e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
@@ -114,22 +114,46 @@ test('a change replaces the table and adds its lines to the top of the feed', ()
   ])
 })
 
-test('a downloads message leaves the table and the feed as they are', () => {
+/** One download running through Wi-Fi. */
+const RUNNING: DownloadsView = {
+  live: { bps: 1_000_000, parts: [{ name: 'Wi-Fi', bps: 1_000_000 }] },
+  list: [
+    {
+      id: 1,
+      url: 'https://example.com/a.iso',
+      name: 'a.iso',
+      state: 'downloading',
+      length: 1000,
+      done: 300,
+      bps: 1_000_000,
+      note: null,
+      cables: [{ name: 'Wi-Fi', bytes: 300, bps: 1_000_000, connections: 4, notes: [] }],
+    },
+  ],
+}
+
+test('a downloads message replaces the downloads, and leaves the table and the feed alone', () => {
   const e = engine()
   const { result } = renderHook(() => useLive(URL, e.open))
   e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
   e.last().send({ type: 'change', table: table(link(1, 'Wi-Fi')), lines: ['a line'] })
-  const before = result.current
+  const { table: before, feed } = result.current
 
   e.last().send({ type: 'downloads', downloads: { live: { bps: 0, parts: [] }, list: [] } })
+  expect(result.current.downloads).toEqual({ live: { bps: 0, parts: [] }, list: [] })
+  e.last().send({ type: 'downloads', downloads: RUNNING })
+  expect(result.current.downloads).toEqual(RUNNING)
 
-  expect(result.current).toEqual(before)
+  expect(result.current.table).toBe(before)
+  expect(result.current.feed).toBe(feed)
+  expect(result.current.status).toBe('live')
 })
 
-test('a closed socket shows disconnected and keeps the last table', () => {
+test('a closed socket shows disconnected and keeps the last table and downloads', () => {
   const e = engine()
   const { result } = renderHook(() => useLive(URL, e.open))
   e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
+  e.last().send({ type: 'downloads', downloads: RUNNING })
   e.last().send({ type: 'change', table: table(link(1, 'Wi-Fi')), lines: ['a line'] })
 
   e.last().drop()
@@ -137,6 +161,7 @@ test('a closed socket shows disconnected and keeps the last table', () => {
   expect(result.current.status).toBe('disconnected')
   expect(result.current.table).toEqual(table(link(1, 'Wi-Fi')))
   expect(result.current.feed.map((l) => l.text)).toEqual(['a line'])
+  expect(result.current.downloads).toEqual(RUNNING)
 })
 
 test('it reconnects after 1 s, then 2 s, 4 s and 5 s, and resets on success', () => {

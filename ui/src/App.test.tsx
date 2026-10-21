@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react'
-import { expect, test, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import App from './App'
 
@@ -25,18 +25,64 @@ vi.mock('./api/useLive', () => ({
       combined: { bps: 57_600_000, parts: [{ name: 'Wi-Fi', bps: 57_600_000, shared_with: [] }], not_counted: [] },
     },
     feed: [],
+    downloads: { live: { bps: 0, parts: [] }, list: [] },
   }),
 }))
 
-test('the app shows its name and only the tabs that are real', () => {
+// Every test starts at the page's plain address, as `barrage` opens it.
+beforeEach(() => window.history.replaceState(null, '', '/'))
+afterEach(() => window.history.replaceState(null, '', '/'))
+
+const tab = (name: string) => screen.getByRole('tab', { name })
+const field = () => screen.queryByRole('textbox', { name: 'Download a file from its link' })
+
+test('the app shows its name and its two tabs', () => {
   render(<App />)
   expect(screen.getByRole('heading', { name: 'BARRAGE' })).toBeInTheDocument()
-  expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Links'])
+  expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Links', 'Downloads'])
 })
 
-test('the one tab is the selected one', () => {
+test('Links is the tab shown, unless the address names another', () => {
   render(<App />)
-  expect(screen.getByRole('tab', { name: 'Links' })).toHaveAttribute('aria-selected', 'true')
+  expect(tab('Links')).toHaveAttribute('aria-selected', 'true')
+  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'false')
+  expect(screen.getByRole('region', { name: 'Wi-Fi' })).toBeInTheDocument()
+})
+
+test('the Downloads tab survives a reload', () => {
+  render(<App />)
+  fireEvent.click(tab('Downloads'))
+  expect(window.location.hash).toBe('#downloads')
+  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'true')
+  expect(field()).toBeInTheDocument()
+
+  // A reload: the page starts again from nothing but its address.
+  cleanup()
+  render(<App />)
+  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'true')
+  expect(field()).toBeInTheDocument()
+
+  // Back on Links, the address is the plain one again.
+  fireEvent.click(tab('Links'))
+  expect(window.location.hash).toBe('')
+  expect(window.location.pathname).toBe('/')
+  expect(tab('Links')).toHaveAttribute('aria-selected', 'true')
+  expect(field()).toBeNull()
+})
+
+test('an address changed by hand, or by Back, moves the tab', () => {
+  render(<App />)
+  act(() => {
+    window.history.replaceState(null, '', '/#downloads')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+  })
+  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'true')
+
+  act(() => {
+    window.history.replaceState(null, '', '/#links')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+  })
+  expect(tab('Links')).toHaveAttribute('aria-selected', 'true')
 })
 
 test('the dashboard shows what the live connection holds', () => {

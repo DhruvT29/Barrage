@@ -1,8 +1,9 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
 
 import type { FeedLine, Status } from '../api/useLive'
-import type { CombinedView, LinkView, TableView } from '../api/types'
+import type { CombinedView, DownloadState, DownloadView, DownloadsView, LinkView, TableView } from '../api/types'
+import type { Tab } from '../tabs'
 import { Dashboard } from './Dashboard'
 
 let nextId = 1
@@ -27,8 +28,40 @@ function table(links: LinkView[], fields: Partial<TableView> = {}): TableView {
   return { links, shared: [], connections: [], combined: NOTHING, ...fields }
 }
 
-function show(status: Status, t: TableView | null, feed: FeedLine[] = []) {
-  return render(<Dashboard status={status} table={t} feed={feed} />)
+type More = { downloads: DownloadsView | null; tab: Tab; onTab: (tab: Tab) => void }
+
+function page(status: Status, t: TableView | null, feed: FeedLine[] = [], more: Partial<More> = {}) {
+  return <Dashboard status={status} table={t} feed={feed} downloads={null} tab="links" onTab={() => {}} {...more} />
+}
+
+function show(status: Status, t: TableView | null, feed: FeedLine[] = [], more: Partial<More> = {}) {
+  return render(page(status, t, feed, more))
+}
+
+function download(id: number, state: DownloadState): DownloadView {
+  return {
+    id,
+    url: `https://example.com/file-${id}.iso`,
+    name: `file-${id}.iso`,
+    state,
+    length: 1000,
+    done: state === 'done' ? 1000 : 300,
+    bps: 0,
+    note: null,
+    cables: [],
+  }
+}
+
+/** One download running through two cables, one finished before it. */
+const LIVE: DownloadsView = {
+  live: {
+    bps: 189_900_000,
+    parts: [
+      { name: 'Wi-Fi', bps: 48_200_000 },
+      { name: 'Ethernet 2', bps: 141_700_000 },
+    ],
+  },
+  list: [download(1, 'done'), download(2, 'downloading')],
 }
 
 const hero = () => screen.getByRole('region', { name: 'Combined speed available' })
@@ -137,8 +170,76 @@ test('disconnected: says so and still shows the last table, dimmed as old', () =
   expect(within(hero()).getByTestId('total')).toHaveTextContent('57.6 Mbps')
   expect(container.querySelector('.layout')).toHaveClass('stale')
 
-  rerender(<Dashboard status="live" table={t} feed={[]} />)
+  rerender(page('live', t))
   expect(container.querySelector('.layout')).not.toHaveClass('stale')
+})
+
+test('while anything downloads, the hero shows the live download speed per cable', () => {
+  show('live', table([wifi(), eth2()], { combined: TWO }), [], { downloads: LIVE })
+
+  const h = screen.getByRole('region', { name: 'Downloading at' })
+  expect(screen.getAllByRole('region')[0]).toBe(h)
+  expect(within(h).getByTestId('total')).toHaveTextContent('189.9 Mbps')
+  expect(h).toHaveTextContent('1 download, through 2 cables')
+  const segments = within(h).getAllByTestId('segment')
+  expect(segments.map((s) => parseFloat(s.style.width))).toEqual([expect.closeTo(25.38, 2), expect.closeTo(74.62, 2)])
+  expect(within(h).getAllByTestId('part').map((p) => p.textContent)).toEqual(['Wi-Fi 48.2', 'Ethernet 2 141.7'])
+  expect(within(h).getByTestId('note')).toHaveTextContent(
+    'What every download is fetching right now, added up by cable. With nothing downloading, this shows the combined speed available.',
+  )
+  expect(screen.queryByRole('region', { name: 'Combined speed available' })).toBeNull()
+})
+
+test('with nothing downloading, the hero is the combined speed available, as before', () => {
+  const ended: DownloadsView = {
+    live: { bps: 0, parts: [] },
+    list: [download(1, 'done'), download(2, 'failed'), download(3, 'waiting'), download(4, 'starting')],
+  }
+  show('live', table([wifi(), eth2()], { combined: TWO }), [], { downloads: ended })
+
+  expect(within(hero()).getByTestId('total')).toHaveTextContent('220.1 Mbps')
+  expect(hero()).toHaveTextContent('from 2 independent connections')
+  expect(screen.queryByRole('region', { name: 'Downloading at' })).toBeNull()
+})
+
+test('a download that stalls keeps the hero on it, at 0.0 Mbps', () => {
+  const stalled: DownloadsView = {
+    live: { bps: 0, parts: [] },
+    list: [download(1, 'downloading'), download(2, 'downloading')],
+  }
+  show('live', table([wifi()], { combined: TWO }), [], { downloads: stalled })
+
+  const h = screen.getByRole('region', { name: 'Downloading at' })
+  expect(within(h).getByTestId('total')).toHaveTextContent(/^0\.0 Mbps$/)
+  expect(h).toHaveTextContent('2 downloads, nothing arriving right now')
+  expect(within(h).queryAllByTestId('segment')).toHaveLength(0)
+})
+
+test('Links shows the cables, Downloads the downloads; the hero and the activity stay on both', () => {
+  const asked: Tab[] = []
+  const t = table([wifi()], { combined: TWO })
+  const onTab = (tab: Tab) => asked.push(tab)
+  const { rerender } = show('live', t, [], { downloads: LIVE, onTab })
+
+  expect(screen.getByRole('tab', { name: 'Links' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('tab', { name: 'Downloads' })).toHaveAttribute('aria-selected', 'false')
+  expect(screen.getByRole('region', { name: 'Wi-Fi' })).toBeInTheDocument()
+  expect(screen.queryByRole('textbox', { name: 'Download a file from its link' })).toBeNull()
+
+  // A click asks for the tab; the page shows whichever it is given.
+  fireEvent.click(screen.getByRole('tab', { name: 'Downloads' }))
+  expect(asked).toEqual(['downloads'])
+
+  rerender(page('live', t, [], { downloads: LIVE, onTab, tab: 'downloads' }))
+  expect(screen.getByRole('tab', { name: 'Downloads' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('textbox', { name: 'Download a file from its link' })).toBeInTheDocument()
+  expect(screen.getByRole('region', { name: 'file-2.iso' })).toBeInTheDocument()
+  expect(screen.queryByRole('region', { name: 'Wi-Fi' })).toBeNull()
+  expect(screen.getByRole('region', { name: 'Downloading at' })).toBeInTheDocument()
+  expect(screen.getByRole('complementary', { name: 'Activity' })).toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('tab', { name: 'Links' }))
+  expect(asked).toEqual(['downloads', 'links'])
 })
 
 test('the engine never answered: says so, nothing else', () => {
