@@ -112,7 +112,8 @@ pub struct DownloadView {
     pub url: String,
     /// The file's name in the download folder; null until the file is found.
     pub name: Option<String>,
-    /// `"starting"`, `"waiting"`, `"downloading"`, `"done"` or `"failed"`.
+    /// `"starting"`, `"waiting"`, `"downloading"`, `"done"`, `"failed"` or
+    /// `"stopped"`.
     pub state: &'static str,
     /// In bytes; null while the server has not said.
     pub length: Option<u64>,
@@ -376,6 +377,7 @@ fn phase_word(phase: Phase) -> &'static str {
         Phase::Downloading => "downloading",
         Phase::Done => "done",
         Phase::Failed => "failed",
+        Phase::Stopped => "stopped",
     }
 }
 
@@ -1035,6 +1037,11 @@ mod tests {
                 Phase::Starting,
                 vec![share(1, "Wi-Fi", 1, 55_000_000, 0, None)],
             ),
+            download(
+                7,
+                Phase::Stopped,
+                vec![share(1, "Wi-Fi", 1, 44_000_000, 0, None)],
+            ),
             // Ethernet 2 in a second download adds to its part. Ethernet 3,
             // carrying nothing, has no part.
             download(
@@ -1063,6 +1070,7 @@ mod tests {
             (Phase::Downloading, "downloading"),
             (Phase::Done, "done"),
             (Phase::Failed, "failed"),
+            (Phase::Stopped, "stopped"),
         ];
         for (phase, word) in phases {
             let view = downloads_view(&[download(1, phase, vec![])]);
@@ -1198,7 +1206,8 @@ mod tests {
 
     /// A download in every state, on the sample's cables: one downloading
     /// over Wi-Fi and both of Ethernet 2's addresses while Ethernet 3 sits
-    /// out with its note, and one failed with the note its link gave.
+    /// out with its note, one failed with the note its link gave, and one
+    /// stopped halfway.
     fn contract_downloads() -> Vec<DownloadStatus> {
         let gone = "https://example.com/files/gone.zip";
         let not_found = format!("finding {gone} through 192.0.2.10: {gone} answered 404 Not Found");
@@ -1252,7 +1261,20 @@ mod tests {
             phase: Phase::Starting,
             ..waiting.clone()
         };
-        vec![downloading, done, failed, waiting, starting]
+
+        let mut stopped = download(
+            6,
+            Phase::Stopped,
+            vec![
+                share(1, "Wi-Fi", 112_500_000, 0, 0, None),
+                share(2, "Ethernet 2", 538_600_000, 0, 0, None),
+            ],
+        );
+        stopped.url = "https://example.com/files/installer.exe".to_string();
+        stopped.name = Some("installer.exe".to_string());
+        stopped.length = Some(1_302_200_000);
+        stopped.note = Some("stopped; resuming carries on from here".to_string());
+        vec![downloading, done, failed, waiting, starting, stopped]
     }
 
     /// Fails when the engine's JSON changes and the page's copy does not,

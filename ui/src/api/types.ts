@@ -55,8 +55,8 @@ export interface NotCounted {
   why: 'not measured yet' | 'portal' | 'probing' | 'down'
 }
 
-/** A download's state words. */
-export type DownloadState = 'starting' | 'waiting' | 'downloading' | 'done' | 'failed'
+/** A download's state words. `stopped` keeps what it saved, to resume from. */
+export type DownloadState = 'starting' | 'waiting' | 'downloading' | 'done' | 'failed' | 'stopped'
 
 /** Every download since the engine started, and the speed they make together. */
 export interface DownloadsView {

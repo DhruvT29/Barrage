@@ -26,6 +26,7 @@ pub mod remote;
 mod saved;
 mod worker;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,8 +62,20 @@ struct Inner {
     /// Becomes true when the engine stops: every download stops and saves
     /// its progress.
     stopping: watch::Sender<bool>,
-    /// Every download's coordinator, so stopping can wait for them.
-    running: Mutex<Vec<JoinHandle<()>>>,
+    /// What stopping and resuming each download needs, by id.
+    controls: Mutex<HashMap<DownloadId, Control>>,
+}
+
+/// One download's way to be stopped, and started again.
+struct Control {
+    /// The URL as given, and parsed.
+    given: String,
+    url: Url,
+    cables: Option<Vec<String>>,
+    /// Becomes true when [`Downloads::stop`] asks it to stop.
+    stop: watch::Sender<bool>,
+    /// Its coordinator, until the engine stopping waits for it.
+    task: Option<JoinHandle<()>>,
 }
 
 /// A URL to download.
@@ -101,6 +114,35 @@ impl fmt::Display for AddError {
 }
 
 impl std::error::Error for AddError {}
+
+/// Why a download was not stopped or resumed. The words are the engine's,
+/// for the page to show as they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlError {
+    NoSuchDownload,
+    /// Stopping: it is not starting, waiting or downloading.
+    NotRunning,
+    /// Resuming: it is not stopped.
+    NotStopped,
+    /// Resuming: its file is starting, waiting or downloading again, as this
+    /// other download.
+    AlreadyRunning(DownloadId),
+}
+
+impl fmt::Display for ControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSuchDownload => f.write_str("no such download"),
+            Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
+            Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
+            Self::AlreadyRunning(id) => {
+                write!(f, "already downloading, as download {}", id.as_u64())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ControlError {}
 
 /// How downloads run. Tests shrink the times.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +217,9 @@ pub enum Phase {
     Done,
     /// Ended without the file; the note says why.
     Failed,
+    /// Stopped, by [`Downloads::stop`] or the engine stopping, with what it
+    /// had saved: resuming carries on from there.
+    Stopped,
 }
 
 /// What one download is doing, as last published.
@@ -226,7 +271,7 @@ impl Downloads {
                 next: AtomicU64::new(0),
                 status: Arc::new(status),
                 stopping: watch::channel(false).0,
-                running: Mutex::new(Vec::new()),
+                controls: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -255,36 +300,38 @@ impl Downloads {
                 return false;
             }
             let id = DownloadId::new(self.inner.next.fetch_add(1, Ordering::SeqCst) + 1);
-            all.push(DownloadStatus {
-                id,
-                url: request.url.clone(),
-                name: None,
-                phase: Phase::Starting,
-                length: None,
-                done: 0,
-                bps: 0,
-                links: Vec::new(),
-                note: None,
-            });
+            all.push(starting(id, &request.url));
             added = Some(Ok(id));
             true
         });
         let id = added.expect("the status closure always runs")?;
+        self.launch(id, request.url, url, request.cables);
+        Ok(id)
+    }
+
+    /// Start download `id`'s coordinator, with its own way to be stopped.
+    fn launch(&self, id: DownloadId, given: String, url: Url, cables: Option<Vec<String>>) {
+        let (stop, asked) = watch::channel(false);
         let task = tokio::spawn(download::run(download::Job {
             id,
-            given: request.url,
-            url,
-            cables: request.cables,
+            given: given.clone(),
+            url: url.clone(),
+            cables: cables.clone(),
             table: self.inner.table.clone(),
             dir: self.inner.dir.clone(),
             config: self.inner.config.clone(),
             status: self.inner.status.clone(),
             stopping: self.inner.stopping.subscribe(),
+            stop: asked,
         }));
-        let mut running = self.inner.running.lock().unwrap();
-        running.retain(|task| !task.is_finished());
-        running.push(task);
-        Ok(id)
+        let control = Control {
+            given,
+            url,
+            cables,
+            stop,
+            task: Some(task),
+        };
+        self.inner.controls.lock().unwrap().insert(id, control);
     }
 
     /// Every download's status, updated as they run.
@@ -292,15 +339,107 @@ impl Downloads {
         self.inner.status.subscribe()
     }
 
+    /// Stop download `id`: its connections stop and report what they wrote,
+    /// and its progress is saved, so resuming it carries on from there.
+    /// Returns once it has stopped, the progress on disk; or, if it finished
+    /// or failed before it heard, says it was not running.
+    pub async fn stop(&self, id: DownloadId) -> Result<(), ControlError> {
+        {
+            let controls = self.inner.controls.lock().unwrap();
+            let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
+            if !self.phase(id).is_some_and(running) {
+                return Err(ControlError::NotRunning);
+            }
+            control.stop.send_replace(true);
+        }
+        // Stopped shows only once its last save is on disk.
+        let mut status = self.inner.status.subscribe();
+        let _ = status
+            .wait_for(|all| all.iter().any(|s| s.id == id && !running(s.phase)))
+            .await;
+        match self.phase(id) {
+            Some(Phase::Stopped) => Ok(()),
+            _ => Err(ControlError::NotRunning),
+        }
+    }
+
+    /// Resume download `id`, stopped: it starts again under the same id and
+    /// picks up from the progress it saved, as a download added again would.
+    /// Not while its file is starting, waiting or downloading as another.
+    /// Returns once it has started.
+    pub async fn resume(&self, id: DownloadId) -> Result<(), ControlError> {
+        let (given, url, cables) = {
+            let controls = self.inner.controls.lock().unwrap();
+            let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
+            (
+                control.given.clone(),
+                control.url.clone(),
+                control.cables.clone(),
+            )
+        };
+        // Checked and started under the status's one lock, as adding is, so
+        // a URL added at the same moment still runs once.
+        let mut outcome = Err(ControlError::NoSuchDownload);
+        self.inner.status.send_if_modified(|all| {
+            let Some(at) = all.iter().position(|s| s.id == id) else {
+                return false;
+            };
+            if all[at].phase != Phase::Stopped {
+                outcome = Err(ControlError::NotStopped);
+                return false;
+            }
+            let again = all.iter().find(|s| {
+                running(s.phase) && Url::parse(s.url.trim()).is_ok_and(|u| same_file(&u, &url))
+            });
+            if let Some(again) = again {
+                outcome = Err(ControlError::AlreadyRunning(again.id));
+                return false;
+            }
+            all[at] = starting(id, &given);
+            outcome = Ok(());
+            true
+        });
+        outcome?;
+        self.launch(id, given, url, cables);
+        Ok(())
+    }
+
+    /// Download `id`'s phase, as last published.
+    fn phase(&self, id: DownloadId) -> Option<Phase> {
+        let all = self.inner.status.borrow();
+        all.iter().find(|s| s.id == id).map(|s| s.phase)
+    }
+
     /// Stop every download: each one's connections stop and report what they
     /// wrote, and its progress is saved, so the next engine resumes it.
     /// Returns once every download has.
     pub async fn shutdown(&self) {
         self.inner.stopping.send_replace(true);
-        let running = std::mem::take(&mut *self.inner.running.lock().unwrap());
-        for task in running {
+        let tasks: Vec<JoinHandle<()>> = {
+            let mut controls = self.inner.controls.lock().unwrap();
+            controls
+                .values_mut()
+                .filter_map(|c| c.task.take())
+                .collect()
+        };
+        for task in tasks {
             let _ = task.await;
         }
+    }
+}
+
+/// A download's status as it starts, before anything is known of the file.
+fn starting(id: DownloadId, given: &str) -> DownloadStatus {
+    DownloadStatus {
+        id,
+        url: given.to_string(),
+        name: None,
+        phase: Phase::Starting,
+        length: None,
+        done: 0,
+        bps: 0,
+        links: Vec::new(),
+        note: None,
     }
 }
 

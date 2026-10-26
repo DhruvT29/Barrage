@@ -271,6 +271,32 @@ export const messages = [
           "bps": 0,
           "note": null,
           "cables": []
+        },
+        {
+          "id": 6,
+          "url": "https://example.com/files/installer.exe",
+          "name": "installer.exe",
+          "state": "stopped",
+          "length": 1302200000,
+          "done": 651100000,
+          "bps": 0,
+          "note": "stopped; resuming carries on from here",
+          "cables": [
+            {
+              "name": "Wi-Fi",
+              "bytes": 112500000,
+              "bps": 0,
+              "connections": 0,
+              "notes": []
+            },
+            {
+              "name": "Ethernet 2",
+              "bytes": 538600000,
+              "bps": 0,
+              "connections": 0,
+              "notes": []
+            }
+          ]
         }
       ]
     }

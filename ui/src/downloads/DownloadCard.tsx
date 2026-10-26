@@ -1,6 +1,66 @@
+import { useRef, useState } from 'react'
+
 import type { CableShare, DownloadState, DownloadView } from '../api/types'
 import { mbps } from '../links/cables'
 import { formatBytes, percent } from './format'
+
+/** What the engine made of a stop or a resume: done, or why not, in its words. */
+type Asked = { ok: true } | { refused: string }
+
+/**
+ * Asks the engine that served the page to stop or resume download `id`. The
+ * body is `{}` as JSON, which a form on another site cannot send; the
+ * engine's refusals (404, 409) are passed on as they are.
+ */
+async function control(id: number, action: 'stop' | 'resume'): Promise<Asked> {
+  let answer: Response
+  try {
+    answer = await fetch(`/api/downloads/${id}/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+  } catch {
+    return { refused: 'the engine is not answering' }
+  }
+  if (answer.ok) return { ok: true }
+  const body: unknown = await answer.json().catch(() => null)
+  const { error } = (body ?? {}) as { error?: unknown }
+  return { refused: typeof error === 'string' ? error : `the engine answered ${answer.status}` }
+}
+
+/** What a download in this state can be asked: Stop while it runs, Resume once stopped. */
+function actionFor(state: DownloadState): 'stop' | 'resume' | null {
+  if (state === 'starting' || state === 'waiting' || state === 'downloading') return 'stop'
+  return state === 'stopped' ? 'resume' : null
+}
+
+/**
+ * The card's button: what it asks, whether an answer is awaited, and the
+ * engine's last refusal, shown only while the download is in the state it
+ * was refused in. The card itself changes when the engine's next status
+ * says so.
+ */
+function useAction(id: number, state: DownloadState) {
+  const action = actionFor(state)
+  const [refused, setRefused] = useState<{ words: string; state: DownloadState } | null>(null)
+  const [sending, setSending] = useState(false)
+  // A second press before the page redraws must not ask twice.
+  const busy = useRef(false)
+
+  async function press() {
+    if (action === null || busy.current) return
+    busy.current = true
+    setSending(true)
+    setRefused(null)
+    const asked = await control(id, action)
+    busy.current = false
+    setSending(false)
+    if ('refused' in asked) setRefused({ words: asked.refused, state })
+  }
+
+  return { action, sending, refused: refused?.state === state ? refused.words : null, press }
+}
 
 /** What a card says in place of a speed, while it has none to show. */
 const WAITING_WORDS: Partial<Record<DownloadState, string>> = {
@@ -14,13 +74,15 @@ const WAITING_WORDS: Partial<Record<DownloadState, string>> = {
  * what that cable carried. Every note is the engine's own words.
  *
  * The state is a colour, a shape (both from the `dl <state>` classes) and
- * the engine's word, always written out.
+ * the engine's word, always written out. A running download can be stopped,
+ * its progress saved, and a stopped one resumed from there.
  */
 export function DownloadCard({ download: d }: { download: DownloadView }) {
   const title = d.name ?? d.url
   const moving = d.state === 'downloading'
   const words = WAITING_WORDS[d.state]
   const progress = progressOf(d)
+  const { action, sending, refused, press } = useAction(d.id, d.state)
   // A cable's note that repeats the download's own says nothing new, and a
   // cable that carried nothing, holds nothing open and has nothing new to
   // say is left out.
@@ -36,6 +98,11 @@ export function DownloadCard({ download: d }: { download: DownloadView }) {
           <span className="mark" aria-hidden="true" />
           <span data-testid="state">{d.state}</span>
         </span>
+        {action !== null && (
+          <button type="button" className={`act ${action}`} disabled={sending} onClick={press}>
+            {action === 'stop' ? 'Stop' : 'Resume'}
+          </button>
+        )}
       </div>
 
       {(moving || words || progress) && (
@@ -63,6 +130,11 @@ export function DownloadCard({ download: d }: { download: DownloadView }) {
       {d.note !== null && (
         <p className="note" data-testid="note">
           {d.note}
+        </p>
+      )}
+      {refused !== null && (
+        <p className="refused" role="alert">
+          {refused}
         </p>
       )}
 

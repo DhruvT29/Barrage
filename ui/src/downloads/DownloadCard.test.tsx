@@ -1,5 +1,5 @@
-import { render, screen, within } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { afterEach, expect, test, vi } from 'vitest'
 
 import type { CableShare, DownloadState, DownloadView } from '../api/types'
 import { DownloadCard } from './DownloadCard'
@@ -141,7 +141,7 @@ test('a download that failed partway keeps what it got on screen', () => {
 })
 
 test('each state shows its word, not only a colour', () => {
-  const states: DownloadState[] = ['starting', 'waiting', 'downloading', 'done', 'failed']
+  const states: DownloadState[] = ['starting', 'waiting', 'downloading', 'done', 'failed', 'stopped']
   for (const state of states) {
     const { unmount } = render(<DownloadCard download={download({ state })} />)
     const c = card()
@@ -225,4 +225,132 @@ test('with no length, a download shows the bytes so far, and its note', () => {
   expect(within(c).queryByTestId('percent')).toBeNull()
   expect(within(c).queryByTestId('progress-fill')).toBeNull()
   expect(within(c).getByTestId('note')).toHaveTextContent(whole)
+})
+
+// Stop and Resume (Task 13).
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+/** The engine answering each request with `status` and `body`; every request it got. */
+function engine(status: number, body: unknown) {
+  const asked: { url: string; init: RequestInit }[] = []
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+    asked.push({ url, init })
+    return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response
+  })
+  return asked
+}
+
+const action = (c: HTMLElement) => within(c).queryByRole('button')
+
+test('a running download can be stopped, a stopped one resumed, an ended one neither', () => {
+  const buttons: [DownloadState, string | null][] = [
+    ['starting', 'Stop'],
+    ['waiting', 'Stop'],
+    ['downloading', 'Stop'],
+    ['stopped', 'Resume'],
+    ['done', null],
+    ['failed', null],
+  ]
+  for (const [state, word] of buttons) {
+    const { unmount } = render(<DownloadCard download={download({ state })} />)
+    expect(action(card())?.textContent ?? null, state).toBe(word)
+    unmount()
+  }
+})
+
+test('Stop and Resume post {} as JSON to the download', async () => {
+  const asked = engine(200, { id: 4 })
+  const running = render(<DownloadCard download={download()} />)
+  await act(async () => {
+    fireEvent.click(action(card())!)
+  })
+  running.unmount()
+  render(<DownloadCard download={download({ state: 'stopped' })} />)
+  await act(async () => {
+    fireEvent.click(action(card())!)
+  })
+
+  expect(asked.map((a) => a.url)).toEqual(['/api/downloads/4/stop', '/api/downloads/4/resume'])
+  for (const { init } of asked) {
+    expect(init.method).toBe('POST')
+    expect(init.headers).toEqual({ 'Content-Type': 'application/json' })
+    expect(init.body).toBe('{}')
+  }
+  // The card changes when the engine's next status says so, not before.
+  expect(screen.queryByRole('alert')).toBeNull()
+})
+
+test("a refusal is shown in the engine's words", async () => {
+  engine(409, { error: 'it is not running, so there is nothing to stop' })
+  render(<DownloadCard download={download()} />)
+  await act(async () => {
+    fireEvent.click(action(card())!)
+  })
+  expect(within(card()).getByRole('alert')).toHaveTextContent(
+    /^it is not running, so there is nothing to stop$/,
+  )
+})
+
+test('a refusal goes once the download has moved on', async () => {
+  engine(409, { error: 'it is not running, so there is nothing to stop' })
+  const { rerender } = render(<DownloadCard download={download()} />)
+  await act(async () => {
+    fireEvent.click(action(card())!)
+  })
+  expect(within(card()).getByRole('alert')).toBeInTheDocument()
+  // It finished before it heard: the refusal said so, and the card now does.
+  rerender(<DownloadCard download={download({ state: 'done' })} />)
+  expect(within(card()).queryByRole('alert')).toBeNull()
+})
+
+test('an engine that does not answer says so', async () => {
+  vi.stubGlobal('fetch', async () => {
+    throw new TypeError('Failed to fetch')
+  })
+  render(<DownloadCard download={download()} />)
+  await act(async () => {
+    fireEvent.click(action(card())!)
+  })
+  expect(within(card()).getByRole('alert')).toHaveTextContent(/^the engine is not answering$/)
+})
+
+test('a press waits for its answer: a second sends nothing', async () => {
+  const asked: string[] = []
+  vi.stubGlobal('fetch', (url: string) => {
+    asked.push(url)
+    return new Promise(() => {})
+  })
+  render(<DownloadCard download={download()} />)
+  const button = action(card())!
+  await act(async () => {
+    fireEvent.click(button)
+    fireEvent.click(button)
+  })
+  expect(asked).toEqual(['/api/downloads/4/stop'])
+  expect(button).toBeDisabled()
+})
+
+test('a stopped download keeps what it got on screen, with the note, and no speeds', () => {
+  render(
+    <DownloadCard
+      download={download({
+        state: 'stopped',
+        bps: 0,
+        note: 'stopped; resuming carries on from here',
+        cables: [cable('Wi-Fi', { bytes: 300_000_000 }), cable('Ethernet 2', { bytes: 900_000_000 })],
+      })}
+    />,
+  )
+  const c = card()
+  expect(within(c).getByTestId('progress')).toHaveTextContent(/^1\.2 GB of 4\.0 GB$/)
+  expect(within(c).getByTestId('percent')).toHaveTextContent(/^30%$/)
+  expect(within(c).queryByTestId('speed')).toBeNull()
+  expect(within(c).getByTestId('note')).toHaveTextContent(/^stopped; resuming carries on from here$/)
+  expect(within(c).getAllByTestId('cable').map(cells)).toEqual([
+    { name: 'Wi-Fi', bytes: '300.0 MB', speed: '', connections: '', notes: [] },
+    { name: 'Ethernet 2', bytes: '900.0 MB', speed: '', connections: '', notes: [] },
+  ])
 })

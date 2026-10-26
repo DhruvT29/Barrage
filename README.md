@@ -26,7 +26,8 @@ addresses, and a notice when two connections reach the internet through the
 same one. **Downloads** takes a link to a file, which then comes down through
 every working connection at once; each download shows its progress, its speed
 and what each connection carried. A tethered phone's part comes out of its
-mobile data. Across the top, both tabs show the combined speed available, or
+mobile data. Stop on a download saves what it has; Resume carries on from
+there. Across the top, both tabs show the combined speed available, or
 while anything downloads the live download speed; beside them, every change as
 it happens. Ctrl+C stops `barrage`; the open page says "disconnected,
 retrying", keeps what it last showed, and comes back by itself when `barrage`

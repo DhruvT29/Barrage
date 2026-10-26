@@ -833,6 +833,150 @@ async fn a_url_that_failed_can_be_added_again() {
     );
 }
 
+/// `POST /api/downloads/{id}/{action}` with `body` sent as `content_type`.
+async fn control(
+    addr: SocketAddr,
+    id: &str,
+    action: &str,
+    content_type: &str,
+    body: &str,
+) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/downloads/{id}/{action}"))
+        .header("content-type", content_type)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    let json = serde_json::from_str(&text).unwrap_or_else(|_| panic!("not JSON: {text}"));
+    (status, json)
+}
+
+/// Stop or resume download `id`, as the page's buttons send it: `{}` as JSON.
+async fn command(addr: SocketAddr, id: u64, action: &str) -> (u16, Value) {
+    control(addr, &id.to_string(), action, "application/json", "{}").await
+}
+
+/// Stop and resume, as the page's buttons send them: the download saves what
+/// it had and shows as stopped, and resuming it carries on from there.
+#[tokio::test]
+async fn a_download_stops_and_resumes_through_the_api() {
+    const LENGTH: u64 = 20 << 20;
+    let files = Server::start().await;
+    // Every answer held after its first MiB: under way, and far from done.
+    let held = File::new(LENGTH).stall_after(1 << 20).etag("\"v1\"");
+    files.at("/held.bin", Answer::File(held));
+    let h = wifi_to_the_file_server();
+    let dir = Folder::new("api-pause");
+    let addr = serve_with(h.table(), downloads_in(&h.table(), &dir.0)).await;
+    let url = files.url("/held.bin").to_string();
+    assert_eq!(
+        post(addr, json!({ "url": url })).await,
+        (201, json!({ "id": 1 }))
+    );
+    listed_where(addr, "bytes", |l| l["list"][0]["done"].as_u64() > Some(0)).await;
+
+    assert_eq!(command(addr, 1, "stop").await, (200, json!({ "id": 1 })));
+    let stopped = listed(addr).await;
+    assert_eq!(stopped["list"][0]["state"], "stopped", "{stopped}");
+    assert_eq!(
+        stopped["list"][0]["note"],
+        "stopped; resuming carries on from here"
+    );
+    assert!(dir.0.join("held.bin.part.json").exists());
+
+    files.at("/held.bin", Answer::File(File::new(LENGTH).etag("\"v1\"")));
+    assert_eq!(command(addr, 1, "resume").await, (200, json!({ "id": 1 })));
+    let done = listed_where(addr, "the download done", |l| {
+        l["list"][0]["state"] == "done"
+    })
+    .await;
+    assert_eq!(done["list"].as_array().unwrap().len(), 1, "{done}");
+    let note = done["list"][0]["note"].as_str().unwrap_or_default();
+    assert!(note.starts_with("resumed: "), "{note}");
+    assert_eq!(
+        std::fs::read(dir.0.join("held.bin")).unwrap(),
+        content(0..LENGTH)
+    );
+}
+
+/// Stopping and resuming say why not, and only this machine's own pages may
+/// ask, as for adding a download.
+#[tokio::test]
+async fn stopping_and_resuming_say_why_not() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let url = "http://example.com/files/a.iso";
+    assert_eq!(
+        post(addr, json!({ "url": url })).await,
+        (201, json!({ "id": 1 }))
+    );
+
+    // Waiting for a cable is running, not stopped.
+    assert_eq!(
+        command(addr, 1, "resume").await,
+        (
+            409,
+            json!({ "error": "it is not stopped, so there is nothing to resume" })
+        )
+    );
+    assert_eq!(command(addr, 1, "stop").await, (200, json!({ "id": 1 })));
+    let stopped = listed(addr).await;
+    assert_eq!(stopped["list"][0]["state"], "stopped", "{stopped}");
+    assert_eq!(
+        stopped["list"][0]["note"],
+        "stopped; resuming starts it over"
+    );
+    assert_eq!(
+        command(addr, 1, "stop").await,
+        (
+            409,
+            json!({ "error": "it is not running, so there is nothing to stop" })
+        )
+    );
+
+    // Added again while stopped, the file is download 2's: 1 waits its turn.
+    assert_eq!(
+        post(addr, json!({ "url": url })).await,
+        (201, json!({ "id": 2 }))
+    );
+    let (status, answer) = command(addr, 1, "resume").await;
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer["id"], 2, "{answer}");
+    let error = answer["error"].as_str().unwrap_or_default();
+    assert!(error.contains("already downloading"), "{error}");
+
+    for id in ["9", "abc", "-1"] {
+        assert_eq!(
+            control(addr, id, "stop", "application/json", "{}").await,
+            (404, json!({ "error": "no such download" })),
+            "{id}"
+        );
+    }
+    // What a form on another site can send is refused, as for adding.
+    for (content_type, body) in [
+        ("application/x-www-form-urlencoded", ""),
+        ("text/plain", "{}"),
+    ] {
+        let (status, answer) = control(addr, "2", "stop", content_type, body).await;
+        assert_eq!(status, 415, "{content_type}: {answer}");
+    }
+    let (status, answer) = control(addr, "2", "stop", "application/json", r#"{"now": 1}"#).await;
+    assert_eq!(status, 400, "{answer}");
+    let foreign = reqwest::Client::new()
+        .post(format!("http://{addr}/api/downloads/2/stop"))
+        .header("content-type", "application/json")
+        .header("origin", "https://attacker.example")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 403);
+    assert_ne!(listed(addr).await["list"][1]["state"], "stopped");
+}
+
 /// The three kinds of body an HTML form can send to another site without
 /// asking first, and none at all. A page that tries must use `fetch` with
 /// JSON, which sends an Origin the guard checks.

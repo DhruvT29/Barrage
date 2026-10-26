@@ -1,6 +1,7 @@
 //! Resuming after a restart (Task 11): a download's progress saved beside
 //! its `.part` as `<name>.part.json`, and the next engine picking up where
-//! the last one stopped, against the scripted server and network as in
+//! the last one stopped; and one download stopped and resumed in the same
+//! engine (Task 13). Against the scripted server and network as in
 //! fetch_download.rs. Progress is saved every 100 ms here.
 
 mod fake;
@@ -9,7 +10,7 @@ mod serve;
 
 use std::time::Duration;
 
-use barrage::fetch::{DownloadConfig, Downloads, Phase};
+use barrage::fetch::{ControlError, DownloadConfig, Downloads, Phase};
 use fake::ms;
 use fetching::*;
 use serde_json::Value;
@@ -93,9 +94,8 @@ async fn stopping_saves_progress_and_adding_again_resumes() {
     wait_for(&first, id, "chunks under way", |s| s.done > FINISHED).await;
     first.shutdown().await;
     // Stopped by the time shutdown returns, not on its way to it.
-    let stopped = first.status().borrow().iter().find(|s| s.id == id).cloned();
-    let stopped = stopped.expect("no status");
-    assert_eq!(stopped.phase, Phase::Failed, "{stopped:?}");
+    let stopped = status_of(&first, id);
+    assert_eq!(stopped.phase, Phase::Stopped, "{stopped:?}");
     assert_eq!(
         stopped.note.as_deref(),
         Some("stopped with barrage; adding it again carries on from here")
@@ -316,6 +316,13 @@ async fn a_whole_download_starts_over() {
     let id = first.add(request(&url)).await.unwrap();
     wait_for(&first, id, "data", |s| s.done > 0).await;
     first.shutdown().await;
+    // Stopped, its one connection told to: not a cable gone.
+    let stopped = status_of(&first, id);
+    assert_eq!(stopped.phase, Phase::Stopped, "{stopped:?}");
+    assert_eq!(
+        stopped.note.as_deref(),
+        Some("stopped with barrage; adding it again starts it over")
+    );
     assert!(progress(&dir, "whole.bin").is_none());
 
     server.at("/whole.bin", Answer::File(File::new(LENGTH).no_ranges()));
@@ -325,4 +332,146 @@ async fn a_whole_download_starts_over() {
     assert_eq!(end.phase, Phase::Done, "{end:?}");
     assert_eq!(end.name.as_deref(), Some("whole (1).bin"));
     assert_same(&dir.read("whole (1).bin"), LENGTH);
+}
+
+// One download stopped and resumed, the engine running on (Task 13).
+
+#[tokio::test]
+async fn stopping_one_download_saves_it_and_resuming_carries_on() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/paused.bin", Answer::File(held().etag("\"v1\"")));
+    let dir = Folder::new("paused");
+    let url = server.url("/paused.bin");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), saving());
+    let id = downloads.add(request(&url)).await.unwrap();
+    wait_for(&downloads, id, "chunks under way", |s| s.done > FINISHED).await;
+
+    downloads.stop(id).await.unwrap();
+    // Stopped by the time stop returns, every byte written saved.
+    let stopped = status_of(&downloads, id);
+    assert_eq!(stopped.phase, Phase::Stopped, "{stopped:?}");
+    assert_eq!(
+        stopped.note.as_deref(),
+        Some("stopped; resuming carries on from here")
+    );
+    let saved = progress(&dir, "paused.bin").expect("no progress file");
+    let had = done_in(&saved);
+    assert_eq!(had, stopped.done, "{saved}");
+
+    // Resumed, the same download carries on, the server holding nothing
+    // back now: only what was missing is fetched.
+    server.at(
+        "/paused.bin",
+        Answer::File(File::new(LENGTH).etag("\"v1\"")),
+    );
+    let before = server.seen().len();
+    downloads.resume(id).await.unwrap();
+    assert_ne!(status_of(&downloads, id).phase, Phase::Stopped);
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_eq!(end.name.as_deref(), Some("paused.bin"));
+    assert_eq!(end.done, LENGTH);
+    let note = end.note.unwrap_or_default();
+    assert!(
+        note.starts_with("resumed: ") && note.ends_with(" were already here"),
+        "{note}"
+    );
+    let again = sent_since(&server, before);
+    assert!(
+        again <= LENGTH - had,
+        "sent {again}, but only {} were missing",
+        LENGTH - had
+    );
+    assert_same(&dir.read("paused.bin"), LENGTH);
+    assert_eq!(listing(&dir), ["paused.bin"]);
+    // One download all along, under its one id.
+    assert_eq!(downloads.status().borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn stopping_one_download_leaves_the_others_running() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/kept.bin", Answer::File(slow()));
+    server.at("/stopped.bin", Answer::File(held().etag("\"v1\"")));
+    let dir = Folder::new("one-of-two");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), saving());
+    let kept = downloads
+        .add(request(&server.url("/kept.bin")))
+        .await
+        .unwrap();
+    let stopped = downloads
+        .add(request(&server.url("/stopped.bin")))
+        .await
+        .unwrap();
+    wait_for(&downloads, stopped, "chunks under way", |s| {
+        s.done > FINISHED
+    })
+    .await;
+    // Two seconds a chunk: far from done.
+    assert_eq!(status_of(&downloads, kept).phase, Phase::Downloading);
+
+    downloads.stop(stopped).await.unwrap();
+    let end = ended(&downloads, kept).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_eq!(end.note, None);
+    assert_same(&dir.read("kept.bin"), LENGTH);
+    assert_eq!(status_of(&downloads, stopped).phase, Phase::Stopped);
+}
+
+#[tokio::test]
+async fn only_a_running_download_stops_and_only_a_stopped_one_resumes() {
+    let links = both();
+    let file = File::new(4 * MIB).rate(4 * MIB).etag("\"v1\"");
+    let (_server, _dir, downloads, id) = start_with("asked.bin", file, &links, saving()).await;
+    // Running: nothing to resume.
+    assert_eq!(downloads.resume(id).await, Err(ControlError::NotStopped));
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    // Done: nothing to stop, nor to resume.
+    assert_eq!(downloads.stop(id).await, Err(ControlError::NotRunning));
+    assert_eq!(downloads.resume(id).await, Err(ControlError::NotStopped));
+    assert_eq!(status_of(&downloads, id).phase, Phase::Done);
+}
+
+/// Added again while stopped, the file is the new download's; the stopped
+/// one cannot take it back while that one runs.
+#[tokio::test]
+async fn a_stopped_download_does_not_resume_while_its_file_runs_as_another() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/twice.bin", Answer::File(held().etag("\"v1\"")));
+    let dir = Folder::new("twice");
+    let url = server.url("/twice.bin");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), saving());
+    let first = downloads.add(request(&url)).await.unwrap();
+    wait_for(&downloads, first, "chunks under way", |s| s.done > FINISHED).await;
+    downloads.stop(first).await.unwrap();
+
+    let second = downloads.add(request(&url)).await.unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        downloads.resume(first).await,
+        Err(ControlError::AlreadyRunning(second))
+    );
+    assert_eq!(status_of(&downloads, first).phase, Phase::Stopped);
+}
+
+/// A file the server sends only whole keeps no progress, so stopping it
+/// says that resuming starts it over.
+#[tokio::test]
+async fn stopping_a_whole_download_says_it_starts_over() {
+    let links = both();
+    let whole = File::new(LENGTH).no_ranges().stall_after(MIB);
+    let (_server, dir, downloads, id) = start_with("whole-stop.bin", whole, &links, saving()).await;
+    wait_for(&downloads, id, "data", |s| s.done > 0).await;
+    downloads.stop(id).await.unwrap();
+    let stopped = status_of(&downloads, id);
+    assert_eq!(stopped.phase, Phase::Stopped, "{stopped:?}");
+    assert_eq!(
+        stopped.note.as_deref(),
+        Some("stopped; resuming starts it over")
+    );
+    assert!(progress(&dir, "whole-stop.bin").is_none());
 }

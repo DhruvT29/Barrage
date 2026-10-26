@@ -125,6 +125,17 @@ pub async fn wait_for(
     }
 }
 
+/// The download's status as last published.
+pub fn status_of(downloads: &Downloads, id: DownloadId) -> DownloadStatus {
+    let status = downloads
+        .status()
+        .borrow()
+        .iter()
+        .find(|s| s.id == id)
+        .cloned();
+    status.unwrap_or_else(|| panic!("no status for {id:?}"))
+}
+
 pub async fn ended(downloads: &Downloads, id: DownloadId) -> DownloadStatus {
     wait_for(downloads, id, "end", |s| {
         matches!(s.phase, Phase::Done | Phase::Failed)

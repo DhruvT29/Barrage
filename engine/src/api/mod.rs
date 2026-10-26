@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRef, Request, State};
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{FromRef, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router, middleware};
 use serde::Deserialize;
 use serde_json::json;
@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::LinkHandle;
-use crate::fetch::{AddError, AddRequest, Downloads};
+use crate::fetch::{AddError, AddRequest, ControlError, DownloadId, Downloads};
 use crate::links::watch::LinkTable;
 
 pub use view::{
@@ -64,6 +64,13 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 ///   the kinds that last refuses, and anything else from a page needs the
 ///   browser to ask first, which this server never answers.
 /// - `GET /api/downloads`: every download, as [`DownloadsView`].
+/// - `POST /api/downloads/{id}/stop` and `POST /api/downloads/{id}/resume`:
+///   stop that download, its progress saved, or resume it from there. The
+///   body is `{}`, as `application/json`, for the same reason as adding's.
+///   They answer `200 {"id"}` once it has stopped or started again, `404
+///   {"error"}` for no such download, `409 {"error"}` for one not running or
+///   not stopped, with `"id"` when its file runs as another download, and
+///   `415` or `400` as adding does.
 ///
 /// Any other address under `/api` answers `404`. Every route answers only
 /// this machine's own pages, and none may be framed ([`guard`]).
@@ -147,6 +154,8 @@ fn api(table: LinkTable, downloads: Downloads) -> Router {
         .route("/api/links", get(links))
         .route("/api/live", get(live::upgrade))
         .route("/api/downloads", get(list_downloads).post(add_download))
+        .route("/api/downloads/{id}/stop", post(stop_download))
+        .route("/api/downloads/{id}/resume", post(resume_download))
         // Any other address under /api is a route this engine does not have,
         // a typo or one a newer page expects. Left to the page's fallback it
         // would answer 200 with index.html, which a JSON client cannot read.
@@ -201,6 +210,67 @@ async fn add_download(
         )
             .into_response(),
         Err(e) => refuse(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+/// The body of a stop or a resume: `{}`. There is nothing to say, but asking
+/// for JSON keeps a form on another site out, as for adding.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoFields {}
+
+async fn stop_download(
+    State(downloads): State<Downloads>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body) {
+        Ok(id) => controlled(id, downloads.stop(id).await),
+        Err(refused) => *refused,
+    }
+}
+
+async fn resume_download(
+    State(downloads): State<Downloads>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body) {
+        Ok(id) => controlled(id, downloads.resume(id).await),
+        Err(refused) => *refused,
+    }
+}
+
+/// The download a stop or resume names, once its body is `{}` as JSON, or
+/// the refusal. An id that is not a number names no download.
+fn asked(
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Result<DownloadId, Box<Response>> {
+    let Ok(Path(id)) = id else {
+        return Err(Box::new(refuse(StatusCode::NOT_FOUND, "no such download")));
+    };
+    match body {
+        Ok(_) => Ok(DownloadId::new(id)),
+        Err(JsonRejection::MissingJsonContentType(_)) => Err(Box::new(refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "send {} as JSON, with Content-Type: application/json",
+        ))),
+        Err(e) => Err(Box::new(refuse(StatusCode::BAD_REQUEST, &e.body_text()))),
+    }
+}
+
+/// What a stop or resume of download `id` answers.
+fn controlled(id: DownloadId, done: Result<(), ControlError>) -> Response {
+    match done {
+        Ok(()) => (StatusCode::OK, Json(json!({ "id": id.as_u64() }))).into_response(),
+        Err(e @ ControlError::NoSuchDownload) => refuse(StatusCode::NOT_FOUND, &e.to_string()),
+        Err(e @ ControlError::AlreadyRunning(other)) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": e.to_string(), "id": other.as_u64() })),
+        )
+            .into_response(),
+        Err(e) => refuse(StatusCode::CONFLICT, &e.to_string()),
     }
 }
 

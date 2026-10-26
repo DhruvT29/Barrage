@@ -115,6 +115,17 @@ pub(crate) struct Job {
     pub status: Arc<watch::Sender<Vec<DownloadStatus>>>,
     /// Becomes true when the engine stops.
     pub stopping: watch::Receiver<bool>,
+    /// Becomes true when this download alone is asked to stop.
+    pub stop: watch::Receiver<bool>,
+}
+
+/// Why a download stops before its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// This download, by [`super::Downloads::stop`].
+    Asked,
+    /// The whole engine.
+    Engine,
 }
 
 /// Run the download to its end, publishing its status as it goes.
@@ -157,6 +168,9 @@ struct Download {
     /// The progress as it stood when the download failed, saved once its
     /// loop has ended.
     last_progress: Option<Snapshot>,
+    /// Stopping on purpose: its connections stop because they were told
+    /// to, not because their cable went.
+    stopping: bool,
 }
 
 /// The progress at one moment, and what saving it needs.
@@ -255,7 +269,7 @@ enum Event {
     Table(bool),
     Wake,
     Tick,
-    Shutdown,
+    Stop(Stop),
 }
 
 impl Download {
@@ -284,6 +298,7 @@ impl Download {
             saved_at: Instant::now(),
             saving: None,
             last_progress: None,
+            stopping: false,
         }
     }
 
@@ -307,8 +322,10 @@ impl Download {
                 () = tokio::time::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
                     Some(Event::Wake)
                 }
+                // This download asked to stop, or the registry gone.
+                _ = self.job.stop.wait_for(|&stop| stop) => Some(Event::Stop(Stop::Asked)),
                 // The engine stopping, or the registry gone with it.
-                _ = self.job.stopping.wait_for(|&stop| stop) => Some(Event::Shutdown),
+                _ = self.job.stopping.wait_for(|&stop| stop) => Some(Event::Stop(Stop::Engine)),
                 _ = tick.tick() => Some(Event::Tick),
             };
             if let Some(event) = event {
@@ -401,13 +418,15 @@ impl Download {
                     self.save_soon();
                 }
             }
-            Event::Shutdown => self.shut_down().await,
+            Event::Stop(why) => self.shut_down(why).await,
         }
     }
 
-    /// The engine is stopping: every connection stops and reports what it
-    /// wrote, and the progress is saved for the next engine.
-    async fn shut_down(&mut self) {
+    /// This download, or the whole engine, is stopping: every connection
+    /// stops and reports what it wrote, and the progress is saved, for
+    /// resuming it or for the next engine.
+    async fn shut_down(&mut self, why: Stop) {
+        self.stopping = true;
         for member in &self.members {
             member.stop.send_replace(true);
         }
@@ -431,12 +450,15 @@ impl Download {
         let snapshot = self.snapshot();
         self.save_now(snapshot).await;
         self.file = None;
-        self.note = Some(if self.progress_file.is_some() {
-            "stopped with barrage; adding it again carries on from here".to_string()
-        } else {
-            "stopped with barrage; adding it again starts it over".to_string()
-        });
-        self.ended = Some(Phase::Failed);
+        // With no progress kept, it was not yet found, or is fetched whole.
+        let note = match (why, self.progress_file.is_some()) {
+            (Stop::Asked, true) => "stopped; resuming carries on from here",
+            (Stop::Asked, false) => "stopped; resuming starts it over",
+            (Stop::Engine, true) => "stopped with barrage; adding it again carries on from here",
+            (Stop::Engine, false) => "stopped with barrage; adding it again starts it over",
+        };
+        self.note = Some(note.to_string());
+        self.ended = Some(Phase::Stopped);
     }
 
     /// The progress now, with what saving it needs: the bytes written, every
@@ -901,6 +923,7 @@ impl Download {
             (false, Outcome::Capped(wait)) => self.capped(report.link, wait),
             (false, Outcome::Done | Outcome::Short) => self.worked(report.link),
             (false, Outcome::Stopped) | (true, Outcome::Done) => {}
+            (true, Outcome::Stopped) if self.stopping => {}
             (true, Outcome::Stopped) => {
                 return self.fail(
                     "the cable carrying the file went away, and this server sends it only \
