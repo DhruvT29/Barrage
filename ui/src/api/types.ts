@@ -1,5 +1,8 @@
 // The engine's JSON, field for field, as `engine/src/api/view.rs` writes it.
-// That file is the contract: change both together.
+// contract.ts holds messages the engine really sent, written by its own test:
+// the type check holds them to these types and contract.test.tsx renders
+// them, so a field changed on one side only fails the build or the tests.
+// After changing view.rs, refresh contract.ts as its header says.
 
 /** The engine's state words, the same ones `brg-links` prints. */
 export type LinkState = 'probing' | 'up' | 'portal' | 'degraded' | 'down'
@@ -52,7 +55,65 @@ export interface NotCounted {
   why: 'not measured yet' | 'portal' | 'probing' | 'down'
 }
 
-/** What the live socket sends: the table on connect, then the table and its change lines on every change. */
+/** A download's state words. `stopped` keeps what it saved, to resume from. */
+export type DownloadState = 'starting' | 'waiting' | 'downloading' | 'done' | 'failed' | 'stopped'
+
+/** Every download since the engine started, and the speed they make together. */
+export interface DownloadsView {
+  live: LiveSpeed
+  /** In the order they were added. */
+  list: DownloadView[]
+}
+
+/** What the downloads that are downloading fetch right now, all together. */
+export interface LiveSpeed {
+  /** The sum of the parts, in bits per second. */
+  bps: number
+  /** One per cable carrying data, in the order it first appears in the list. */
+  parts: SpeedPart[]
+}
+
+export interface SpeedPart {
+  name: string
+  bps: number
+}
+
+/** One download. */
+export interface DownloadView {
+  id: number
+  /** The URL as it was given. */
+  url: string
+  /** The file's name in the download folder; null until the file is found. */
+  name: string | null
+  state: DownloadState
+  /** In bytes; null while the server has not said. */
+  length: number | null
+  /** Bytes written. */
+  done: number
+  /** In bits per second. */
+  bps: number
+  /** Why it failed, or what to know about it, in the engine's words. */
+  note: string | null
+  cables: CableShare[]
+}
+
+/** One cable's part in a download: its addresses' shares added up by the engine. */
+export interface CableShare {
+  name: string
+  bytes: number
+  /** In bits per second, 0 unless downloading. */
+  bps: number
+  connections: number
+  /** Each of its addresses' notes, each said once. */
+  notes: string[]
+}
+
+/**
+ * What the live socket sends: the table on connect, then the downloads, then
+ * the table and its change lines on every change to the links, and the
+ * downloads again on every change to them.
+ */
 export type LiveMessage =
   | { type: 'table'; table: TableView }
   | { type: 'change'; table: TableView; lines: string[] }
+  | { type: 'downloads'; downloads: DownloadsView }

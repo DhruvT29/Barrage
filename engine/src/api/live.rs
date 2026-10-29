@@ -1,5 +1,6 @@
-//! The live WebSocket: the whole table when a page connects, then the table
-//! again each time it changes, with the lines saying what changed.
+//! The live WebSocket: the whole table when a page connects, then the
+//! downloads, then the table again each time it changes, with the lines
+//! saying what changed, and the downloads again each time they change.
 //!
 //! It follows the table itself, not the event channel. A speed, a public
 //! address or an RTT arriving changes the table without any `LinkEvent`, and
@@ -8,8 +9,10 @@
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
+use tokio::sync::watch;
 
-use super::view::{LiveMessage, change_message, table_view};
+use super::view::{LiveMessage, change_message, downloads_view, table_view};
+use crate::fetch::{DownloadStatus, Downloads};
 use crate::links::Link;
 use crate::links::watch::LinkTable;
 
@@ -18,23 +21,34 @@ pub struct Feed {
     table: LinkTable,
     /// The table as this client last saw it, once it has seen one.
     shown: Option<Vec<Link>>,
+    downloads: watch::Receiver<Vec<DownloadStatus>>,
+    /// Whether this client has been sent the downloads yet.
+    downloads_sent: bool,
+    /// False once nothing can change the downloads any more.
+    downloads_open: bool,
 }
 
 impl Feed {
-    pub fn new(table: LinkTable) -> Self {
-        Self { table, shown: None }
+    pub fn new(table: LinkTable, downloads: &Downloads) -> Self {
+        Self {
+            table,
+            shown: None,
+            downloads: downloads.status(),
+            downloads_sent: false,
+            downloads_open: true,
+        }
     }
 
     /// The next message for this client: the whole table the first time,
-    /// then a change each time the table moves. `None` once the watcher has
-    /// stopped.
+    /// then the downloads, then a change each time the table moves and the
+    /// downloads each time they do. `None` once the watcher has stopped.
     ///
     /// Whatever changes while the client is still busy with its last message
     /// is merged into the next one, so a slow client is never sent a backlog
     /// and costs the server no queue.
     ///
-    /// Cancel safe: the only wait is for the table to change, so a
-    /// `select!` may drop this future without losing anything.
+    /// Cancel safe: the only waits are for the table or the downloads to
+    /// change, so a `select!` may drop this future without losing anything.
     pub async fn next(&mut self) -> Option<LiveMessage> {
         let Some(shown) = &self.shown else {
             let now = self.table.latest();
@@ -42,19 +56,49 @@ impl Feed {
             self.shown = Some(now);
             return Some(LiveMessage::Table { table });
         };
-        if !self.table.changed().await {
-            return None;
+        if !self.downloads_sent {
+            self.downloads_sent = true;
+            return Some(downloads_message(&mut self.downloads));
         }
-        let now = self.table.latest();
-        let message = change_message(shown, &now);
-        self.shown = Some(now);
-        Some(message)
+        loop {
+            tokio::select! {
+                // A change to the links first when both are waiting: the
+                // downloads are still there for the next call.
+                biased;
+                open = self.table.changed() => {
+                    if !open {
+                        return None;
+                    }
+                    let now = self.table.latest();
+                    let message = change_message(shown, &now);
+                    self.shown = Some(now);
+                    return Some(message);
+                }
+                changed = self.downloads.changed(), if self.downloads_open => match changed {
+                    Ok(()) => return Some(downloads_message(&mut self.downloads)),
+                    // Every sender is gone; the table still moves.
+                    Err(_) => self.downloads_open = false,
+                },
+            }
+        }
+    }
+}
+
+/// The downloads as they are now, marked as seen.
+fn downloads_message(downloads: &mut watch::Receiver<Vec<DownloadStatus>>) -> LiveMessage {
+    LiveMessage::Downloads {
+        downloads: downloads_view(&downloads.borrow_and_update()),
     }
 }
 
 /// `GET /api/live`.
-pub(super) async fn upgrade(ws: WebSocketUpgrade, State(table): State<LinkTable>) -> Response {
-    ws.on_upgrade(move |socket| stream(socket, Feed::new(table)))
+pub(super) async fn upgrade(
+    ws: WebSocketUpgrade,
+    State(table): State<LinkTable>,
+    State(downloads): State<Downloads>,
+) -> Response {
+    let feed = Feed::new(table, &downloads);
+    ws.on_upgrade(move |socket| stream(socket, feed))
 }
 
 async fn stream(mut socket: WebSocket, mut feed: Feed) {

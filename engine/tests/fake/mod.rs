@@ -12,8 +12,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use barrage::links::probe::{Probe, ProbeVerdict};
@@ -57,6 +57,36 @@ pub struct Fake {
     pub lookups: AtomicUsize,
     /// How long each public address lookup takes. Zero answers at once.
     lookup_time: Duration,
+    /// Keep loopback addresses as links, which the real filter drops.
+    loopback: bool,
+    /// When set, the interface list is whatever this holds at each poll, and
+    /// the script is not used.
+    live: Option<Live>,
+    /// Probe answers a test switches while the watcher runs, per address.
+    switches: HashMap<IpAddr, Switch>,
+}
+
+/// A probe answer a test changes while the watcher runs: a link that stops
+/// working, and works again, under the same id.
+#[derive(Clone)]
+pub struct Switch(Arc<Mutex<ProbeVerdict>>);
+
+impl Switch {
+    pub fn set(&self, verdict: ProbeVerdict) {
+        *self.0.lock().unwrap() = verdict;
+    }
+}
+
+/// An interface list a test changes while the watcher runs, so a link comes
+/// or goes at a moment the test picks, such as 30% into a download, rather
+/// than at a poll it has to count.
+#[derive(Clone, Default)]
+pub struct Live(Arc<Mutex<Vec<Candidate>>>);
+
+impl Live {
+    pub fn set(&self, links: Vec<Candidate>) {
+        *self.0.lock().unwrap() = links;
+    }
 }
 
 pub const SAMPLED_BPS: u64 = 40_000_000;
@@ -71,6 +101,25 @@ impl Fake {
             script: Mutex::new(steps.into()),
             ..Self::default()
         }
+    }
+
+    /// The interfaces in `links` until the test changes them through the
+    /// returned [`Live`].
+    pub fn live(links: Vec<Candidate>) -> (Self, Live) {
+        let live = Live(Arc::new(Mutex::new(links)));
+        let fake = Self {
+            live: Some(live.clone()),
+            ..Self::default()
+        };
+        (fake, live)
+    }
+
+    /// Probes of `ip` answer whatever the returned [`Switch`] holds, at first
+    /// `Working`.
+    pub fn switched(mut self, ip: &str) -> (Self, Switch) {
+        let switch = Switch(Arc::new(Mutex::new(ProbeVerdict::Working)));
+        self.switches.insert(ip.parse().unwrap(), switch.clone());
+        (self, switch)
     }
 
     /// Probe answers for `ip`, in order; the last one repeats.
@@ -121,6 +170,14 @@ impl Fake {
         self
     }
 
+    /// Let 127.0.0.x addresses stand in for real links, so a download over
+    /// them carries real bytes to a server on this machine. Everything else
+    /// is still judged by the real filter.
+    pub fn loopback_links(mut self) -> Self {
+        self.loopback = true;
+        self
+    }
+
     /// The public address seen through `ip`, lookup after lookup; the last
     /// repeats. `None` makes that lookup fail.
     pub fn public(self, ip: &str, answers: &[Option<&str>]) -> Self {
@@ -138,6 +195,9 @@ impl Fake {
 
 impl Network for Fake {
     fn enumerate(&self) -> anyhow::Result<Vec<Candidate>> {
+        if let Some(live) = &self.live {
+            return Ok(live.0.lock().unwrap().clone());
+        }
         let mut script = self.script.lock().unwrap();
         let step = if script.len() > 1 {
             script.pop_front()
@@ -149,6 +209,14 @@ impl Network for Fake {
             Some(Step::Fail) => anyhow::bail!("scripted enumeration failure"),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn usable(&self, all: &[Candidate]) -> Vec<Candidate> {
+        let real = barrage::links::usable(all);
+        all.iter()
+            .filter(|c| (self.loopback && c.up && c.addr.ip().is_loopback()) || real.contains(c))
+            .cloned()
+            .collect()
     }
 
     fn probe(
@@ -169,7 +237,10 @@ impl Network for Fake {
         let verdict = match self.verdicts.lock().unwrap().get_mut(&addr) {
             Some(queue) if queue.len() > 1 && !fail => queue.pop_front().unwrap(),
             Some(queue) => *queue.front().unwrap(),
-            None => ProbeVerdict::Working,
+            None => self
+                .switches
+                .get(&addr)
+                .map_or(ProbeVerdict::Working, |s| *s.0.lock().unwrap()),
         };
         async move {
             if hang {
