@@ -124,9 +124,6 @@ pub enum ControlError {
     NotRunning,
     /// Resuming: it is not stopped.
     NotStopped,
-    /// Resuming: its file is starting, waiting or downloading again, as this
-    /// other download.
-    AlreadyRunning(DownloadId),
 }
 
 impl fmt::Display for ControlError {
@@ -135,9 +132,6 @@ impl fmt::Display for ControlError {
             Self::NoSuchDownload => f.write_str("no such download"),
             Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
             Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
-            Self::AlreadyRunning(id) => {
-                write!(f, "already downloading, as download {}", id.as_u64())
-            }
         }
     }
 }
@@ -153,7 +147,10 @@ pub struct DownloadConfig {
     pub read_deadline: Duration,
     /// How long one link may take to find the file, redirects and all.
     pub find_deadline: Duration,
-    /// How often the status is published.
+    /// How often each link's speed is measured and the status published at
+    /// the least. What a download does between, a chunk written, a link
+    /// joining, a note, is published as it happens; the live socket merges
+    /// what a slow page has not read yet.
     pub publish_every: Duration,
     /// The span a speed is measured over.
     pub speed_window: Duration,
@@ -196,8 +193,9 @@ impl Default for DownloadConfig {
 pub struct DownloadId(u64);
 
 impl DownloadId {
-    /// Only [`Downloads::add`] mints ids, hence `pub(crate)`, as for
-    /// [`LinkId`].
+    /// Only [`Downloads::add`] gives out new ids, hence `pub(crate)`, as for
+    /// [`LinkId`]. The API makes one from the number in a path only to look
+    /// it up: an id from outside is never trusted to name a download.
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -281,23 +279,36 @@ impl Downloads {
     ///
     /// Only an `http` or `https` address is taken, and not while the same
     /// file is still starting, waiting or downloading: two downloads of one
-    /// file would race each other for the same links. Once it is done or has
-    /// failed, adding it again starts a new download.
+    /// file would race each other for the same links. A stopped download of
+    /// the file is resumed, under its own id, through the cables asked for
+    /// now: one download of a file, never two, so its progress is never
+    /// taken from under it. Once it is done or has failed, adding it again
+    /// starts a new download.
     pub async fn add(&self, request: AddRequest) -> Result<DownloadId, AddError> {
         let url = web_address(&request.url)?;
         if request.cables.as_ref().is_some_and(Vec::is_empty) {
             return Err(AddError::NoCables);
         }
-        // Checked and added under the status's one lock, so the same URL
-        // posted twice at once still starts once.
+        // Checked and started under the controls' lock, then the status's,
+        // as resuming is: the same URL posted twice at once still starts
+        // once, and a stop that comes meanwhile waits for the new download.
+        let mut controls = self.inner.controls.lock().unwrap();
         let mut added = None;
         self.inner.status.send_if_modified(|all| {
-            let running = all.iter().find(|s| {
-                running(s.phase) && Url::parse(s.url.trim()).is_ok_and(|u| same_file(&u, &url))
-            });
-            if let Some(running) = running {
+            let same =
+                |s: &DownloadStatus| Url::parse(s.url.trim()).is_ok_and(|u| same_file(&u, &url));
+            if let Some(running) = all.iter().find(|s| running(s.phase) && same(s)) {
                 added = Some(Err(AddError::AlreadyRunning(running.id)));
                 return false;
+            }
+            if let Some(at) = all
+                .iter()
+                .position(|s| s.phase == Phase::Stopped && same(s))
+            {
+                let id = all[at].id;
+                all[at] = starting(id, &request.url);
+                added = Some(Ok(id));
+                return true;
             }
             let id = DownloadId::new(self.inner.next.fetch_add(1, Ordering::SeqCst) + 1);
             all.push(starting(id, &request.url));
@@ -305,12 +316,21 @@ impl Downloads {
             true
         });
         let id = added.expect("the status closure always runs")?;
-        self.launch(id, request.url, url, request.cables);
+        self.launch(&mut controls, id, request.url, url, request.cables);
         Ok(id)
     }
 
     /// Start download `id`'s coordinator, with its own way to be stopped.
-    fn launch(&self, id: DownloadId, given: String, url: Url, cables: Option<Vec<String>>) {
+    /// Called with the controls' lock held from before `id` showed as
+    /// starting, so a stop never finds the coordinator it replaces.
+    fn launch(
+        &self,
+        controls: &mut HashMap<DownloadId, Control>,
+        id: DownloadId,
+        given: String,
+        url: Url,
+        cables: Option<Vec<String>>,
+    ) {
         let (stop, asked) = watch::channel(false);
         let task = tokio::spawn(download::run(download::Job {
             id,
@@ -331,7 +351,7 @@ impl Downloads {
             stop,
             task: Some(task),
         };
-        self.inner.controls.lock().unwrap().insert(id, control);
+        controls.insert(id, control);
     }
 
     /// Every download's status, updated as they run.
@@ -365,34 +385,29 @@ impl Downloads {
 
     /// Resume download `id`, stopped: it starts again under the same id and
     /// picks up from the progress it saved, as a download added again would.
-    /// Not while its file is starting, waiting or downloading as another.
     /// Returns once it has started.
     pub async fn resume(&self, id: DownloadId) -> Result<(), ControlError> {
-        let (given, url, cables) = {
-            let controls = self.inner.controls.lock().unwrap();
-            let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
-            (
-                control.given.clone(),
-                control.url.clone(),
-                control.cables.clone(),
-            )
-        };
-        // Checked and started under the status's one lock, as adding is, so
-        // a URL added at the same moment still runs once.
+        // Checked and started under the controls' lock, then the status's,
+        // as adding is: a URL added at the same moment still runs once, and
+        // a stop that comes meanwhile waits for the new coordinator rather
+        // than signal the one that has ended.
+        let mut controls = self.inner.controls.lock().unwrap();
+        let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
+        let (given, url, cables) = (
+            control.given.clone(),
+            control.url.clone(),
+            control.cables.clone(),
+        );
         let mut outcome = Err(ControlError::NoSuchDownload);
         self.inner.status.send_if_modified(|all| {
             let Some(at) = all.iter().position(|s| s.id == id) else {
                 return false;
             };
+            // Its file cannot be running as another download: adding the URL
+            // of a stopped download resumes that one rather than start a
+            // second.
             if all[at].phase != Phase::Stopped {
                 outcome = Err(ControlError::NotStopped);
-                return false;
-            }
-            let again = all.iter().find(|s| {
-                running(s.phase) && Url::parse(s.url.trim()).is_ok_and(|u| same_file(&u, &url))
-            });
-            if let Some(again) = again {
-                outcome = Err(ControlError::AlreadyRunning(again.id));
                 return false;
             }
             all[at] = starting(id, &given);
@@ -400,7 +415,7 @@ impl Downloads {
             true
         });
         outcome?;
-        self.launch(id, given, url, cables);
+        self.launch(&mut controls, id, given, url, cables);
         Ok(())
     }
 

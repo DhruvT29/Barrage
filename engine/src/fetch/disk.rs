@@ -8,10 +8,20 @@
 //! or a folder that cannot be written fails here, before the first byte
 //! (PLAN.md section 3.6, item 4). Chunks are claimed in ascending order, so
 //! NTFS only fills zeros a few chunks ahead of the lowest unfinished byte.
+//!
+//! FROM THE INTERNET
+//!
+//! The `.part` carries the mark a browser gives a download, a
+//! `Zone.Identifier` stream saying it came from the internet, so Windows
+//! treats the finished file as one: SmartScreen checks a program before it
+//! runs, Office opens a document in Protected View. The stream moves with
+//! the file when it is named, and stays through a resume.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+
+use reqwest::Url;
 
 use super::name::free_name;
 
@@ -72,6 +82,28 @@ pub(crate) fn reopen_part(part: &Path, length: u64) -> Result<File, String> {
         Err(e) => Err(format!("cannot read {}: {e}", part.display())),
     }
 }
+
+/// Mark `part` as downloaded from `url`, as a browser marks a download: a
+/// `Zone.Identifier` stream with the internet zone, 3. Any user name and
+/// password in the URL are left out. A drive with no streams (FAT32, exFAT)
+/// cannot hold the mark, and the file is downloaded without it, as a
+/// browser's would be.
+#[cfg(windows)]
+pub(crate) fn mark_from_internet(part: &Path, url: &Url) {
+    let mut host = url.clone();
+    let _ = host.set_username("");
+    let _ = host.set_password(None);
+    let mark = format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={host}\r\n");
+    let mut stream = part.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    if let Err(e) = std::fs::write(PathBuf::from(stream), mark) {
+        tracing::debug!(error = %e, part = %part.display(), "could not mark a download as from the internet");
+    }
+}
+
+/// Only Windows reads the mark.
+#[cfg(not(windows))]
+pub(crate) fn mark_from_internet(_part: &Path, _url: &Url) {}
 
 /// Write all of `data` at `offset`, without moving any shared position, so
 /// many threads can write one file at once.
@@ -245,6 +277,25 @@ mod tests {
         let dir = Folder::new("size");
         let (_, part, _file) = create_part(&dir.0, "big.bin", 5 << 20).unwrap();
         assert_eq!(std::fs::metadata(part).unwrap().len(), 5 << 20);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_part_is_marked_as_from_the_internet_and_keeps_the_mark_when_named() {
+        let dir = Folder::new("mark");
+        let (name, part, file) = create_part(&dir.0, "setup.exe", 3).unwrap();
+        let url = Url::parse("https://user:secret@example.com/files/setup.exe?v=2").unwrap();
+        mark_from_internet(&part, &url);
+        drop(file);
+        assert_eq!(name_finished(&part, &name).unwrap(), "setup.exe");
+
+        let mark = std::fs::read_to_string(dir.0.join("setup.exe:Zone.Identifier")).unwrap();
+        assert_eq!(
+            mark,
+            "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/files/setup.exe?v=2\r\n"
+        );
+        // The file itself is untouched by its mark.
+        assert_eq!(std::fs::metadata(dir.0.join("setup.exe")).unwrap().len(), 3);
     }
 
     /// The default for `barrage --downloads`. Every Windows profile has one,

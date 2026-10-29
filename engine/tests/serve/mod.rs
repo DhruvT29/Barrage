@@ -162,13 +162,14 @@ impl Drop for Slot {
     }
 }
 
-/// Answer `429 Too Many Requests` to some of one source's pieces, whatever
-/// else is open.
+/// Answer `429 Too Many Requests`, or another status, to some of one source's
+/// pieces, whatever else is open.
 #[derive(Clone, Debug)]
 pub struct Refusal {
     source: IpAddr,
     /// How many are left to refuse; `None`, every one.
     left: Option<Arc<AtomicUsize>>,
+    status: u16,
     retry_after: Option<String>,
 }
 
@@ -320,10 +321,23 @@ impl File {
 
     /// Refuse with 429 the next `times` pieces for `source`, or with `None`
     /// every one, sending this `Retry-After` if any. Probes pass.
-    pub fn refuse(mut self, source: &str, times: Option<usize>, retry_after: Option<&str>) -> Self {
+    pub fn refuse(self, source: &str, times: Option<usize>, retry_after: Option<&str>) -> Self {
+        self.refuse_with(source, times, 429, retry_after)
+    }
+
+    /// Refuse the next `times` pieces for `source`, or with `None` every one,
+    /// with `status` and this `Retry-After` if any. Probes pass.
+    pub fn refuse_with(
+        mut self,
+        source: &str,
+        times: Option<usize>,
+        status: u16,
+        retry_after: Option<&str>,
+    ) -> Self {
         self.refusals.push(Refusal {
             source: source.parse().unwrap(),
             left: times.map(|n| Arc::new(AtomicUsize::new(n))),
+            status,
             retry_after: retry_after.map(str::to_string),
         });
         self
@@ -523,12 +537,12 @@ async fn answer(
         (
             Some(Answer::File(_)),
             Some(Plan {
-                refused: Some(wait),
+                refused: Some((code, wait)),
                 ..
             }),
         ) => {
             finish_now();
-            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+            let mut response = status(code).into_response();
             if let Some(wait) = wait {
                 set(&mut response, header::RETRY_AFTER, wait);
             }
@@ -575,8 +589,8 @@ struct Plan {
     cut: Option<u64>,
     /// The file offset where the answer stops sending, if it stalls.
     stall: Option<u64>,
-    /// Refused with 429, and the `Retry-After` sent with it, if any.
-    refused: Option<Option<String>>,
+    /// Refused with this status, and the `Retry-After` sent with it, if any.
+    refused: Option<(u16, Option<String>)>,
     /// Its place under a [`Cap`], held for as long as it is answered.
     slot: Option<Slot>,
     /// The file as this request finds it.
@@ -587,7 +601,7 @@ struct Plan {
 impl Plan {
     fn status(&self) -> u16 {
         match (&self.refused, &self.kind) {
-            (Some(_), _) => 429,
+            (Some((code, _)), _) => *code,
             (None, Kind::Whole) => 200,
             (None, Kind::Partial) => 206,
             (None, Kind::Unsatisfiable) => 416,
@@ -640,11 +654,11 @@ impl File {
                 .iter()
                 .find(|r| r.source == source && r.take())
             {
-                refused = Some(r.retry_after.clone());
+                refused = Some((r.status, r.retry_after.clone()));
             } else if let Some(cap) = self.caps.iter().find(|c| c.source == source) {
                 match cap.enter() {
                     Some(held) => slot = Some(held),
-                    None => refused = Some(cap.retry_after.clone()),
+                    None => refused = Some((429, cap.retry_after.clone())),
                 }
             }
         }

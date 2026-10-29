@@ -16,15 +16,24 @@
     Each run fetches the whole file. Rates come from the adapters' byte
     counters (Get-NetAdapterStatistics), not from the engine, so the engine
     does not mark its own work; its own count per cable is shown beside
-    them. Every finished file's SHA-256 must match the first run's.
+    them. Every finished file's SHA-256 must match the first run's, and the
+    reference copy's when there is one.
 
     Two rows are watched together rather than measured (-Row):
       Yank     both cables; the tether's cable pulled at about 30%: the
                download carries on through the Wi-Fi and finishes right.
-      Pause    Stop on the download's card at about half, then Resume: its
-               progress is saved, and it carries on from there. Both cables,
-               or with -WifiOnly the Wi-Fi alone, which takes long enough to
-               stop by hand at half and spends no mobile data.
+      Pause    Stop on the download's card, then Resume, as often as wanted:
+               each stop saves what it had written, and each resume carries
+               on from exactly that. Both cables, or with -WifiOnly the Wi-Fi
+               alone, which takes long enough to stop by hand at half and
+               spends no mobile data.
+
+    THE REFERENCE. A file is checked against the SHA-256 of a copy of the
+    same URL, length and version: with -Reference, one curl fetches in the
+    preflight through the Wi-Fi alone (the whole file on the Wi-Fi, none on
+    the phone), so a fault the engine made in every copy alike still shows;
+    else the first file of the last measured runs, if they were of this
+    version. A file the server names no strong ETag for has no reference.
 
     USAGE
       # The preflight, and what each session would cost:
@@ -32,6 +41,8 @@
       # A session, once its cost is agreed:
       .\tools\phase3-acceptance.ps1 -Url <file> -BudgetMB <agreed> -Run
       .\tools\phase3-acceptance.ps1 -Url <file> -BudgetMB <agreed> -Row Yank
+      # Either, checked against a curl copy fetched over the Wi-Fi first:
+      .\tools\phase3-acceptance.ps1 -Url <file> -BudgetMB <agreed> -Row Pause -Reference
       # Before any of it, with no phone: one run through the Wi-Fi alone,
       # every step of a session but the tether's, refused if any other
       # adapter has a way out.
@@ -42,8 +53,10 @@
     cable's speed once, with up to 64 MiB. The preflight starts no engine:
     it asks Windows for each cable's address, then curl, through each, for
     the file's first KB and the cable's public address, a few KB in all.
-    A session refuses to start past -BudgetMB, and stops the engine if the
-    tether's counter passes the budget anyway.
+    The phone's counter counts both ways, so each cost shown is the payload
+    and a tenth more for what travels beside it. A session refuses to start
+    past -BudgetMB, and stops the engine if the tether's counter passes the
+    budget anyway. A download still not over after -Minutes ends the session.
 
     The engine runs in a window of its own, its downloads in a folder of
     their own, and a session opens its page, http://127.0.0.1:<port>, in the
@@ -63,6 +76,10 @@ param(
     # half, and no mobile data at all.
     [switch]$WifiOnly,
     [switch]$Rehearse,
+    # A reference copy by curl over the Wi-Fi in the preflight.
+    [switch]$Reference,
+    # The longest one download may take before the session gives up.
+    [int]$Minutes = 30,
     [int]$Port = 7700,
     [string]$Engine = "",
     [string]$Work = ""
@@ -80,9 +97,17 @@ if (($Run -or $Row -or $Rehearse) -and -not (Test-Path $Engine)) {
     throw "no engine at $Engine. Build it first, in engine: cargo build --release --bin barrage"
 }
 if (-not $Work) { $Work = Join-Path $env:TEMP "brg-phase3" }
-$downloads = Join-Path $Work "downloads"
+# A name only this script uses: the folder is emptied at each session, so
+# it must never be one that holds anything else, whatever -Work is.
+$downloads = Join-Path $Work "brg-phase3-downloads"
 $api = "http://127.0.0.1:$Port/api"
 $results = Join-Path $Work "phase3-results.csv"
+# The SHA-256 files are checked against, with the URL, length and ETag it
+# is of.
+$referenceFile = Join-Path $Work "phase3-reference.json"
+# The file as this session's preflight found it.
+$script:FileLength = $null
+$script:FileEtag = $null
 # Every status a session polls, one JSON line each, with the time and run.
 $timeline = Join-Path $Work ("timeline-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".jsonl")
 
@@ -158,13 +183,82 @@ function Test-Range([string]$Name, [string]$Address) {
     $etag = Select-String -Path $headers -Pattern '^ETag:\s*(\S.*?)\s*$' | Select-Object -Last 1
     $date = Select-String -Path $headers -Pattern '^Last-Modified:\s*\S' | Select-Object -Last 1
     $version = $null
-    if ($etag -and $etag.Matches[0].Groups[1].Value -match '^".*"$') { $version = "a strong ETag" }
+    $strong = $null
+    if ($etag -and $etag.Matches[0].Groups[1].Value -match '^".*"$') {
+        $version = "a strong ETag"
+        $strong = $etag.Matches[0].Groups[1].Value
+    }
     elseif ($date) { $version = "its Last-Modified date" }
     [pscustomobject]@{
         Ok      = ($parts[0] -eq "206" -and $parts[1] -eq "1024")
         Answer  = "$($parts[0]) $($parts[1])"
         Length  = $length
         Version = $version
+        Etag    = $strong
+    }
+}
+
+# The file as this session's preflight found it, for the reference to be
+# of: its length, and its strong ETag if it has one.
+function Set-FileFound($Range) {
+    $script:FileLength = $Range.Length
+    $script:FileEtag = $Range.Etag
+}
+
+# The reference SHA-256 for this session's file: of the same URL, length and
+# strong ETag, or none. A file with no strong ETag has none: nothing tells
+# its versions apart.
+function Get-Reference {
+    if (-not $script:FileEtag -or -not (Test-Path $referenceFile)) { return $null }
+    $ref = Get-Content -LiteralPath $referenceFile | Out-String | ConvertFrom-Json
+    if ($ref.url -ne $Url -or [int64]$ref.length -ne $script:FileLength -or $ref.etag -ne $script:FileEtag) {
+        return $null
+    }
+    return $ref
+}
+
+function Save-Reference([string]$Sha, [string]$From) {
+    if (-not $script:FileEtag) { return }
+    [pscustomobject]@{
+        url    = $Url
+        length = $script:FileLength
+        etag   = $script:FileEtag
+        sha    = $Sha
+        from   = $From
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $referenceFile -Encoding UTF8
+}
+
+# A copy of the file the engine did not make: curl, through the Wi-Fi alone,
+# so it spends no mobile data. Its SHA-256 becomes the reference. Refused if
+# the server's ETag is not the one the preflight saw.
+function New-CurlReference([string]$Address) {
+    if (-not $script:FileEtag) { throw "-Reference needs a file whose server names a strong ETag" }
+    $copy = Join-Path $Work "reference.bin"
+    $headers = Join-Path $Work "reference-headers.txt"
+    "  fetching the reference copy with curl through $($Wifi): $(MB $script:FileLength) MB on the Wi-Fi, none on the phone"
+    & curl.exe -s -L --interface $Address --max-time 3600 -D $headers -o $copy $Url
+    if ($LASTEXITCODE -ne 0) { throw "curl could not fetch the reference copy (exit $LASTEXITCODE)" }
+    $tag = Select-String -Path $headers -Pattern '^ETag:\s*(\S.*?)\s*$' | Select-Object -Last 1
+    $got = $null
+    if ($tag) { $got = $tag.Matches[0].Groups[1].Value }
+    $size = (Get-Item -LiteralPath $copy).Length
+    if ($got -ne $script:FileEtag -or $size -ne $script:FileLength) {
+        Remove-Item -LiteralPath $copy -Force
+        throw "the file on the server changed while its reference copy came down"
+    }
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $copy).Hash.ToLower()
+    Remove-Item -LiteralPath $copy -Force
+    Save-Reference $hash "the curl copy"
+    "  the reference copy's SHA-256: $($hash.Substring(0, 12))..."
+}
+
+# How long one download may take, and the session's end if it takes longer.
+function Get-Deadline { (Get-Date).AddMinutes($Minutes) }
+
+function Assert-Deadline($Deadline, $Download) {
+    if ((Get-Date) -gt $Deadline) {
+        Stop-Engine $script:Proc
+        throw "after $Minutes min the download is still $($Download.state); note: $(Hide "$($Download.note)")"
     }
 }
 
@@ -289,6 +383,7 @@ function Invoke-Run([string]$Config, [int]$Repeat, [string[]]$Cables) {
     if ($script:TetherName) { $tetherBefore = Get-AdapterBytes $script:TetherName }
     $id = Add-Download $Cables
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $deadline = Get-Deadline
     $peak = 0
     $notes = New-Object System.Collections.ArrayList
     while ($true) {
@@ -299,6 +394,9 @@ function Invoke-Run([string]$Config, [int]$Repeat, [string[]]$Cables) {
         Add-Notes $notes $d
         Assert-Budget
         if ($d.state -in @("done", "failed")) { break }
+        # Stopped from the open page, a measured run measures nothing.
+        if ($d.state -eq "stopped") { throw "$Config r$($Repeat): stopped from the page, so it was not measured" }
+        Assert-Deadline $deadline $d
     }
     $watch.Stop()
     $secs = $watch.Elapsed.TotalSeconds
@@ -339,18 +437,10 @@ function Invoke-Run([string]$Config, [int]$Repeat, [string[]]$Cables) {
 
 # ---------------------------------------------------------------- the rows
 
-# The SHA-256 of the file from the measured runs, if they have run.
-function Get-ReferenceHash {
-    if (-not (Test-Path $results)) { return $null }
-    $done = @(Import-Csv $results | Where-Object { $_.Sha }) | Select-Object -First 1
-    if ($done) { return $done.Sha }
-    return $null
-}
-
 function Show-Hash([string]$Hash) {
-    $want = Get-ReferenceHash
-    if ($want) { "  SHA-256 $($Hash.Substring(0, 12))..., the same as the measured runs' file: $($Hash -eq $want)" }
-    else { "  SHA-256 $($Hash.Substring(0, 12))... (no measured runs to compare with)" }
+    $ref = Get-Reference
+    if ($ref) { "  SHA-256 $($Hash.Substring(0, 12))..., the same as $($ref.from): $($Hash -eq $ref.sha)" }
+    else { "  SHA-256 $($Hash.Substring(0, 12))... (no reference for this version of the file to compare with)" }
 }
 
 function Invoke-Yank {
@@ -358,9 +448,11 @@ function Invoke-Yank {
     "  added. Watch the Downloads tab; at about 30%, pull the tether's cable."
     $pulled = $false
     $notes = New-Object System.Collections.ArrayList
+    $deadline = Get-Deadline
     while ($true) {
         Start-Sleep -Milliseconds 250
         $d = Get-Download $id "yank"
+        Assert-Deadline $deadline $d
         Add-Notes $notes $d
         if (-not $pulled) {
             Assert-Budget
@@ -380,44 +472,57 @@ function Invoke-Yank {
     if ($d.state -eq "done") { Show-Hash (Get-FinishedHash $d) }
 }
 
-# Stop on the card at about half, then Resume: what was saved, and that the
-# same download carried on from it.
+# Stop on the card, then Resume, as many times as the user likes: each stop
+# saved every byte written, and each resume carried on from exactly what the
+# stop before it saved.
 function Invoke-Pause {
     $id = Add-Download $script:Cables
-    "  added. Watch the Downloads tab; at about half, press Stop on its card, then Resume."
+    "  added. Watch the Downloads tab; press Stop on its card once it shows a percentage, then Resume."
+    $deadline = Get-Deadline
+    $rounds = 0
+    $exact = $true
+    # What the last stop saved, for the round after it to be checked against.
+    $had = $null
     while ($true) {
-        Start-Sleep -Milliseconds 250
-        $d = Get-Download $id "pause: running"
-        Assert-Budget
-        if ($d.state -eq "stopped") { break }
-        if ($d.state -in @("done", "failed")) {
-            "  $($d.state) before Stop: nothing to resume"
-            return
+        while ($true) {
+            Start-Sleep -Milliseconds 250
+            $d = Get-Download $id "pause: running"
+            Assert-Budget
+            if ($d.state -in @("stopped", "done", "failed")) { break }
+            Assert-Deadline $deadline $d
         }
-    }
-    $pct = 0
-    if ($d.length) { $pct = [math]::Round($d.done / $d.length * 100, 0) }
-    "  stopped at $pct% ($(MB $d.done) MB); note: $(Hide "$($d.note)")"
-    $saved = Get-Content -LiteralPath (Join-Path $downloads "$($d.name).part.json") | Out-String | ConvertFrom-Json
-    $had = [double](@($saved.done) | ForEach-Object { $_[1] - $_[0] } | Measure-Object -Sum).Sum
-    "  saved beside the .part: $(MB $had) MB in $(@($saved.done).Count) ranges; every byte written: $($had -eq $d.done)"
+        if ($null -ne $had) {
+            # A resumed download's cables count only what they carried since,
+            # so the rest of what is done was already here.
+            $fetched = [double](@($d.cables) | Measure-Object -Property bytes -Sum).Sum
+            $already = $d.done - $fetched
+            "  round ${rounds}: $(MB $already) MB were already here on resuming, $(MB $had) MB saved: the same: $($already -eq $had)"
+            if ($already -ne $had) { $exact = $false }
+        }
+        if ($d.state -ne "stopped") { break }
+        $rounds++
+        $pct = 0
+        if ($d.length) { $pct = [math]::Round($d.done / $d.length * 100, 0) }
+        "  stop ${rounds}: at $pct% ($(MB $d.done) MB); note: $(Hide "$($d.note)")"
+        $saved = Get-Content -LiteralPath (Join-Path $downloads "$($d.name).part.json") | Out-String | ConvertFrom-Json
+        $had = [double](@($saved.done) | ForEach-Object { $_[1] - $_[0] } | Measure-Object -Sum).Sum
+        "  saved beside the .part: $(MB $had) MB in $(@($saved.done).Count) ranges; every byte written: $($had -eq $d.done)"
+        if ($had -ne $d.done) { $exact = $false }
 
-    $deadline = (Get-Date).AddMinutes(10)
-    while ($d.state -eq "stopped") {
-        if ((Get-Date) -gt $deadline) { throw "not resumed within 10 minutes" }
-        Start-Sleep -Milliseconds 250
-        $d = Get-Download $id "pause: stopped"
+        $resumeBy = (Get-Date).AddMinutes(10)
+        while ($d.state -eq "stopped") {
+            if ((Get-Date) -gt $resumeBy) { throw "not resumed within 10 minutes" }
+            Start-Sleep -Milliseconds 250
+            $d = Get-Download $id "pause: stopped"
+        }
+        "  resumed"
     }
-    "  resumed"
-    while ($d.state -notin @("done", "failed")) {
-        Start-Sleep -Milliseconds 250
-        $d = Get-Download $id "pause: resumed"
-        Assert-Budget
+    if ($rounds -eq 0) {
+        "  $($d.state) before Stop: nothing to resume"
+        return
     }
-    # A resumed download's cables count only what they carried since.
-    $fetched = [double](@($d.cables) | Measure-Object -Property bytes -Sum).Sum
-    "  $($d.state): $(MB $fetched) MB fetched after Resume, $(MB ($d.done - $fetched)) MB already here; note: $(Hide "$($d.note)")"
-    "  already here = what was saved: $(($d.done - $fetched) -eq $had)"
+    "  $($d.state) after $rounds stop(s); note: $(Hide "$($d.note)")"
+    "  every stop saved what it had written, and every resume carried on from exactly that: $exact"
     if ($d.state -eq "done") { Show-Hash (Get-FinishedHash $d) }
 }
 
@@ -442,12 +547,15 @@ try {
         "  $($Wifi): a ranged 1 KB request answered 206 with 1024 bytes; the file is $(MB $range.Length) MB"
         if ($range.Version) { "  the server names its version by $($range.Version)" }
         else { "  the server names no version: a stopped download would start over" }
+        Set-FileFound $range
+        if ($Reference) { New-CurlReference (Get-Address $Wifi) }
         $script:Proc = Start-Engine
         Wait-Cables
         "  the engine is up at http://127.0.0.1:$Port and has measured the Wi-Fi"
         $res = Invoke-Run -Config $script:CfgWifi -Repeat 1 -Cables @($Wifi)
         $res | Format-List Config, Secs, WifiMbps, TetherMbps, MaxCn, Ok206, EngineWifiMB, EngineTethMB, State, Sha, Note, Notes |
             Out-String -Width 200
+        if ($res.Sha) { Show-Hash $res.Sha }
         return
     }
 
@@ -461,6 +569,8 @@ try {
         if (-not $range.Ok) { throw "$($Wifi): a ranged 1 KB request answered '$($range.Answer)', not '206 1024'" }
         if (-not $range.Version) { throw "-Row Pause needs a file whose server names its version" }
         "  $($Wifi): a ranged 1 KB request answered 206 with 1024 bytes; the file is $(MB $range.Length) MB, its version named by $($range.Version)"
+        Set-FileFound $range
+        if ($Reference) { New-CurlReference (Get-Address $Wifi) }
         $script:Cables = @($Wifi)
         $script:Proc = Start-Engine -Open
         Wait-Cables
@@ -494,6 +604,7 @@ try {
         "  $($name): a ranged 1 KB request answered 206 with 1024 bytes"
         $length = $range.Length
         $version = $range.Version
+        Set-FileFound $range
     }
     if (-not $length) { throw "the server named no length in its Content-Range" }
     $fileMB = $length / 1e6
@@ -507,18 +618,22 @@ try {
 
     # The most each session can cost the phone: a tether-only run is the
     # whole file, a combined run at most the whole file again, and each
-    # start of the engine a speed test.
+    # start of the engine a speed test. The phone counts both ways, TLS and
+    # acknowledgements too, so a tenth more: the measured runs of 2026-10-22
+    # counted 2635 MB against about 2450 MB of files and speed test.
+    $margin = 1.1
     $costs = @{
-        Run     = [math]::Ceiling($SpeedTestMB + $Repeats * 2 * $fileMB)
-        Yank    = [math]::Ceiling($SpeedTestMB + $fileMB)
-        Pause   = [math]::Ceiling($SpeedTestMB + $fileMB)
+        Run     = [math]::Ceiling(($SpeedTestMB + $Repeats * 2 * $fileMB) * $margin)
+        Yank    = [math]::Ceiling(($SpeedTestMB + $fileMB) * $margin)
+        Pause   = [math]::Ceiling(($SpeedTestMB + $fileMB) * $margin)
     }
     if (-not $Run -and -not $Row) {
         ""
-        "== What each session can cost in mobile data, at most"
-        "  -Run ($Repeats repeats of A, B, C): $($costs.Run) MB; about $([math]::Ceiling($SpeedTestMB + $Repeats * 1.5 * $fileMB)) MB if the tether carries half of each combined run"
+        "== What each session can cost in mobile data, at most, a tenth over the payload"
+        "  -Run ($Repeats repeats of A, B, C): $($costs.Run) MB; about $([math]::Ceiling(($SpeedTestMB + $Repeats * 1.5 * $fileMB) * $margin)) MB if the tether carries half of each combined run"
         "  -Row Yank: $($costs.Yank) MB"
         "  -Row Pause: $($costs.Pause) MB; with -WifiOnly none"
+        "  -Reference adds $([math]::Ceiling($fileMB)) MB on the Wi-Fi, none on the phone"
         "  Agree a budget, then run again with -BudgetMB and -Run or -Row."
         return
     }
@@ -527,6 +642,7 @@ try {
     if ($BudgetMB -lt $costs[$session]) {
         throw "this session can cost up to $($costs[$session]) MB of mobile data, more than -BudgetMB $BudgetMB"
     }
+    if ($Reference) { New-CurlReference $addresses[$Wifi] }
 
     ""
     "== The engine"
@@ -568,6 +684,15 @@ try {
         $first = $rows[0].Sha
         $same = @($rows | Where-Object { $_.Sha -ne $first }).Count -eq 0
         "  every file's SHA-256 matches the first run's ($($first.Substring(0, 12))...): $same"
+        $ref = Get-Reference
+        if ($ref -and $ref.from -eq "the curl copy") {
+            $same = $same -and ($first -eq $ref.sha)
+            "  and the curl copy's: $($first -eq $ref.sha)"
+        } elseif ($same) {
+            # For a row later in the session, or another session, of this
+            # same version of the file.
+            Save-Reference $first "the measured runs' first file"
+        }
         $used = ((Get-AdapterBytes $script:TetherName) - $script:TetherStart) / 1e6
         "  mobile data this session, both ways: $([math]::Round($used, 0)) MB"
 

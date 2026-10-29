@@ -58,7 +58,8 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 ///   [`LiveMessage`]s.
 /// - `POST /api/downloads`: start one. The body is JSON, `{"url": string,
 ///   "cables"?: string[]}`, sent as `application/json`. It answers `201
-///   {"id"}`, `400 {"error"}` for a body or URL it cannot use, `409 {"error",
+///   {"id"}` (a stopped download of the URL is resumed, and its own id
+///   given), `400 {"error"}` for a body or URL it cannot use, `409 {"error",
 ///   "id"}` for a URL already downloading, with that download's id, and `415
 ///   {"error"}` for anything not JSON. A form on another site can only send
 ///   the kinds that last refuses, and anything else from a page needs the
@@ -69,8 +70,7 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 ///   body is `{}`, as `application/json`, for the same reason as adding's.
 ///   They answer `200 {"id"}` once it has stopped or started again, `404
 ///   {"error"}` for no such download, `409 {"error"}` for one not running or
-///   not stopped, with `"id"` when its file runs as another download, and
-///   `415` or `400` as adding does.
+///   not stopped, and `415` or `400` as adding does.
 ///
 /// Any other address under `/api` answers `404`. Every route answers only
 /// this machine's own pages, and none may be framed ([`guard`]).
@@ -265,11 +265,6 @@ fn controlled(id: DownloadId, done: Result<(), ControlError>) -> Response {
     match done {
         Ok(()) => (StatusCode::OK, Json(json!({ "id": id.as_u64() }))).into_response(),
         Err(e @ ControlError::NoSuchDownload) => refuse(StatusCode::NOT_FOUND, &e.to_string()),
-        Err(e @ ControlError::AlreadyRunning(other)) => (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": e.to_string(), "id": other.as_u64() })),
-        )
-            .into_response(),
         Err(e) => refuse(StatusCode::CONFLICT, &e.to_string()),
     }
 }

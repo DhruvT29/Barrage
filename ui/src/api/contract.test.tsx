@@ -119,7 +119,7 @@ test('the contract file renders on the Downloads tab too', () => {
   const { list } = lastDownloads(all)
   // The checks below prove nothing unless every kind of card is in the file.
   const states = list.map((d) => d.state)
-  for (const state of ['starting', 'waiting', 'downloading', 'done', 'failed'] as const) {
+  for (const state of ['starting', 'waiting', 'downloading', 'done', 'failed', 'stopped'] as const) {
     expect(states, `a ${state} download`).toContain(state)
   }
   expect(list.some((d) => d.note !== null), 'a download with a note').toBe(true)

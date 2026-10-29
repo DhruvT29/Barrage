@@ -17,6 +17,10 @@
 //!   the console.
 //! - **A name over [`MAX_NAME`] is cut from the end of its stem**, keeping
 //!   the extension, since that is what decides what opens the file.
+//! - **A name shaped like the engine's own files gets a `_` at the end**:
+//!   one ending `.part`, `.part.json` or `.part.json.new`, in any case.
+//!   Otherwise a server could plant a `.part` and progress beside it, for a
+//!   later download of a trusted address to pick up as its own.
 //!
 //! And a name already in the folder is never reused ([`free_name`]): the new
 //! file gets ` (1)`, ` (2)` before its extension.
@@ -94,11 +98,26 @@ pub(crate) fn names_like(name: &str) -> impl Iterator<Item = String> + '_ {
 /// The highest number [`free_name`] tries.
 const MAX_NUMBER: u64 = 999;
 
-/// Whether `dir` holds `name` or its `.part`. Anything that cannot be checked
-/// counts as taken: a file this cannot see is still one it must not
-/// overwrite.
+/// Whether `dir` holds `name`, its `.part` or the progress saved beside that.
+/// Anything that cannot be checked counts as taken: a file this cannot see
+/// is still one it must not overwrite.
 pub(crate) fn taken(dir: &Path, name: &str) -> bool {
-    !nothing_at(&dir.join(name)) || !nothing_at(&dir.join(format!("{name}.part")))
+    [
+        name.to_string(),
+        format!("{name}.part"),
+        format!("{name}.part.json"),
+    ]
+    .iter()
+    .any(|n| !nothing_at(&dir.join(n)))
+}
+
+/// The ends of the names the engine gives its own files beside a download.
+const OWN_ENDINGS: &[&str] = &[".part", ".part.json", ".part.json.new"];
+
+/// Whether `name` ends as one of the engine's own files does, in any case.
+fn looks_like_own(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    OWN_ENDINGS.iter().any(|end| lower.ends_with(end))
 }
 
 /// Whether there is surely nothing at `path`: no file, no folder, no link.
@@ -118,6 +137,11 @@ fn clean(raw: &str) -> Option<String> {
         return None;
     }
     let short = shorten(trimmed);
+    let short = if looks_like_own(&short) {
+        format!("{short}_")
+    } else {
+        short
+    };
     Some(if reserved(&short) {
         format!("_{short}")
     } else {
@@ -372,6 +396,31 @@ mod tests {
         }
     }
 
+    /// A downloaded file never takes the shape of the engine's own files, so
+    /// a server cannot plant a `.part` and the progress that goes with it
+    /// for a later download to pick up as its own (PR #4's review).
+    #[test]
+    fn a_name_never_looks_like_the_engines_own_files() {
+        let cases = [
+            ("ubuntu.iso.part", "ubuntu.iso.part_"),
+            ("ubuntu.iso.part.json", "ubuntu.iso.part.json_"),
+            ("ubuntu.iso.part.json.new", "ubuntu.iso.part.json.new_"),
+            // Windows names ignore case.
+            ("x.PART", "x.PART_"),
+            ("x.Part.Json", "x.Part.Json_"),
+            (".part", ".part_"),
+            // Only the end counts.
+            ("parts.zip", "parts.zip"),
+            ("x.part.zip", "x.part.zip"),
+            ("x.partial", "x.partial"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(clean(raw).as_deref(), Some(want), "{raw:?}");
+        }
+        // Made safe in any other way too: a trailing dot goes first.
+        assert_eq!(clean("x.part.").as_deref(), Some("x.part_"));
+    }
+
     #[test]
     fn filename_star_wins_and_is_decoded() {
         let plain = url("http://example.com/get?id=7");
@@ -457,6 +506,10 @@ mod tests {
         assert_eq!(free("x.iso"), "x (3).iso");
         dir.touch("y.iso.part");
         assert_eq!(free("y.iso"), "y (1).iso");
+        // And so does progress left beside a name, the engine's or not: a
+        // name with a progress file is never one to write over it.
+        dir.touch("w.iso.part.json");
+        assert_eq!(free("w.iso"), "w (1).iso");
         // So does a folder.
         fs::create_dir(dir.0.join("z.iso")).unwrap();
         assert_eq!(free("z.iso"), "z (1).iso");

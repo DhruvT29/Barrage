@@ -252,6 +252,11 @@ async fn a_file_with_no_version_starts_over() {
     let id = first.add(request(&url)).await.unwrap();
     wait_for(&first, id, "chunks under way", |s| s.done > FINISHED).await;
     first.shutdown().await;
+    // Nothing to tell the file by, so it says it will start over.
+    assert_eq!(
+        status_of(&first, id).note.as_deref(),
+        Some("stopped with barrage; adding it again starts it over")
+    );
     let saved = progress(&dir, "unnamed.bin").expect("no progress file");
     assert_eq!(saved["validator"], Value::Null);
 
@@ -435,10 +440,11 @@ async fn only_a_running_download_stops_and_only_a_stopped_one_resumes() {
     assert_eq!(status_of(&downloads, id).phase, Phase::Done);
 }
 
-/// Added again while stopped, the file is the new download's; the stopped
-/// one cannot take it back while that one runs.
+/// Added again while stopped, the URL resumes the stopped download, under
+/// its own id: one download of the file, never two, so its progress is
+/// never taken from under it (PR #4's review).
 #[tokio::test]
-async fn a_stopped_download_does_not_resume_while_its_file_runs_as_another() {
+async fn adding_a_stopped_downloads_url_resumes_it() {
     let links = both();
     let server = Server::start().await;
     server.at("/twice.bin", Answer::File(held().etag("\"v1\"")));
@@ -449,22 +455,51 @@ async fn a_stopped_download_does_not_resume_while_its_file_runs_as_another() {
     wait_for(&downloads, first, "chunks under way", |s| s.done > FINISHED).await;
     downloads.stop(first).await.unwrap();
 
-    let second = downloads.add(request(&url)).await.unwrap();
-    assert_ne!(second, first);
+    server.at("/twice.bin", Answer::File(File::new(LENGTH).etag("\"v1\"")));
+    let again = downloads.add(request(&url)).await.unwrap();
+    assert_eq!(again, first);
+    assert_ne!(status_of(&downloads, first).phase, Phase::Stopped);
+    let end = ended(&downloads, first).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    let note = end.note.unwrap_or_default();
+    assert!(note.starts_with("resumed: "), "{note}");
+    assert_same(&dir.read("twice.bin"), LENGTH);
+    assert_eq!(listing(&dir), ["twice.bin"]);
+    assert_eq!(downloads.status().borrow().len(), 1);
+    // Running again, its URL is held as any running download's is.
+    assert_eq!(downloads.resume(first).await, Err(ControlError::NotStopped));
+}
+
+/// A server that names no version of its file gives nothing to tell, on
+/// resuming, whether it is still the same, so stopping says resuming starts
+/// over: as it then does.
+#[tokio::test]
+async fn stopping_a_file_with_no_version_says_it_starts_over() {
+    let links = both();
+    let (server, dir, downloads, id) =
+        start_with("unversioned.bin", held(), &links, saving()).await;
+    wait_for(&downloads, id, "chunks under way", |s| s.done > FINISHED).await;
+    downloads.stop(id).await.unwrap();
     assert_eq!(
-        downloads.resume(first).await,
-        Err(ControlError::AlreadyRunning(second))
+        status_of(&downloads, id).note.as_deref(),
+        Some("stopped; resuming starts it over")
     );
-    assert_eq!(status_of(&downloads, first).phase, Phase::Stopped);
+
+    server.at("/unversioned.bin", Answer::File(File::new(LENGTH)));
+    downloads.resume(id).await.unwrap();
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("unversioned.bin"), LENGTH);
 }
 
 /// A file the server sends only whole keeps no progress, so stopping it
-/// says that resuming starts it over.
+/// says that resuming starts it over, and nothing it wrote is kept: the
+/// resumed download starts over under the same name.
 #[tokio::test]
 async fn stopping_a_whole_download_says_it_starts_over() {
     let links = both();
     let whole = File::new(LENGTH).no_ranges().stall_after(MIB);
-    let (_server, dir, downloads, id) = start_with("whole-stop.bin", whole, &links, saving()).await;
+    let (server, dir, downloads, id) = start_with("whole-stop.bin", whole, &links, saving()).await;
     wait_for(&downloads, id, "data", |s| s.done > 0).await;
     downloads.stop(id).await.unwrap();
     let stopped = status_of(&downloads, id);
@@ -474,4 +509,15 @@ async fn stopping_a_whole_download_says_it_starts_over() {
         Some("stopped; resuming starts it over")
     );
     assert!(progress(&dir, "whole-stop.bin").is_none());
+    assert!(listing(&dir).is_empty(), "{:?}", listing(&dir));
+
+    server.at(
+        "/whole-stop.bin",
+        Answer::File(File::new(LENGTH).no_ranges()),
+    );
+    downloads.resume(id).await.unwrap();
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_eq!(end.name.as_deref(), Some("whole-stop.bin"));
+    assert_same(&dir.read("whole-stop.bin"), LENGTH);
 }

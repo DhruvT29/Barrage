@@ -38,6 +38,28 @@ async fn a_file_comes_down_through_every_link_byte_for_byte() {
     assert_eq!(wifi + ethernet, length);
 }
 
+/// A finished file carries the mark a browser gives a download, so Windows
+/// treats it as from the internet: SmartScreen checks a program, Office
+/// opens a document in Protected View (PR #4's review).
+#[cfg(windows)]
+#[tokio::test]
+async fn a_finished_file_is_marked_as_from_the_internet() {
+    let links = both();
+    let file = File::new(MIB).rate(4 * MIB);
+    let (server, dir, downloads, id) = start("marked.exe", file, &links).await;
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+
+    let stream = dir.0.join("marked.exe:Zone.Identifier");
+    let mark = std::fs::read_to_string(&stream).expect("no Zone.Identifier stream");
+    assert!(
+        mark.starts_with("[ZoneTransfer]\r\nZoneId=3\r\n"),
+        "{mark:?}"
+    );
+    let host = format!("HostUrl={}\r\n", server.url("/marked.exe"));
+    assert!(mark.contains(&host), "{mark:?}");
+}
+
 #[tokio::test]
 async fn each_link_gets_its_own_workers() {
     let links = both();

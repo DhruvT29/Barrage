@@ -40,17 +40,28 @@
 //! being usable, is stopped at once, without waiting for a deadline; if it
 //! comes back, it does so under a new id, as a new member.
 //!
+//! A server error (5xx) to a piece counts as a broken connection, judged the
+//! same way.
+//!
 //! WHEN THE SERVER LIMITS CONNECTIONS
 //!
-//! A `429 Too Many Requests` is a ceiling, not a failure (PLAN.md item 8):
-//! servers cap connections per address, and each link has an address of its
-//! own. Each 429 ends the connection that got it and nothing takes its
-//! place, so the link settles at what the server takes, never below one,
-//! while the others keep theirs. When its last connection is refused, the
-//! link waits as long as `Retry-After` asks, up to `max_retry_after`, and
-//! sits the download out if asked to wait longer; with no `Retry-After` it
-//! rests as a failing link. A link that works again after waiting may hold
-//! all its connections again, and learns the ceiling afresh.
+//! A `429 Too Many Requests`, or a `503 Service Unavailable`, is a ceiling,
+//! not a failure (PLAN.md item 8): servers cap connections or requests per
+//! address, and each link has an address of its own. Each refusal ends the
+//! connection that got it and nothing takes its place, so the link settles
+//! at what the server takes, never below one, while the others keep theirs.
+//! When its last connection is refused, the link waits as long as
+//! `Retry-After` asks, up to `max_retry_after`, and sits the download out if
+//! asked to wait longer; with no `Retry-After`, or one shorter than a rest,
+//! it rests as a failing link. A link that works again after waiting may
+//! hold all its connections again, and learns the ceiling afresh.
+//!
+//! WHEN AN ADDRESS EXPIRES
+//!
+//! A link keeps the address its redirects led to. Many are signed and last
+//! minutes, so a `401`, `403`, `404` or `410` from one sends the link back to
+//! the URL given, to find the file again; the same file, it carries on
+//! through the fresh address. Once only until a chunk comes through again.
 //!
 //! With no usable link it waits. When every usable link has given up, on a
 //! file it could not find or answers it could not use, and none is resting,
@@ -69,8 +80,11 @@
 //! The next engine, given the same URL, looks for that progress under the
 //! names the file would be given, in the order they are tried, and if the
 //! server's file is still the same length and version, fetches only what is
-//! missing. Otherwise it starts over and says why. A file the server sends
-//! only whole cannot be picked up again, so no progress is kept for it.
+//! missing. Otherwise it starts over and says why; so it does for a server
+//! that names no version, and stopping says so. A file the server sends only
+//! whole cannot be picked up again, so no progress is kept for it, and one
+//! stopped by the user leaves nothing behind: resuming starts it over under
+//! the same name.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -86,7 +100,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::disk::{create_part, name_finished, reopen_part};
+use super::disk::{create_part, mark_from_internet, name_finished, reopen_part};
 use super::name::{names_like, taken};
 use super::remote::{Remote, differs, find};
 use super::saved::{Saved, load, progress_path, save};
@@ -233,6 +247,9 @@ struct Member {
     /// One connection is trying the link after a rest; its first chunk
     /// brings back the rest.
     trial: bool,
+    /// Whether an address it was redirected to that answers it is gone is
+    /// found again: once, until a chunk comes through again.
+    may_find_again: bool,
     /// Bytes this link's workers wrote, counted by them.
     written: Arc<AtomicU64>,
     stop: watch::Sender<bool>,
@@ -370,6 +387,14 @@ impl Download {
                 }
                 let (task, exit) = match ended {
                     Ok(done) => done,
+                    // A worker that panicked took its chunk with it, and the
+                    // download would wait for it for ever: it ends, its
+                    // progress saved, rather than hang.
+                    Err(e) if e.is_panic() => {
+                        return self.fail(format!(
+                            "a connection stopped unexpectedly ({e}); what was written is kept"
+                        ));
+                    }
                     Err(e) => (e.id(), Some(format!("a connection stopped: {e}"))),
                 };
                 if let Some(seat) = self.working.remove(&task) {
@@ -449,9 +474,24 @@ impl Download {
         }
         let snapshot = self.snapshot();
         self.save_now(snapshot).await;
-        self.file = None;
-        // With no progress kept, it was not yet found, or is fetched whole.
-        let note = match (why, self.progress_file.is_some()) {
+        // Progress picked up again needs the version the server named, to
+        // tell it is still the same file: without one, or with no progress
+        // kept (not yet found, or fetched whole), it starts over.
+        let resumable = self.progress_file.is_some()
+            && self
+                .file
+                .as_ref()
+                .is_some_and(|open| open.fixed.validator.is_some());
+        if let Some(open) = self.file.take()
+            && matches!(open.mode, Mode::Whole { .. })
+            && why == Stop::Asked
+        {
+            // Nothing can carry on from a file fetched whole, and resuming it
+            // starts over under the same name.
+            drop(open.file);
+            let _ = std::fs::remove_file(&open.part);
+        }
+        let note = match (why, resumable) {
             (Stop::Asked, true) => "stopped; resuming carries on from here",
             (Stop::Asked, false) => "stopped; resuming starts it over",
             (Stop::Engine, true) => "stopped with barrage; adding it again carries on from here",
@@ -558,6 +598,7 @@ impl Download {
                         resting: None,
                         backoff: self.job.config.rest_first,
                         trial: false,
+                        may_find_again: true,
                         written: Arc::new(AtomicU64::new(0)),
                         stop: watch::channel(false).0,
                         note: None,
@@ -654,6 +695,9 @@ impl Download {
                 (name, part, file, Ranges::new())
             }
         };
+        // A `.part` picked up again is marked too: an older engine's has no
+        // mark.
+        mark_from_internet(&part, &remote.url);
         let mode = match pieces {
             Some(length) => {
                 let (pile, taken) = flume::unbounded();
@@ -920,8 +964,14 @@ impl Download {
                 }
             }
             (false, Outcome::Broken(why)) => self.broken(report.link, why),
-            (false, Outcome::Capped(wait)) => self.capped(report.link, wait),
-            (false, Outcome::Done | Outcome::Short) => self.worked(report.link),
+            (false, Outcome::Capped(refused, wait)) => self.capped(report.link, &refused, wait),
+            (false, Outcome::Gone(why)) => self.gone(report.link, why),
+            (false, Outcome::Done | Outcome::Short) => {
+                if let Some(member) = self.member(report.link) {
+                    member.may_find_again = true;
+                }
+                self.worked(report.link);
+            }
             (false, Outcome::Stopped) | (true, Outcome::Done) => {}
             (true, Outcome::Stopped) if self.stopping => {}
             (true, Outcome::Stopped) => {
@@ -933,7 +983,7 @@ impl Download {
             }
             (true, outcome) => {
                 let why = match outcome {
-                    Outcome::Failed(why) | Outcome::Broken(why) => why,
+                    Outcome::Failed(why) | Outcome::Broken(why) | Outcome::Gone(why) => why,
                     _ => "the file ended early".to_string(),
                 };
                 return self.fail(format!(
@@ -968,17 +1018,19 @@ impl Download {
         self.add_workers(link, usize::MAX);
     }
 
-    /// The server refused a connection on `link` with 429: it allows fewer
-    /// connections through this address (PLAN.md item 8). The refused one
-    /// ends and nothing takes its place, so the link settles at what the
-    /// server takes, and says so, while the other links keep their own.
-    /// Counting refusals, rather than looking at who is receiving, does not
-    /// depend on which answer arrives first. Its last connection is never
-    /// counted away: refused too, the link waits as long as the server asked,
-    /// sits the download out if that is longer than `max_retry_after`, or
-    /// rests as a failing link when the server did not say.
-    fn capped(&mut self, link: LinkId, wait: Option<Duration>) {
-        let most = self.job.config.max_retry_after;
+    /// The server refused a connection on `link` with 429 or 503, `refused`:
+    /// it allows fewer connections or requests through this address (PLAN.md
+    /// item 8). The refused one ends and nothing takes its place, so the link
+    /// settles at what the server takes, and says so, while the other links
+    /// keep their own. Counting refusals, rather than looking at who is
+    /// receiving, does not depend on which answer arrives first. Its last
+    /// connection is never counted away: refused too, the link waits as long
+    /// as the server asked, sits the download out if that is longer than
+    /// `max_retry_after`, or rests as a failing link when the server did not
+    /// say, or asked for less than a rest: asking again at once, round after
+    /// round, is what a server limiting requests counts against it.
+    fn capped(&mut self, link: LinkId, refused: &str, wait: Option<Duration>) {
+        let (most, least) = (self.job.config.max_retry_after, self.job.config.rest_first);
         let Some(member) = self.member(link) else {
             return;
         };
@@ -1002,18 +1054,43 @@ impl Download {
                     wait_words(most)
                 ));
             }
-            Some(wait) => {
+            Some(wait) if wait >= least => {
                 let note = format!(
                     "the server asked this cable to wait {} before trying again",
                     wait_words(wait)
                 );
                 self.pause(link, wait, note);
             }
-            None => self.rest(
+            _ => self.rest(
                 link,
-                "the server refused this cable's connections (429 Too Many Requests)".to_string(),
+                format!("the server refused this cable's connections ({refused})"),
             ),
         }
+    }
+
+    /// The address `link` was redirected to answered that it is gone, as a
+    /// signed address does once it expires: find the file again from the URL
+    /// given, and carry on through the fresh address if it is still the same
+    /// file. Once only until a chunk comes through again, so an address that
+    /// refuses straight after it was found again is not found over and over.
+    /// An address the URL itself names is gone for good: the worker ends, as
+    /// for any answer that cannot be used.
+    fn gone(&mut self, link: LinkId, why: String) {
+        let given = self.job.url.clone();
+        let Some(member) = self.member(link) else {
+            return;
+        };
+        let redirected = member.remote.as_ref().is_some_and(|r| r.url != given);
+        if !(member.present && redirected && member.may_find_again && !member.finding) {
+            member.note = Some(why);
+            return;
+        }
+        member.may_find_again = false;
+        // Its other connections ask the old address too, and stop on their
+        // own refusals; the fresh ones start once it is found.
+        member.remote = None;
+        member.note = Some(format!("{why}; it finds the file again"));
+        self.join(link);
     }
 
     /// A connection on `link` failed, and has already given up its seat. If

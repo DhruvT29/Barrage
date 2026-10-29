@@ -27,13 +27,17 @@
 //! data, or whose request or answer breaks, is reported broken and its
 //! worker ends: one worker cannot tell a bad connection from a failing link.
 //! The coordinator can, from whether the link's other connections are still
-//! receiving, so each worker notes when its own last received bytes. An
-//! answer that arrives but cannot be used, an unexpected status or a piece
-//! of the wrong bytes, is no fault of the connection: that worker ends, and
-//! no other takes its place. A `429 Too Many Requests` is neither: the
-//! server allows fewer connections through this address, and may say how
-//! long to wait. That worker ends too, and its link holds one fewer
-//! (PLAN.md item 8).
+//! receiving, so each worker notes when its own last received bytes. A
+//! server error (5xx) is reported broken too: the server failing this
+//! request, which a later one may not. An answer that arrives but cannot be
+//! used, an unexpected status or a piece of the wrong bytes, is no fault of
+//! the connection: that worker ends, and no other takes its place. A
+//! `429 Too Many Requests` or a `503 Service Unavailable` is neither: the
+//! server allows fewer connections or requests through this address, and may
+//! say how long to wait. That worker ends too, and its link holds one fewer
+//! (PLAN.md item 8). A `401`, `403`, `404` or `410` to the address a
+//! redirect led to says the address is gone, as a signed one is once it
+//! expires, and the coordinator may find the file again.
 
 use std::fs::File;
 use std::net::IpAddr;
@@ -109,10 +113,14 @@ pub(crate) enum Outcome {
     /// The server's answer cannot be used: an unexpected status, a piece of
     /// other bytes, an answer with nothing in it. The worker ends.
     Failed(String),
-    /// The server refused the connection with `429 Too Many Requests`, and
-    /// asked to wait this long if it said. The worker ends; its link holds
-    /// one connection fewer (PLAN.md item 8).
-    Capped(Option<Duration>),
+    /// The server refused the connection with this status, `429 Too Many
+    /// Requests` or `503 Service Unavailable`, and asked to wait this long
+    /// if it said. The worker ends; its link holds one connection fewer
+    /// (PLAN.md item 8).
+    Capped(String, Option<Duration>),
+    /// The address answered `401`, `403`, `404` or `410`: not this file, or
+    /// not any more. The worker ends.
+    Gone(String),
     /// The file on the server is not the one being fetched any more. The
     /// download ends.
     Changed(String),
@@ -199,7 +207,8 @@ impl Worker {
             Wait::TimedOut => return (0, self.no_answer()),
             Wait::Stopped => return (0, Outcome::Stopped),
         };
-        let answer_end = match self.check(&response, range, length) {
+        let validated = self.validator.is_some();
+        let answer_end = match answer_end(&response, range, length, validated) {
             Ok(end) => end,
             Err(outcome) => return (0, outcome),
         };
@@ -213,55 +222,6 @@ impl Worker {
             None => Outcome::Failed("the answer ended before any of the piece arrived".into()),
         };
         (written, outcome)
-    }
-
-    /// The end of the bytes the answer holds, if it is a piece of this file
-    /// starting where `range` does.
-    fn check(&self, response: &Response, range: &Range<u64>, length: u64) -> Result<u64, Outcome> {
-        let status = response.status();
-        if status == StatusCode::OK {
-            // With If-Range, the whole file is the server's way of saying
-            // the version asked for is gone.
-            return Err(Outcome::Changed(if self.validator.is_some() {
-                "the file changed on the server during the download, so it stopped rather than \
-                 mix two versions"
-                    .into()
-            } else {
-                "the server stopped sending pieces partway through the download".into()
-            }));
-        }
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let wait = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| retry_after(v, SystemTime::now()));
-            return Err(Outcome::Capped(wait));
-        }
-        if status != StatusCode::PARTIAL_CONTENT {
-            return Err(Outcome::Failed(format!(
-                "the server answered {status} to a request for a piece"
-            )));
-        }
-        let text = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .ok_or(Outcome::Failed(
-                "a piece came without a Content-Range".into(),
-            ))?;
-        match content_range(text) {
-            Some((_, _, Some(total))) if total != length => Err(Outcome::Changed(format!(
-                "the file's length on the server changed during the download ({total} bytes, \
-                 not {length}), so it stopped rather than mix two versions"
-            ))),
-            Some((start, end, Some(_))) if start == range.start && end >= start => Ok(end + 1),
-            _ => Err(Outcome::Failed(format!(
-                "asked for bytes {}-{} of {length}, the Content-Range says {text:?}",
-                range.start,
-                range.end - 1
-            ))),
-        }
     }
 
     /// The whole file from byte 0: how many bytes were written, and how it
@@ -381,4 +341,175 @@ impl Worker {
 /// Resolves once the link is told to stop, or its coordinator is gone.
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|&stop| stop).await;
+}
+
+/// The end of the bytes `response` holds, if it is a piece of a file
+/// `length` bytes long starting where `range` does; else what became of the
+/// request. `validated`: it was asked with `If-Range`.
+fn answer_end(
+    response: &Response,
+    range: &Range<u64>,
+    length: u64,
+    validated: bool,
+) -> Result<u64, Outcome> {
+    let status = response.status();
+    if status == StatusCode::OK {
+        // With If-Range, the whole file is the server's way of saying the
+        // version asked for is gone.
+        return Err(Outcome::Changed(if validated {
+            "the file changed on the server during the download, so it stopped rather than mix \
+             two versions"
+                .into()
+        } else {
+            "the server stopped sending pieces partway through the download".into()
+        }));
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        let wait = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| retry_after(v, SystemTime::now()));
+        return Err(Outcome::Capped(status.to_string(), wait));
+    }
+    let why = format!("the server answered {status} to a request for a piece");
+    if status.is_server_error() {
+        return Err(Outcome::Broken(why));
+    }
+    if matches!(status.as_u16(), 401 | 403 | 404 | 410) {
+        return Err(Outcome::Gone(why));
+    }
+    if status != StatusCode::PARTIAL_CONTENT {
+        return Err(Outcome::Failed(why));
+    }
+    let text = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(Outcome::Failed(
+            "a piece came without a Content-Range".into(),
+        ))?;
+    match content_range(text) {
+        Some((_, _, Some(total))) if total != length => Err(Outcome::Changed(format!(
+            "the file's length on the server changed during the download ({total} bytes, not \
+             {length}), so it stopped rather than mix two versions"
+        ))),
+        // Ending inside the file, so the end past it is a byte that exists.
+        Some((start, end, Some(_))) if start == range.start && start <= end && end < length => {
+            Ok(end + 1)
+        }
+        _ => Err(Outcome::Failed(format!(
+            "asked for bytes {}-{} of {length}, the Content-Range says {text:?}",
+            range.start,
+            range.end - 1
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer with this status and these headers.
+    fn answer(status: u16, headers: &[(&str, &str)]) -> Response {
+        let mut built = axum::http::Response::builder().status(status);
+        for (name, value) in headers {
+            built = built.header(*name, *value);
+        }
+        Response::from(built.body(Vec::<u8>::new()).unwrap())
+    }
+
+    const LENGTH: u64 = 10_000;
+
+    fn end_of(status: u16, headers: &[(&str, &str)]) -> Result<u64, Outcome> {
+        answer_end(&answer(status, headers), &(4000..8000), LENGTH, true)
+    }
+
+    #[test]
+    fn a_piece_is_its_bytes_of_this_file() {
+        let piece = |range: &str| end_of(206, &[("content-range", range)]);
+        assert_eq!(piece("bytes 4000-7999/10000"), Ok(8000));
+        // Shorter than asked, or running on past the chunk, to the file's
+        // last byte: the worker writes only what the chunk needs.
+        assert_eq!(piece("bytes 4000-4999/10000"), Ok(5000));
+        assert_eq!(piece("bytes 4000-9999/10000"), Ok(10000));
+        // Starting elsewhere is other bytes.
+        assert!(matches!(
+            piece("bytes 0-3999/10000"),
+            Err(Outcome::Failed(_))
+        ));
+        // Another total is another file.
+        assert!(matches!(
+            piece("bytes 4000-7999/20000"),
+            Err(Outcome::Changed(_))
+        ));
+        assert!(matches!(end_of(206, &[]), Err(Outcome::Failed(_))));
+    }
+
+    /// An end past the file is a lie the bytes cannot keep, and the largest
+    /// one would wrap the worker's counting round to 0 (PR #4's review).
+    #[test]
+    fn a_piece_ending_past_the_file_is_refused() {
+        let piece = |range: &str| end_of(206, &[("content-range", range)]);
+        for range in [
+            "bytes 4000-10000/10000",
+            "bytes 4000-18446744073709551615/10000",
+            "bytes 4000-3999/10000",
+        ] {
+            assert!(matches!(piece(range), Err(Outcome::Failed(_))), "{range}");
+        }
+    }
+
+    #[test]
+    fn a_429_or_a_503_is_a_ceiling_with_its_wait() {
+        assert_eq!(
+            end_of(429, &[("retry-after", "7")]),
+            Err(Outcome::Capped(
+                "429 Too Many Requests".into(),
+                Some(Duration::from_secs(7))
+            ))
+        );
+        assert_eq!(
+            end_of(503, &[]),
+            Err(Outcome::Capped("503 Service Unavailable".into(), None))
+        );
+    }
+
+    #[test]
+    fn a_server_error_is_the_connection_failing() {
+        for status in [500, 502, 504] {
+            let ended = end_of(status, &[]);
+            assert!(
+                matches!(ended, Err(Outcome::Broken(_))),
+                "{status}: {ended:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_that_refuses_or_has_nothing_is_gone() {
+        for status in [401, 403, 404, 410] {
+            let ended = end_of(status, &[]);
+            assert!(
+                matches!(ended, Err(Outcome::Gone(_))),
+                "{status}: {ended:?}"
+            );
+        }
+        // Other statuses are an answer that cannot be used.
+        for status in [301, 400, 416] {
+            let ended = end_of(status, &[]);
+            assert!(
+                matches!(ended, Err(Outcome::Failed(_))),
+                "{status}: {ended:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_file_means_it_changed_or_stopped_coming_in_pieces() {
+        let changed = answer_end(&answer(200, &[]), &(4000..8000), LENGTH, true);
+        assert!(matches!(changed, Err(Outcome::Changed(w)) if w.contains("changed")));
+        let unasked = answer_end(&answer(200, &[]), &(4000..8000), LENGTH, false);
+        assert!(matches!(unasked, Err(Outcome::Changed(w)) if w.contains("stopped sending")));
+    }
 }

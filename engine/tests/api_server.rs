@@ -937,16 +937,22 @@ async fn stopping_and_resuming_say_why_not() {
         )
     );
 
-    // Added again while stopped, the file is download 2's: 1 waits its turn.
+    // Added again while stopped, the URL resumes download 1, under its id:
+    // one download of the file, never two.
     assert_eq!(
         post(addr, json!({ "url": url })).await,
-        (201, json!({ "id": 2 }))
+        (201, json!({ "id": 1 }))
     );
-    let (status, answer) = command(addr, 1, "resume").await;
-    assert_eq!(status, 409, "{answer}");
-    assert_eq!(answer["id"], 2, "{answer}");
-    let error = answer["error"].as_str().unwrap_or_default();
-    assert!(error.contains("already downloading"), "{error}");
+    let again = listed(addr).await;
+    assert_eq!(again["list"].as_array().unwrap().len(), 1, "{again}");
+    assert_ne!(again["list"][0]["state"], "stopped", "{again}");
+    assert_eq!(
+        command(addr, 1, "resume").await,
+        (
+            409,
+            json!({ "error": "it is not stopped, so there is nothing to resume" })
+        )
+    );
 
     for id in ["9", "abc", "-1"] {
         assert_eq!(
@@ -960,13 +966,13 @@ async fn stopping_and_resuming_say_why_not() {
         ("application/x-www-form-urlencoded", ""),
         ("text/plain", "{}"),
     ] {
-        let (status, answer) = control(addr, "2", "stop", content_type, body).await;
+        let (status, answer) = control(addr, "1", "stop", content_type, body).await;
         assert_eq!(status, 415, "{content_type}: {answer}");
     }
-    let (status, answer) = control(addr, "2", "stop", "application/json", r#"{"now": 1}"#).await;
+    let (status, answer) = control(addr, "1", "stop", "application/json", r#"{"now": 1}"#).await;
     assert_eq!(status, 400, "{answer}");
     let foreign = reqwest::Client::new()
-        .post(format!("http://{addr}/api/downloads/2/stop"))
+        .post(format!("http://{addr}/api/downloads/1/stop"))
         .header("content-type", "application/json")
         .header("origin", "https://attacker.example")
         .body("{}")
@@ -974,7 +980,7 @@ async fn stopping_and_resuming_say_why_not() {
         .await
         .unwrap();
     assert_eq!(foreign.status(), 403);
-    assert_ne!(listed(addr).await["list"][1]["state"], "stopped");
+    assert_ne!(listed(addr).await["list"][0]["state"], "stopped");
 }
 
 /// The three kinds of body an HTML form can send to another site without

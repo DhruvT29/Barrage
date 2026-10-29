@@ -1,5 +1,6 @@
 //! A link failing mid-download (Task 9), and a server that limits
-//! connections with `429 Too Many Requests` (Task 10), against the scripted
+//! connections with `429 Too Many Requests` or `503` (Task 10, PR #4's
+//! review), or fails a piece, or whose redirect expires, against the scripted
 //! server and network as in fetch_download.rs. The times are short: a fresh
 //! connection takes a failed one's place 100 ms later, a link whose every
 //! connection failed rests 200 ms, doubling up to 1 s, and in the tests that
@@ -14,12 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use barrage::LinkHandle;
-use barrage::fetch::{DownloadConfig, DownloadStatus, LinkShare, Phase, retry_after};
+use barrage::fetch::{DownloadConfig, DownloadStatus, Downloads, LinkShare, Phase, retry_after};
 use barrage::links::probe::ProbeVerdict;
 use barrage::links::watch::WatchConfig;
 use fake::{Fake, ms};
 use fetching::*;
-use serve::{File, Seen, most_at_once};
+use serve::{Answer, File, Seen, Server, most_at_once};
 
 /// Short failure times, so a test takes a few seconds. The read deadline
 /// stays the usual one: with several suites at once, a working connection
@@ -506,4 +507,163 @@ async fn a_last_refusal_without_a_wait_rests_like_a_failing_link() {
         "{notes:?}"
     );
     assert!(share(&end, "Ethernet 2").bytes > 0);
+}
+
+// From PR #4's review: other answers a server limits or fails with.
+
+/// Vultr's speed server limits requests with 503, not 429: a ceiling too,
+/// waited out as asked, not a connection lost for good.
+#[tokio::test]
+async fn a_503_is_a_ceiling_like_a_429() {
+    let links = both();
+    let file = busy().refuse_with(ETHERNET, Some(4), 503, Some("1"));
+    let config = DownloadConfig {
+        max_retry_after: ms(1000),
+        ..failing()
+    };
+    let (_server, dir, downloads, id) = start_with("unavailable.bin", file, &links, config).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("unavailable.bin"), LENGTH);
+    let notes = ethernet_notes(&history.await.unwrap());
+    let wait = "the server asked this cable to wait 1 s before trying again";
+    assert!(notes.iter().any(|n| n == wait), "{notes:?}");
+    // Back after the wait, it carried its share.
+    assert!(share(&end, "Ethernet 2").bytes > 0, "{end:?}");
+}
+
+/// With no wait named, a 503 to every connection rests the link, and says
+/// what the server answered.
+#[tokio::test]
+async fn a_503_without_a_wait_rests_the_link() {
+    let links = both();
+    let file = busy().refuse_with(ETHERNET, Some(4), 503, None);
+    let (_server, dir, downloads, id) =
+        start_with("unavailable-rest.bin", file, &links, failing()).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("unavailable-rest.bin"), LENGTH);
+    let notes = ethernet_notes(&history.await.unwrap());
+    let rest = "the server refused this cable's connections (503 Service Unavailable); it rests \
+                200 ms and tries again";
+    assert!(notes.iter().any(|n| n == rest), "{notes:?}");
+    assert!(share(&end, "Ethernet 2").bytes > 0, "{end:?}");
+}
+
+/// A server error to a piece is the connection failing, judged as a broken
+/// one is: every connection of a link getting one rests it, and it comes
+/// back.
+#[tokio::test]
+async fn a_server_error_to_a_piece_rests_the_link_rather_than_drop_it() {
+    let links = both();
+    let file = busy().refuse_with(ETHERNET, Some(4), 502, None);
+    let (_server, dir, downloads, id) =
+        start_with("bad-gateway.bin", file, &links, failing()).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("bad-gateway.bin"), LENGTH);
+    let notes = ethernet_notes(&history.await.unwrap());
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.starts_with("the server answered 502 Bad Gateway")
+                && n.ends_with("; it rests 200 ms and tries again")),
+        "{notes:?}"
+    );
+    assert!(share(&end, "Ethernet 2").bytes > 0, "{end:?}");
+}
+
+/// A Retry-After of 0, or of a date already past, is no wait at all: the
+/// link rests as it would with none, each rest in a row longer, rather than
+/// ask again at once, round after round.
+#[tokio::test]
+async fn a_retry_after_of_nothing_still_rests_and_backs_off() {
+    let links = both();
+    let file = busy().refuse(ETHERNET, None, Some("0"));
+    let (server, dir, downloads, id) = start_with("no-time.bin", file, &links, failing()).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("no-time.bin"), LENGTH);
+    let notes = ethernet_notes(&history.await.unwrap());
+    let rest = "the server refused this cable's connections (429 Too Many Requests); it rests";
+    assert!(notes.iter().any(|n| n.starts_with(rest)), "{notes:?}");
+    // Four at the start, then one trial a rest (200, 400, 800 ms, then a
+    // second each) while the Wi-Fi fetches the file alone.
+    let refusals = refused(&server.seen()).len();
+    assert!(
+        refusals <= 12,
+        "{refusals} refusals: it asked again at once"
+    );
+}
+
+/// A link redirected to an address that stops working, as signed CDN
+/// addresses do when they expire, finds the file again from the URL given,
+/// and carries on through the fresh address.
+#[tokio::test]
+async fn an_expired_redirect_is_followed_again() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/get", Answer::Redirect(302, "/signed-1".to_string()));
+    server.at("/signed-1", Answer::File(busy().etag("\"v1\"")));
+    let dir = Folder::new("expired");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), failing());
+    let id = downloads.add(request(&server.url("/get"))).await.unwrap();
+    wait_for(&downloads, id, "data", |s| s.done > 4 * MIB).await;
+
+    // The signature runs out: the old address refuses, and the URL now
+    // redirects to a fresh one.
+    server.at("/signed-1", Answer::Status(403));
+    server.at("/get", Answer::Redirect(302, "/signed-2".to_string()));
+    server.at("/signed-2", Answer::File(busy().etag("\"v1\"")));
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("signed-1"), LENGTH);
+    assert!(
+        server
+            .seen()
+            .iter()
+            .any(|s| s.path == "/signed-2" && !is_probe(s)),
+        "no piece came from the fresh address"
+    );
+}
+
+/// An address that refuses its pieces again straight after it was found
+/// again fails the download, rather than find it over and over.
+#[tokio::test]
+async fn a_redirect_that_keeps_refusing_is_followed_again_only_once() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/get", Answer::Redirect(302, "/signed".to_string()));
+    server.at(
+        "/signed",
+        Answer::File(
+            busy()
+                .etag("\"v1\"")
+                .refuse_with(WIFI, None, 403, None)
+                .refuse_with(ETHERNET, None, 403, None),
+        ),
+    );
+    let dir = Folder::new("refusing");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), failing());
+    let id = downloads.add(request(&server.url("/get"))).await.unwrap();
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Failed, "{end:?}");
+    let note = end.note.unwrap_or_default();
+    assert!(
+        note.starts_with("the server answered 403 Forbidden"),
+        "{note}"
+    );
+    // Each link found the file twice at most: once, and once again.
+    let probes = server.seen().iter().filter(|s| s.path == "/get").count();
+    assert!(probes <= 4, "{probes} finds");
 }
