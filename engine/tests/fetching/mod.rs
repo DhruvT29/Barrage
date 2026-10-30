@@ -65,6 +65,9 @@ pub fn config() -> DownloadConfig {
         find_deadline: Duration::from_secs(5),
         publish_every: ms(20),
         speed_half_life: ms(500),
+        // Two equal links hold 4 each, as in phase 3.
+        connections: 8,
+        most_per_link: 4,
         ..DownloadConfig::default()
     }
 }

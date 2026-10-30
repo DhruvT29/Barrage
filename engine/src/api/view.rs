@@ -919,6 +919,7 @@ mod tests {
             bytes,
             bps,
             connections,
+            wanted: connections,
             note: note.map(String::from),
         }
     }

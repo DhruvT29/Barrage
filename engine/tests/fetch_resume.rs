@@ -80,23 +80,28 @@ fn listing(dir: &Folder) -> Vec<String> {
 /// Review Focus 2 (phase 4): the progress saved while a download runs counts
 /// what each connection has written of its part so far, so an engine that
 /// is killed rather than stopped keeps it. No part here ends: the server
-/// holds every answer after its first MiB, and the read deadline would give
-/// one up only after 5 s.
+/// holds every answer after its first MiB, and the read deadline gives one
+/// up only after 30 s.
 #[tokio::test]
 async fn progress_saved_while_running_counts_parts_under_way() {
     let links = both();
     let server = Server::start().await;
     server.at("/running.bin", Answer::File(held().etag("\"v1\"")));
     let dir = Folder::new("running");
-    let downloads = Downloads::with_config(links.table(), dir.0.clone(), saving());
+    let patient = DownloadConfig {
+        read_deadline: Duration::from_secs(30),
+        ..saving()
+    };
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), patient);
     let id = downloads
         .add(request(&server.url("/running.bin")))
         .await
         .unwrap();
     wait_for(&downloads, id, "parts under way", |s| s.done > FINISHED).await;
 
-    // Saved every 100 ms: seen within 3 s, before any part could end.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // Saved every 100 ms, each save flushing the `.part` first, which a disk
+    // busy with several suites at once can take seconds over.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let saved = loop {
         let saved = progress(&dir, "running.bin").map_or(0, |p| done_in(&p));
         if saved > FINISHED || std::time::Instant::now() > deadline {

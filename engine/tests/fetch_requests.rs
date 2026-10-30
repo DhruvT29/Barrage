@@ -76,20 +76,30 @@ async fn a_request_limited_server_is_asked_rarely() {
 async fn the_end_of_a_file_splits_so_no_link_waits() {
     // The Wi-Fi sixteen times as fast as the Ethernet: halving the file
     // between them would leave the Wi-Fi idle while the Ethernet crawls.
+    // 16 MiB/s over the Wi-Fi's four, not 64: a test build sharing the
+    // machine falls behind 64, the Wi-Fi then really is less than sixteen
+    // times as fast, and the Ethernet's fair share grows past the bound.
+    // At a quarter of the speeds, a cut must save four times as long, so
+    // halving stops where it did, at the same bytes.
     const LENGTH: u64 = 16 * MIB;
     let links = both();
     let file = File::new(LENGTH)
-        .rate_for(WIFI, 16 * MIB)
-        .rate_for(ETHERNET, MIB);
-    let (_server, dir, downloads, id) = start_with("uneven.bin", file, &links, config()).await;
+        .rate_for(WIFI, 4 * MIB)
+        .rate_for(ETHERNET, MIB / 4);
+    let config = DownloadConfig {
+        min_split_time: ms(2000),
+        ..config()
+    };
+    let (_server, dir, downloads, id) = start_with("uneven.bin", file, &links, config).await;
 
     let end = ended(&downloads, id).await;
     assert_eq!(end.phase, Phase::Done, "{end:?}");
     assert_same(&dir.read("uneven.bin"), LENGTH);
     // Halved between them, the Ethernet would carry 8 MiB; cut by bytes
     // left alone, about 4 (phase 4, Task 1), each of its connections keeping
-    // a last part under 1 MiB, a second's work, while the Wi-Fi waited. By
-    // their speeds, it keeps a seventeenth of what is left at each cut.
+    // a last part under 1 MiB, four seconds' work, while the Wi-Fi waited.
+    // By their speeds, it keeps a seventeenth of what is left at each cut,
+    // about 1 MiB in all.
     let slow = share(&end, "Ethernet 2").bytes;
     assert!(
         slow < LENGTH / 8,

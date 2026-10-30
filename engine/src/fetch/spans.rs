@@ -21,7 +21,7 @@
 
 use std::ops::Range;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -93,12 +93,15 @@ impl Claim {
 /// the seat's worker, which writes. The lock is held for a few instructions
 /// at a time, never across an `.await`. `ready` wakes the worker when the
 /// coordinator gives it work; `got` counts the bytes the seat has received
-/// over all its claims, as each piece arrives, for its speed.
+/// over all its claims, as each piece arrives, for its speed. `retire` tells
+/// the worker to end once its claim is done, its link holding more
+/// connections than it is wanted to.
 #[derive(Debug, Default)]
 pub(crate) struct Hand {
     pub claim: Mutex<Claim>,
     pub ready: Notify,
     pub got: AtomicU64,
+    pub retire: AtomicBool,
 }
 
 /// The least either side of a cut keeps when the owner's speed is known.

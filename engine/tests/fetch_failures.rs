@@ -226,7 +226,7 @@ async fn with_one_connection_a_failure_rests_the_link() {
     let links = both();
     let file = busy().cut(ETHERNET, 256 * KIB, 1);
     let alone = DownloadConfig {
-        workers_per_link: 1,
+        most_per_link: 1,
         ..failing()
     };
     let (_server, dir, downloads, id) = start_with("one-each.bin", file, &links, alone).await;
@@ -482,11 +482,21 @@ async fn a_short_retry_after_is_waited_out() {
     );
 }
 
+/// [`failing`], rebalanced every 100 ms: a link that should hold no
+/// connections is offered one many times over before the download ends.
+fn rebalancing() -> DownloadConfig {
+    DownloadConfig {
+        rebalance_every: ms(100),
+        ..failing()
+    }
+}
+
 #[tokio::test]
 async fn a_long_retry_after_leaves_the_link_out() {
     let links = both();
     let file = busy().refuse(ETHERNET, None, Some("3311"));
-    let (server, dir, downloads, id) = start_with("long-wait.bin", file, &links, failing()).await;
+    let (server, dir, downloads, id) =
+        start_with("long-wait.bin", file, &links, rebalancing()).await;
 
     let end = ended(&downloads, id).await;
     assert_eq!(end.phase, Phase::Done, "{end:?}");
@@ -499,10 +509,34 @@ async fn a_long_retry_after_leaves_the_link_out() {
         Some("sits out: the server asked this cable to wait 55 min 11 s, longer than 1 min")
     );
     assert_eq!(share(&end, "Wi-Fi").bytes, LENGTH);
-    // Its four refused connections, and none after.
+    // Its four refused connections, and none after, however often the
+    // connections were shared out again.
     let seen = server.seen();
     assert_eq!(ethernet_pieces(&seen).len(), 4);
     assert_eq!(refused(&seen).len(), 4);
+}
+
+/// An answer that cannot be used ends its connection and nothing takes its
+/// place: a link whose every answer is a 400 is not asked again, however
+/// often the connections are shared out, and the others finish the file.
+#[tokio::test]
+async fn a_link_whose_answers_cannot_be_used_is_not_asked_again() {
+    let links = both();
+    let file = busy().refuse_with(ETHERNET, None, 400, None);
+    let (server, dir, downloads, id) =
+        start_with("bad-request.bin", file, &links, rebalancing()).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("bad-request.bin"), LENGTH);
+    let ethernet = share(&end, "Ethernet 2");
+    assert_eq!(ethernet.bytes, 0);
+    assert_eq!(
+        ethernet.note.as_deref(),
+        Some("the server answered 400 Bad Request to a request for a piece")
+    );
+    assert_eq!(ethernet.wanted, 0, "{ethernet:?}");
+    assert_eq!(ethernet_pieces(&server.seen()).len(), 4);
 }
 
 /// With no wait named, a refused last connection is a link failing.

@@ -174,10 +174,14 @@ impl Worker {
     }
 
     /// What to ask for next: what its claim has not written yet, once the
-    /// coordinator has given it one. `None` once the link is told to stop.
+    /// coordinator has given it one. `None` once the link is told to stop,
+    /// or this connection to retire.
     async fn next(&mut self) -> Option<Range<u64>> {
         let hand = self.hand.clone();
         loop {
+            if hand.retire.load(Ordering::SeqCst) {
+                return None;
+            }
             let left = {
                 let claim = hand.claim.lock().unwrap();
                 (!claim.is_done()).then_some(claim.reserved..claim.end)

@@ -133,8 +133,21 @@ async fn a_short_or_overlong_answer_writes_only_what_was_asked() {
     let end = ended(&downloads, id).await;
     assert_eq!(end.phase, Phase::Done, "{end:?}");
     assert_same(&dir.read("short.bin"), length);
+    // Only the bytes still missing are asked for again: no request starts
+    // where another did, so none asks again from the top of its part. What
+    // the server sent is at least the file; past a cut it also sent what was
+    // already on its way (phase 4, Task 1), more on a loaded machine.
     let seen = server.seen();
-    assert_eq!(served(&seen, WIFI) + served(&seen, ETHERNET), length);
+    let starts: Vec<u64> = seen
+        .iter()
+        .filter(|s| !is_probe(s))
+        .filter_map(|s| Some(s.asked()?.0))
+        .collect();
+    let mut distinct = starts.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), starts.len(), "{starts:?}");
+    assert!(served(&seen, WIFI) + served(&seen, ETHERNET) >= length);
     assert_eq!(end.links.iter().map(|l| l.bytes).sum::<u64>(), length);
 
     let long = File::new(length).past_the_range();

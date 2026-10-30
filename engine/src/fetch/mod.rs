@@ -11,6 +11,7 @@
 //! | `ranges` | [`Ranges`]: the bytes done (pure) |
 //! | `spans` | one connection's part of the file, and where to cut one (pure) |
 //! | `rate` | a speed that follows a change in seconds (pure) |
+//! | `schedule` | paths, and how many connections each link holds (pure) |
 //! | `name` | [`file_name`], [`free_name`]: safe names, never one taken |
 //! | `remote` | [`find`]: what one link sees at the URL; [`retry_after`] |
 //! | `disk` | the `.part`: full size at once, written at offsets, named last; the Downloads folder |
@@ -27,6 +28,7 @@ pub mod ranges;
 mod rate;
 pub mod remote;
 mod saved;
+mod schedule;
 mod spans;
 mod worker;
 
@@ -144,8 +146,13 @@ impl std::error::Error for ControlError {}
 /// How downloads run. Tests shrink the times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadConfig {
-    /// Connections each link opens for one download.
-    pub workers_per_link: u32,
+    /// The most connections one download holds over every link, shared out
+    /// by what each delivers (schedule.rs).
+    pub connections: u32,
+    /// The most one link holds for one download.
+    pub most_per_link: u32,
+    /// How often each link's connections move one toward its share.
+    pub rebalance_every: Duration,
     /// How long a connection may go without data before it is given up.
     pub read_deadline: Duration,
     /// How long one link may take to find the file, redirects and all.
@@ -184,7 +191,9 @@ pub struct DownloadConfig {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            workers_per_link: 4,
+            connections: 16,
+            most_per_link: 8,
+            rebalance_every: Duration::from_secs(2),
             read_deadline: Duration::from_secs(8),
             // Several round trips per hop, and the tether's reached 934 ms.
             find_deadline: Duration::from_secs(20),
@@ -261,10 +270,13 @@ pub struct LinkShare {
     pub name: String,
     /// Bytes this link wrote to the file.
     pub bytes: u64,
-    /// Its speed over the last speed window, 0 unless downloading.
+    /// Its speed in this download (rate.rs), 0 unless downloading.
     pub bps: u64,
     /// Its connections open for this download right now.
     pub connections: u32,
+    /// The connections the download wants it to hold, by what it delivers
+    /// (schedule.rs): `connections` moves toward this one at a time.
+    pub wanted: u32,
     pub note: Option<String>,
 }
 

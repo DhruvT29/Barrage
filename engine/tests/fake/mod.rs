@@ -51,6 +51,8 @@ pub struct Fake {
     /// Scripted speed test results and how long each takes, in order; the
     /// last repeats. Empty means `SAMPLED_BPS` after `sample_time`.
     sample_answers: Mutex<VecDeque<(u64, Duration)>>,
+    /// Speed test results by address, ahead of `sample_answers`.
+    speeds: HashMap<IpAddr, u64>,
     /// Public addresses per local address, in order; the last repeats. An
     /// address with none scripted reports itself, so no two links share.
     publics: Mutex<HashMap<IpAddr, VecDeque<Option<IpAddr>>>>,
@@ -159,6 +161,12 @@ impl Fake {
         self
     }
 
+    /// Every speed test through `ip` measures `bps`, after `sample_time`.
+    pub fn speed(mut self, ip: &str, bps: u64) -> Self {
+        self.speeds.insert(ip.parse().unwrap(), bps);
+        self
+    }
+
     /// Speed test results and durations, in order; the last repeats.
     pub fn sample_answers(self, answers: &[(u64, Duration)]) -> Self {
         *self.sample_answers.lock().unwrap() = answers.iter().copied().collect();
@@ -264,12 +272,15 @@ impl Network for Fake {
         self.samples.fetch_add(1, Ordering::SeqCst);
         self.sampled_through.lock().unwrap().push(addr);
         let fail = self.failing_samples.contains(&addr);
-        let (bps, takes) = {
-            let mut answers = self.sample_answers.lock().unwrap();
-            match answers.len() {
-                0 => (SAMPLED_BPS, self.sample_time),
-                1 => *answers.front().unwrap(),
-                _ => answers.pop_front().unwrap(),
+        let (bps, takes) = match self.speeds.get(&addr) {
+            Some(&bps) => (bps, self.sample_time),
+            None => {
+                let mut answers = self.sample_answers.lock().unwrap();
+                match answers.len() {
+                    0 => (SAMPLED_BPS, self.sample_time),
+                    1 => *answers.front().unwrap(),
+                    _ => answers.pop_front().unwrap(),
+                }
             }
         };
         async move {
