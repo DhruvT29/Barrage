@@ -212,7 +212,14 @@ async fn a_rested_link_that_works_again_gets_its_connections_back() {
         .iter()
         .filter_map(|(_, s)| ethernet_in(s))
         .find(|l| l.connections == 4)
-        .expect("Ethernet 2 never got its four connections back");
+        .unwrap_or_else(|| {
+            let seen: Vec<_> = history[rested..]
+                .iter()
+                .filter_map(|(_, s)| ethernet_in(s))
+                .map(|l| (l.connections, l.wanted, l.note.clone()))
+                .collect();
+            panic!("Ethernet 2 never got its four connections back: {seen:?}")
+        });
     // As soon as the trying connection received bytes, not once it had
     // fetched its whole 4 MiB chunk.
     assert!(back.bytes < 4 * MIB, "{back:?}");

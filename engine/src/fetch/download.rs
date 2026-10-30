@@ -123,7 +123,7 @@ use super::{
     wait_words,
 };
 use crate::links::watch::LinkTable;
-use crate::links::{Link, LinkId};
+use crate::links::{Link, LinkId, LinkState};
 
 /// The download's note when the server sends the file only whole.
 const ONLY_WHOLE: &str = "the server sends this file only whole, not in pieces, so it comes \
@@ -299,9 +299,17 @@ struct Member {
     /// The note it sits out with, behind the cable that carries its internet
     /// connection (`paths`); none while it is not behind one.
     behind: Option<String>,
-    /// It has stopped sitting out behind another cable since the last
-    /// rebalance: it takes the path over with all it is wanted at once.
-    took_over: bool,
+    /// The most it might hold at the last retarget: 0 while it is not
+    /// taking part, 1 while it is degraded or tries after a rest.
+    allowed: u32,
+    /// Allowed more than before, until then its weight is unknown, counted as
+    /// the others' average, while its speed starts again from what it carries
+    /// now.
+    unweighed_until: Option<Instant>,
+    /// It may hold more than a moment ago (it took a path over, was trusted
+    /// again, or its trial or ceiling ended): the next rebalance gives it all
+    /// it is wanted at once, as a link joining is given.
+    at_once: bool,
 }
 
 /// The file once a link has found it.
@@ -671,7 +679,9 @@ impl Download {
                         wanted: 0,
                         ceiling: None,
                         behind: None,
-                        took_over: false,
+                        allowed: 0,
+                        unweighed_until: None,
+                        at_once: false,
                     });
                     self.join(link.id);
                 }
@@ -993,19 +1003,46 @@ impl Download {
     /// Each link's share of the download's connections, by what its path
     /// delivers (schedule.rs). Its target moves only by two or more; what it
     /// is wanted to hold is that within its ceiling, one while it tries after
-    /// a rest, and none while it rests or is gone. A link still finding the
-    /// file counts already, so the first to find it starts with its own
-    /// share, not every connection a link may hold. A cable on the same
-    /// internet connection as the one carrying it holds none, and says so.
+    /// a rest or is degraded, and none while it rests or is gone. A link
+    /// still finding the file counts already, so the first to find it starts
+    /// with its own share, not every connection a link may hold. A cable on
+    /// the same internet connection as the one carrying it holds none, and
+    /// says so.
     fn retarget(&mut self) {
         let config = &self.job.config;
         let now = Instant::now();
+        // Back from down and not trusted yet: if it drops again, it takes one
+        // connection's part with it, not a full share.
+        let degraded = |id: LinkId| {
+            self.links
+                .iter()
+                .any(|l| l.id == id && l.state == LinkState::Degraded)
+        };
         let taking: HashMap<LinkId, u32> = self
             .members
             .iter()
             .filter(|m| m.present && m.resting.is_none() && (m.agrees || m.finding))
-            .map(|m| (m.id, most_of(m, config.most_per_link)))
+            .map(|m| {
+                let most = most_of(m, config.most_per_link);
+                (m.id, if degraded(m.id) { most.min(1) } else { most })
+            })
             .collect();
+        // A link allowed more than a moment ago: what it carried held to less
+        // says nothing of what it carries now (when a server limits each
+        // connection, a link held to one carries a quarter as much and would
+        // be wanted too few to grow). Its speed starts again, and for a
+        // `rebalance_every` its weight is unknown, the others' average: not
+        // its speed test, one connection's figure, against what the others
+        // carry on all of theirs.
+        for member in &mut self.members {
+            let most = taking.get(&member.id).copied().unwrap_or(0);
+            if member.allowed > 0 && most > member.allowed {
+                member.rate = Rate::default();
+                member.unweighed_until = Some(now + config.rebalance_every);
+                member.at_once = true;
+            }
+            member.allowed = most;
+        }
         // A link held to none cannot carry a path, so another cable on its
         // connection does.
         let paths: Vec<Path> = paths(&self.links, |id| {
@@ -1066,7 +1103,7 @@ impl Download {
                         if member.note.as_ref() == Some(&note) {
                             member.note = None;
                         }
-                        member.took_over = true;
+                        member.at_once = true;
                     }
                 }
             }
@@ -1075,13 +1112,20 @@ impl Download {
 
     /// What `path` weighs: what its links carried in this download once one
     /// has carried for a `rebalance_every`; before, the cable's speed test,
-    /// one connection's figure and so a floor; else 0, unknown.
+    /// one connection's figure and so a floor; else 0, unknown. Unknown too
+    /// while a link on it was just allowed more (`unweighed_until`).
     fn weight(&self, path: &Path, now: Instant) -> u64 {
         let members: Vec<&Member> = path
             .links
             .iter()
             .filter_map(|id| self.members.iter().find(|m| m.id == *id))
             .collect();
+        if members
+            .iter()
+            .any(|m| m.unweighed_until.is_some_and(|until| now < until))
+        {
+            return 0;
+        }
         let carried = members.iter().any(|m| {
             m.carrying_since
                 .is_some_and(|since| now.duration_since(since) >= self.job.config.rebalance_every)
@@ -1099,9 +1143,9 @@ impl Download {
     /// Move each link one connection toward what it is wanted to hold: one
     /// more, while the download's `connections` allow, or the one with least
     /// left of its claim retires. A link with one still retiring waits for it
-    /// to end, so its count never moves by two at once. A cable taking a path
-    /// over from one that left starts with all it is wanted at once, as a
-    /// link joining does.
+    /// to end, so its count never moves by two at once. A link allowed more
+    /// than before (taking a path over, trusted again) starts with all it is
+    /// wanted at once, as a link joining does.
     fn rebalance(&mut self) {
         self.rebalanced_at = Instant::now();
         if !matches!(
@@ -1119,12 +1163,12 @@ impl Download {
             .iter()
             .filter(|m| m.present)
             .filter(|m| !self.seats.values().any(|s| s.link == m.id && s.retiring))
-            .map(|m| (m.id, self.holding(m.id), m.wanted, m.took_over))
+            .map(|m| (m.id, self.holding(m.id), m.wanted, m.at_once))
             .collect();
         for member in &mut self.members {
-            member.took_over = false;
+            member.at_once = false;
         }
-        for (link, holding, wanted, took_over) in moves {
+        for (link, holding, wanted, at_once) in moves {
             if holding > wanted {
                 let leaving = self
                     .seats
@@ -1136,7 +1180,7 @@ impl Download {
                     self.retire(seat);
                 }
             } else if holding < wanted {
-                self.add_workers(link, if took_over { usize::MAX } else { 1 });
+                self.add_workers(link, if at_once { usize::MAX } else { 1 });
             }
         }
         self.hand_out();

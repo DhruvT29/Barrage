@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use barrage::LinkHandle;
 use barrage::fetch::{DownloadConfig, DownloadStatus, Phase};
-use barrage::links::watch::WatchConfig;
+use barrage::links::LinkState;
+use barrage::links::probe::ProbeVerdict;
+use barrage::links::watch::{LinkTable, WatchConfig};
 use fake::{Fake, cand_idx, ms};
 use fetching::*;
 use serve::File;
@@ -456,5 +458,212 @@ async fn an_address_not_taking_part_keeps_its_own_note() {
     assert!(
         notes.iter().any(|n| n.is_some_and(|n| n.contains("400"))),
         "{notes:?}"
+    );
+}
+
+/// The Wi-Fi and Ethernet 2, the Ethernet's probe answer set by the test
+/// through the returned switch; probed every 50 ms, a failure retried after
+/// 50 ms, trusted again after `cooldown`.
+fn switchable(cooldown: Duration) -> (LinkHandle, fake::Switch) {
+    // Each speed test one connection's figure, as a real one is: about the
+    // 256 KiB/s the tests below serve each connection.
+    let (net, probe) = two_links()
+        .speed(WIFI, 2_000_000)
+        .speed(ETHERNET, 2_000_000)
+        .loopback_links()
+        .switched(ETHERNET);
+    let watch = WatchConfig {
+        reprobe: ms(50),
+        retry: ms(50),
+        cooldown,
+        ..WatchConfig::every(ms(20))
+    };
+    (LinkHandle::start_with(Arc::new(net), watch).unwrap(), probe)
+}
+
+/// The Ethernet's state as it changed, with when, `None` while it is not in
+/// the table.
+type States = Vec<(tokio::time::Instant, Option<LinkState>)>;
+
+/// The Ethernet's state in every table the watcher publishes, with when it
+/// was seen, until `stop` is set.
+fn record_states(
+    mut table: LinkTable,
+) -> (tokio::task::JoinHandle<States>, Arc<tokio::sync::Notify>) {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stopped = stop.clone();
+    let task = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        loop {
+            let state = table
+                .latest()
+                .iter()
+                .find(|l| l.name == "Ethernet 2")
+                .map(|l| l.state);
+            if seen.last().map(|(_, s)| *s) != Some(state) {
+                seen.push((tokio::time::Instant::now(), state));
+            }
+            tokio::select! {
+                open = table.changed() => if !open { return seen },
+                () = stopped.notified() => return seen,
+            }
+        }
+    });
+    (task, stop)
+}
+
+async fn ethernet_is(links: &LinkHandle, state: LinkState) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let table = links.table().latest();
+        if table
+            .iter()
+            .any(|l| l.name == "Ethernet 2" && l.state == state)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Ethernet 2 never {state:?}: {table:?}"
+        );
+        tokio::time::sleep(ms(10)).await;
+    }
+}
+
+/// The Ethernet's connections from before it went down have ended.
+async fn ethernet_holds_none(
+    downloads: &barrage::fetch::Downloads,
+    id: barrage::fetch::DownloadId,
+) {
+    wait_for(downloads, id, "the Ethernet's connections to end", |s| {
+        s.links
+            .iter()
+            .filter(|l| l.name == "Ethernet 2")
+            .all(|l| l.connections == 0)
+    })
+    .await;
+}
+
+/// The Ethernet stops answering mid-download and answers again once its
+/// connections have ended: while it is degraded it holds one connection at
+/// most, and once trusted, more. At 256 KiB/s a connection, so the file
+/// outlasts the cooldown without moving many bytes through a test build.
+#[tokio::test]
+async fn a_link_back_from_down_holds_one_connection_until_trusted() {
+    let (links, probe) = switchable(Duration::from_secs(1));
+    let (states, stop) = record_states(links.table());
+    const LENGTH: u64 = 10 * MIB;
+    let file = File::new(LENGTH).rate(256 * KIB);
+    let (_server, dir, downloads, id) = start_with("degraded.bin", file, &links, quick()).await;
+    let history = record(&downloads, id);
+
+    wait_for(&downloads, id, "the Ethernet carrying", |s| {
+        s.links
+            .iter()
+            .any(|l| l.name == "Ethernet 2" && l.bytes >= MIB / 2)
+    })
+    .await;
+    probe.set(ProbeVerdict::Broken);
+    ethernet_is(&links, LinkState::Down).await;
+    ethernet_holds_none(&downloads, id).await;
+    probe.set(ProbeVerdict::Working);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("degraded.bin"), LENGTH);
+    stop.notify_one();
+    let states = states.await.unwrap();
+    // The first time it is degraded, and the first time it is up after.
+    let when = |state, after: tokio::time::Instant| {
+        states
+            .iter()
+            .find(|(at, s)| *s == Some(state) && *at > after)
+            .map(|(at, _)| *at)
+            .unwrap_or_else(|| panic!("never {state:?}: {states:?}"))
+    };
+    let degraded = when(LinkState::Degraded, states[0].0 - ms(1));
+    let up = when(LinkState::Up, degraded);
+    let history = history.await.unwrap();
+    let ethernet = |from: tokio::time::Instant, to: tokio::time::Instant| {
+        history
+            .iter()
+            .filter(move |(at, _)| *at > from && *at < to)
+            .filter_map(|(_, s)| s.links.iter().find(|l| l.name == "Ethernet 2"))
+    };
+    // Judged a little inside each window, so a status the download published
+    // just before the table showed the change is not counted against it.
+    let margin = ms(50);
+    let while_degraded: Vec<(u32, u32)> = ethernet(degraded + margin, up - margin)
+        .map(|l| (l.connections, l.wanted))
+        .collect();
+    assert!(
+        while_degraded.iter().all(|&(c, w)| c <= 1 && w <= 1),
+        "{while_degraded:?}"
+    );
+    assert!(
+        while_degraded.iter().any(|&(c, _)| c == 1),
+        "it never took part while degraded: {while_degraded:?}"
+    );
+    // Trusted, it takes its whole share at once, as a link joining does,
+    // not one connection a rebalance.
+    let after: Vec<u32> = ethernet(up, tokio::time::Instant::now())
+        .map(|l| l.connections)
+        .collect();
+    assert_eq!(after.iter().find(|&&n| n > 1), Some(&4), "{after:?}");
+    // And keeps it: what it carried held to one connection does not weigh it
+    // once trusted. Both links are served alike a connection, so it is
+    // wanted as many as the Wi-Fi again; on a loaded machine one link's
+    // figure dips for a moment, so a moment at 2 is allowed, never 1.
+    let settled: Vec<u32> = ethernet(up + ms(500), tokio::time::Instant::now())
+        .filter(|l| l.connections > 0)
+        .map(|l| l.wanted)
+        .collect();
+    assert!(settled.contains(&4), "{settled:?}");
+    assert!(settled.iter().all(|&n| n >= 2), "{settled:?}");
+}
+
+/// The Ethernet down and back four times, inside one long cooldown: each
+/// return costs it a request or two, not a connection's worth each. At
+/// 256 KiB/s a connection, as above.
+#[tokio::test]
+async fn a_link_flapping_costs_a_request_or_two_per_return() {
+    let (links, probe) = switchable(Duration::from_secs(60));
+    const LENGTH: u64 = 10 * MIB;
+    let file = File::new(LENGTH).rate(256 * KIB);
+    let (server, dir, downloads, id) = start_with("flapping.bin", file, &links, quick()).await;
+
+    wait_for(&downloads, id, "the Ethernet carrying", |s| {
+        s.links
+            .iter()
+            .any(|l| l.name == "Ethernet 2" && l.bytes >= MIB / 2)
+    })
+    .await;
+    const RETURNS: usize = 4;
+    let mut before = 0;
+    for round in 0..RETURNS {
+        probe.set(ProbeVerdict::Broken);
+        ethernet_is(&links, LinkState::Down).await;
+        ethernet_holds_none(&downloads, id).await;
+        if round == 0 {
+            before = pieces_through(&server.seen(), ETHERNET);
+        }
+        probe.set(ProbeVerdict::Working);
+        ethernet_is(&links, LinkState::Degraded).await;
+        wait_for(&downloads, id, "the Ethernet back with a connection", |s| {
+            s.links
+                .iter()
+                .any(|l| l.name == "Ethernet 2" && l.connections == 1)
+        })
+        .await;
+        tokio::time::sleep(ms(200)).await;
+    }
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("flapping.bin"), LENGTH);
+    let since = pieces_through(&server.seen(), ETHERNET) - before;
+    assert!(
+        since <= 2 * RETURNS,
+        "{since} piece requests over {RETURNS} returns"
     );
 }
