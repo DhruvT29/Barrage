@@ -62,6 +62,7 @@ function link(id: number, name: string): LinkView {
     rtt_ms: 40,
     down_bps: 57_600_000,
     public_ip: '203.0.113.7',
+    metered: false,
   }
 }
 
@@ -127,9 +128,10 @@ const RUNNING: DownloadsView = {
       done: 300,
       bps: 1_000_000,
       note: null,
-      cables: [{ name: 'Wi-Fi', bytes: 300, bps: 1_000_000, connections: 4, notes: [] }],
+      cables: [{ name: 'Wi-Fi', bytes: 300, bps: 1_000_000, connections: 4, wanted: 4, notes: [] }],
     },
   ],
+  used: [{ cable: 'Wi-Fi', bytes: 300 }],
 }
 
 test('a downloads message replaces the downloads, and leaves the table and the feed alone', () => {
@@ -139,8 +141,8 @@ test('a downloads message replaces the downloads, and leaves the table and the f
   e.last().send({ type: 'change', table: table(link(1, 'Wi-Fi')), lines: ['a line'] })
   const { table: before, feed } = result.current
 
-  e.last().send({ type: 'downloads', downloads: { live: { bps: 0, parts: [] }, list: [] } })
-  expect(result.current.downloads).toEqual({ live: { bps: 0, parts: [] }, list: [] })
+  e.last().send({ type: 'downloads', downloads: { live: { bps: 0, parts: [] }, list: [], used: [] } })
+  expect(result.current.downloads).toEqual({ live: { bps: 0, parts: [] }, list: [], used: [] })
   e.last().send({ type: 'downloads', downloads: RUNNING })
   expect(result.current.downloads).toEqual(RUNNING)
 

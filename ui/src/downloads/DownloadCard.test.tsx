@@ -5,7 +5,7 @@ import type { CableShare, DownloadState, DownloadView } from '../api/types'
 import { DownloadCard } from './DownloadCard'
 
 function cable(name: string, fields: Partial<CableShare> = {}): CableShare {
-  return { name, bytes: 0, bps: 0, connections: 0, notes: [], ...fields }
+  return { name, bytes: 0, bps: 0, connections: 0, wanted: 0, notes: [], ...fields }
 }
 
 function download(fields: Partial<DownloadView> = {}): DownloadView {

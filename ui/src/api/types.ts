@@ -20,6 +20,8 @@ export interface LinkView {
   /** The cable's measured speed in bits per second; null until measured, never 0 for unknown. */
   down_bps: number | null
   public_ip: string | null
+  /** Whether Windows says the connection it is on is metered. */
+  metered: boolean
 }
 
 /** The whole table, in the order links appeared. */
@@ -63,6 +65,14 @@ export interface DownloadsView {
   live: LiveSpeed
   /** In the order they were added. */
   list: DownloadView[]
+  /** What each cable has received for every download since the engine started, written or not, in the order cables first carried. */
+  used: UseView[]
+}
+
+/** The data one cable has received, in bytes. */
+export interface UseView {
+  cable: string
+  bytes: number
 }
 
 /** What the downloads that are downloading fetch right now, all together. */
@@ -104,6 +114,8 @@ export interface CableShare {
   /** In bits per second, 0 unless downloading. */
   bps: number
   connections: number
+  /** The connections the download wants it to hold, by what it delivers: `connections` moves toward it one at a time. */
+  wanted: number
   /** Each of its addresses' notes, each said once. */
   notes: string[]
 }

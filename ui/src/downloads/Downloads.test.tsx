@@ -28,7 +28,7 @@ function engine(...answers: Answer[]) {
   return asked
 }
 
-const NOTHING: DownloadsView = { live: { bps: 0, parts: [] }, list: [] }
+const NOTHING: DownloadsView = { live: { bps: 0, parts: [] }, list: [], used: [] }
 
 function download(id: number, name: string): DownloadView {
   return {

@@ -15,6 +15,7 @@ function link(address: string, fields: Partial<LinkView> = {}): LinkView {
     rtt_ms: 40,
     down_bps: 57_600_000,
     public_ip: '203.0.113.7',
+    metered: false,
     ...fields,
   }
 }

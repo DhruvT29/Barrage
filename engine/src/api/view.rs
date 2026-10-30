@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 
-use crate::fetch::{DownloadStatus, LinkShare, Phase};
+use crate::fetch::{CableUse, DownloadStatus, LinkShare, Phase};
 use crate::links::render::{cable_speed, cables_in_order, changes, state_word};
 use crate::links::{Link, LinkState, shared_connections, shared_upstreams};
 
@@ -29,6 +29,8 @@ pub struct LinkView {
     /// The cable's measured speed, in bits per second.
     pub down_bps: Option<u64>,
     pub public_ip: Option<String>,
+    /// Whether Windows says the connection it is on is metered.
+    pub metered: bool,
 }
 
 /// The whole table, in the order links appeared.
@@ -85,6 +87,16 @@ pub struct DownloadsView {
     pub live: LiveSpeed,
     /// In the order they were added.
     pub list: Vec<DownloadView>,
+    /// What each cable has received for every download since the engine
+    /// started, written or not, in the order cables first carried.
+    pub used: Vec<UseView>,
+}
+
+/// The data one cable has received.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UseView {
+    pub cable: String,
+    pub bytes: u64,
 }
 
 /// The live download speed: what the downloads that are downloading are
@@ -137,6 +149,9 @@ pub struct CableShare {
     pub bps: u64,
     /// Connections open for this download right now.
     pub connections: u32,
+    /// The connections the download wants it to hold, by what it delivers:
+    /// `connections` moves toward it one at a time.
+    pub wanted: u32,
     /// Each of its addresses' notes, in order, each said once.
     pub notes: Vec<String>,
 }
@@ -273,10 +288,11 @@ fn link_view(link: &Link) -> LinkView {
         rtt_ms: link.rtt.map(|rtt| rtt.as_millis() as u64),
         down_bps: link.down_bps,
         public_ip: link.public_ip.map(|ip| ip.to_string()),
+        metered: link.metered,
     }
 }
 
-pub fn downloads_view(all: &[DownloadStatus]) -> DownloadsView {
+pub fn downloads_view(all: &[DownloadStatus], used: &[CableUse]) -> DownloadsView {
     let list: Vec<DownloadView> = all.iter().map(download_view).collect();
 
     let mut parts: Vec<SpeedPart> = Vec::new();
@@ -302,6 +318,13 @@ pub fn downloads_view(all: &[DownloadStatus]) -> DownloadsView {
             parts,
         },
         list,
+        used: used
+            .iter()
+            .map(|u| UseView {
+                cable: u.cable.clone(),
+                bytes: u.bytes,
+            })
+            .collect(),
     }
 }
 
@@ -343,6 +366,7 @@ fn cable_shares(links: &[LinkShare]) -> Vec<CableShare> {
                     bytes: 0,
                     bps: 0,
                     connections: 0,
+                    wanted: 0,
                     notes: Vec::new(),
                 });
                 cables.len() - 1
@@ -352,6 +376,7 @@ fn cable_shares(links: &[LinkShare]) -> Vec<CableShare> {
         cable.bytes += link.bytes;
         cable.bps += link.bps;
         cable.connections += link.connections;
+        cable.wanted += link.wanted;
         if let Some(note) = &link.note
             && !cable.notes.contains(note)
         {
@@ -409,7 +434,7 @@ mod tests {
                 "links": [{
                     "id": 1, "name": "Wi-Fi", "address": "192.0.2.10", "family": "ipv4",
                     "state": "up", "rtt_ms": 40, "down_bps": 57600000,
-                    "public_ip": "203.0.113.7"
+                    "public_ip": "203.0.113.7", "metered": false
                 }],
                 "shared": [],
                 "connections": [],
@@ -488,7 +513,7 @@ mod tests {
         assert!(change["lines"].is_array());
 
         let downloads = serde_json::to_value(LiveMessage::Downloads {
-            downloads: downloads_view(&[download(1, Phase::Starting, vec![])]),
+            downloads: downloads_view(&[download(1, Phase::Starting, vec![])], &[]),
         })
         .unwrap();
         assert_eq!(downloads["type"], "downloads");
@@ -840,14 +865,93 @@ mod tests {
         }
     }
 
+    /// Wanting what it holds, as `share` does.
     fn cable(name: &str, bytes: u64, bps: u64, connections: u32, notes: &[&str]) -> CableShare {
         CableShare {
             name: name.to_string(),
             bytes,
             bps,
             connections,
+            wanted: connections,
             notes: notes.iter().map(|n| n.to_string()).collect(),
         }
+    }
+
+    /// A Windows "Set as metered" tether, a cable growing toward more
+    /// connections than it holds, and what each cable has received.
+    #[test]
+    fn metered_used_and_wanted_become_the_json_the_ui_reads() {
+        let tether = Link {
+            metered: true,
+            ..up(
+                4,
+                "Ethernet 3",
+                "198.51.100.30",
+                48,
+                41_000_000,
+                "203.0.113.9",
+            )
+        };
+        assert_eq!(json_of(&[tether])["links"][0]["metered"], true);
+
+        let growing = download(
+            1,
+            Phase::Downloading,
+            vec![LinkShare {
+                wanted: 6,
+                ..share(1, "Wi-Fi", 3_000_000, 20_000_000, 4, None)
+            }],
+        );
+        let used = [
+            CableUse {
+                cable: "Ethernet 3".to_string(),
+                bytes: 7_000_000,
+            },
+            CableUse {
+                cable: "Wi-Fi".to_string(),
+                bytes: 3_100_000,
+            },
+        ];
+        let json = serde_json::to_value(downloads_view(&[growing], &used)).unwrap();
+        assert_eq!(
+            json["list"][0]["cables"][0],
+            json!({
+                "name": "Wi-Fi", "bytes": 3000000, "bps": 20000000,
+                "connections": 4, "wanted": 6, "notes": []
+            })
+        );
+        assert_eq!(
+            json["used"],
+            json!([
+                { "cable": "Ethernet 3", "bytes": 7000000 },
+                { "cable": "Wi-Fi", "bytes": 3100000 }
+            ])
+        );
+    }
+
+    #[test]
+    fn a_cables_wanted_is_its_addresses_added_up() {
+        let status = download(
+            1,
+            Phase::Downloading,
+            vec![
+                LinkShare {
+                    wanted: 3,
+                    ..share(2, "Ethernet 2", 1, 1, 2, None)
+                },
+                LinkShare {
+                    wanted: 1,
+                    ..share(1, "Wi-Fi", 1, 1, 1, None)
+                },
+                LinkShare {
+                    wanted: 2,
+                    ..share(3, "Ethernet 2", 1, 1, 2, None)
+                },
+            ],
+        );
+        let cables = &downloads_view(&[status], &[]).list[0].cables;
+        let wanted: Vec<(&str, u32)> = cables.iter().map(|c| (c.name.as_str(), c.wanted)).collect();
+        assert_eq!(wanted, [("Ethernet 2", 5), ("Wi-Fi", 1)]);
     }
 
     fn speed(name: &str, bps: u64) -> SpeedPart {
@@ -890,7 +994,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            downloads_view(&[status]).list[0].cables,
+            downloads_view(&[status], &[]).list[0].cables,
             vec![
                 cable(
                     "Ethernet 2",
@@ -956,7 +1060,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            downloads_view(&all).live,
+            downloads_view(&all, &[]).live,
             LiveSpeed {
                 bps: 100_000_000,
                 parts: vec![speed("Wi-Fi", 30_000_000), speed("Ethernet 2", 70_000_000)],
@@ -975,7 +1079,7 @@ mod tests {
             (Phase::Stopped, "stopped"),
         ];
         for (phase, word) in phases {
-            let view = downloads_view(&[download(1, phase, vec![])]);
+            let view = downloads_view(&[download(1, phase, vec![])], &[]);
             assert_eq!(view.list[0].state, word);
         }
     }
@@ -1001,7 +1105,7 @@ mod tests {
             vec![share(1, "Wi-Fi", 400_000_000, 0, 0, None)],
         );
         assert_eq!(
-            serde_json::to_value(downloads_view(&[starting, done])).unwrap(),
+            serde_json::to_value(downloads_view(&[starting, done], &[])).unwrap(),
             json!({
                 "live": { "bps": 0, "parts": [] },
                 "list": [
@@ -1016,10 +1120,11 @@ mod tests {
                         "note": null,
                         "cables": [{
                             "name": "Wi-Fi", "bytes": 400000000, "bps": 0,
-                            "connections": 0, "notes": []
+                            "connections": 0, "wanted": 0, "notes": []
                         }]
                     }
-                ]
+                ],
+                "used": []
             })
         );
     }
@@ -1067,14 +1172,17 @@ mod tests {
                 141_000_000,
                 "2001:db8::20",
             ),
-            up(
-                4,
-                "Ethernet 3",
-                "198.51.100.30",
-                48,
-                41_000_000,
-                "203.0.113.7",
-            ),
+            Link {
+                metered: true,
+                ..up(
+                    4,
+                    "Ethernet 3",
+                    "198.51.100.30",
+                    48,
+                    41_000_000,
+                    "203.0.113.7",
+                )
+            },
             with_state(
                 up(
                     5,
@@ -1119,7 +1227,11 @@ mod tests {
             1,
             Phase::Downloading,
             vec![
-                share(1, "Wi-Fi", 1_210_000_000, 38_400_000, 4, None),
+                // Growing toward six.
+                LinkShare {
+                    wanted: 6,
+                    ..share(1, "Wi-Fi", 1_210_000_000, 38_400_000, 4, None)
+                },
                 share(2, "Ethernet 2", 905_000_000, 61_000_000, 4, None),
                 share(3, "Ethernet 2", 412_000_000, 27_500_000, 4, None),
                 share(4, "Ethernet 3", 0, 0, 0, Some(other)),
@@ -1179,6 +1291,21 @@ mod tests {
         vec![downloading, done, failed, waiting, starting, stopped]
     }
 
+    /// What the sample's cables received: a little over what they wrote, as
+    /// bytes past a cut count.
+    fn contract_used() -> Vec<CableUse> {
+        vec![
+            CableUse {
+                cable: "Wi-Fi".to_string(),
+                bytes: 1_326_100_000,
+            },
+            CableUse {
+                cable: "Ethernet 2".to_string(),
+                bytes: 1_858_200_000,
+            },
+        ]
+    }
+
     /// Fails when the engine's JSON changes and the page's copy does not,
     /// which is what made a renamed field leave both test suites green.
     /// The messages come in the order the socket sends them.
@@ -1190,7 +1317,7 @@ mod tests {
                 table: table_view(&before),
             },
             LiveMessage::Downloads {
-                downloads: downloads_view(&contract_downloads()),
+                downloads: downloads_view(&contract_downloads(), &contract_used()),
             },
             change_message(&before, &after),
         ];

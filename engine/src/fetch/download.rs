@@ -1776,6 +1776,9 @@ impl Download {
             links,
             note: self.note.clone(),
         };
+        // The data used first, so a page woken by the status reads a count
+        // no older than the bytes the status shows.
+        self.job.used.publish();
         // Every tick publishes, but only a change wakes the readers: a
         // download that is waiting or done would otherwise send each open
         // page the same status several times a second.
@@ -1792,7 +1795,6 @@ impl Download {
                     true
                 }
             });
-        self.job.used.publish();
     }
 }
 

@@ -269,6 +269,12 @@ pub const EVENT_CAPACITY: usize = 256;
 pub struct LinkTable(watch::Receiver<Vec<Link>>);
 
 impl LinkTable {
+    /// A table that follows `links`, for a test that sets them itself.
+    #[cfg(test)]
+    pub(crate) fn of(links: watch::Receiver<Vec<Link>>) -> Self {
+        Self(links)
+    }
+
     /// The links as of the watcher's last change, in the order they appeared.
     /// Copies out and returns at once; it never waits on the watcher.
     pub fn snapshot(&self) -> Vec<Link> {

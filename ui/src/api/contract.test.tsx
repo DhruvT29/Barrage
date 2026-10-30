@@ -155,3 +155,18 @@ test('the contract file renders on the Downloads tab too', () => {
     }
   }
 })
+
+// The page draws these from phase 4 on; the sample must keep sending one of
+// each, or the page's handling of them is never tried against the engine.
+test('the contract carries a metered cable, a cable wanting more than it holds, and the data used', () => {
+  const tables = messages.flatMap((m) => (m.type === 'downloads' ? [] : [m.table]))
+  expect(tables.some((t) => t.links.some((l) => l.metered))).toBe(true)
+  const { list, used } = lastDownloads(messages)
+  expect(list.some((d) => d.cables.some((c) => c.wanted > c.connections))).toBe(true)
+  // Each cable that wrote has received at least what it wrote, once.
+  expect(used.length).toBe(new Set(used.map((u) => u.cable)).size)
+  for (const u of used) {
+    const wrote = list.flatMap((d) => d.cables).filter((c) => c.name === u.cable)
+    expect(u.bytes).toBeGreaterThanOrEqual(wrote.reduce((sum, c) => sum + c.bytes, 0))
+  }
+})

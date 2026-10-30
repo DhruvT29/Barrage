@@ -30,7 +30,12 @@ addresses, and a notice when two connections reach the internet through the
 same one. **Downloads** takes a link to a file, which then comes down through
 every working connection at once; each download shows its progress, its speed
 and what each connection carried. A tethered phone's part comes out of its
-mobile data. Stop on a download saves what it has; Resume, or adding its link
+mobile data. The faster a connection delivers, the more of a download's
+connections it holds. Two cables that reach the internet through the same
+connection count as one: one carries and the other sits out, and a cable
+Windows calls metered is the one that sits out. A connection that drops and
+comes back holds a single connection until it has kept working for 30
+seconds. Stop on a download saves what it has; Resume, or adding its link
 again, carries on from there. Downloaded files carry the mark Windows gives a
 browser's downloads, so SmartScreen and Office treat them as from the
 internet. Across the top, both tabs show the combined speed available, or
