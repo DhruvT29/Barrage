@@ -539,6 +539,30 @@ async fn a_link_whose_answers_cannot_be_used_is_not_asked_again() {
     assert_eq!(ethernet_pieces(&server.seen()).len(), 4);
 }
 
+/// The same for an address the URL itself names that answers it is gone:
+/// gone for good, so nothing takes its connections' places however often
+/// the connections are shared out (Task 4 found the rebalance asking through
+/// it again).
+#[tokio::test]
+async fn an_address_gone_for_good_is_not_asked_again() {
+    let links = both();
+    let file = busy().refuse_with(ETHERNET, None, 403, None);
+    let (server, dir, downloads, id) =
+        start_with("forbidden.bin", file, &links, rebalancing()).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("forbidden.bin"), LENGTH);
+    let ethernet = share(&end, "Ethernet 2");
+    assert_eq!(ethernet.bytes, 0);
+    assert_eq!(
+        ethernet.note.as_deref(),
+        Some("the server answered 403 Forbidden to a request for a piece")
+    );
+    assert_eq!(ethernet.wanted, 0, "{ethernet:?}");
+    assert_eq!(ethernet_pieces(&server.seen()).len(), 4);
+}
+
 /// With no wait named, a refused last connection is a link failing.
 #[tokio::test]
 async fn a_last_refusal_without_a_wait_rests_like_a_failing_link() {

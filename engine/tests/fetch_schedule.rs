@@ -14,7 +14,7 @@ use std::time::Duration;
 use barrage::LinkHandle;
 use barrage::fetch::{DownloadConfig, DownloadStatus, Phase};
 use barrage::links::watch::WatchConfig;
-use fake::{Fake, ms};
+use fake::{Fake, cand_idx, ms};
 use fetching::*;
 use serve::File;
 
@@ -285,4 +285,176 @@ async fn a_server_ceiling_still_caps_a_link() {
     );
     let wifi: Vec<u32> = shares(&history, "Wi-Fi").map(|l| l.wanted).collect();
     assert!(wifi.iter().all(|&n| n == 4), "{wifi:?}");
+}
+
+/// The public address both cables show the internet below: the phone joined
+/// to the laptop's own Wi-Fi and tethered.
+const SHARED: &str = "198.51.100.7";
+
+const BEHIND_WIFI: &str = "sits out: it reaches the internet through the same connection as \
+                           Wi-Fi, so using both gains nothing";
+
+/// The Wi-Fi (40 Mbps) and Ethernet 2 (5 Mbps) behind one public address
+/// over `net`, once both are up, speed-tested and their public addresses
+/// known: a download sees them as one path from the start.
+async fn one_connection(net: Fake) -> LinkHandle {
+    behind_one(net, &[]).await
+}
+
+/// As [`one_connection`], with `more` addresses behind the same public
+/// address.
+async fn behind_one(net: Fake, more: &[&str]) -> LinkHandle {
+    let mut net = net
+        .speed(WIFI, 40_000_000)
+        .speed(ETHERNET, 5_000_000)
+        .public(WIFI, &[Some(SHARED)])
+        .public(ETHERNET, &[Some(SHARED)]);
+    for address in more {
+        net = net.public(address, &[Some(SHARED)]);
+    }
+    let net = Arc::new(net.loopback_links());
+    let links = LinkHandle::start_with(net, WatchConfig::every(ms(20))).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let table = links.table().latest();
+        let ready = |l: &&barrage::links::Link| {
+            l.state.is_usable() && l.down_bps.is_some() && l.public_ip.is_some()
+        };
+        if table.iter().filter(ready).count() == 2 + more.len() {
+            return links;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never ready: {table:?}"
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+}
+
+/// The pieces asked of the server through `source`, its probe aside.
+fn pieces_through(seen: &[serve::Seen], source: &str) -> usize {
+    seen.iter()
+        .filter(|s| s.source == ip(source) && !is_probe(s))
+        .count()
+}
+
+#[tokio::test]
+async fn a_cable_sharing_the_wifis_connection_sits_out() {
+    let links = one_connection(two_links()).await;
+    const LENGTH: u64 = 16 * MIB;
+    let file = File::new(LENGTH).rate(2 * MIB);
+    let (server, dir, downloads, id) = start_with("one-path.bin", file, &links, quick()).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("one-path.bin"), LENGTH);
+    let ethernet = share(&end, "Ethernet 2");
+    assert_eq!(ethernet.bytes, 0, "{end:?}");
+    assert_eq!(ethernet.note.as_deref(), Some(BEHIND_WIFI));
+    assert_eq!(share(&end, "Wi-Fi").bytes, LENGTH);
+    assert_eq!(pieces_through(&server.seen(), ETHERNET), 0);
+    let history = history.await.unwrap();
+    for (_, status) in &history {
+        if let Some(e) = status.links.iter().find(|l| l.name == "Ethernet 2") {
+            assert_eq!((e.connections, e.wanted), (0, 0), "{status:?}");
+        }
+    }
+    // The path's share is all the Wi-Fi's: as many as one link may hold.
+    let wifi: Vec<u32> = shares(&history, "Wi-Fi").map(|l| l.wanted).collect();
+    assert!(!wifi.is_empty() && wifi.iter().all(|&n| n == 4), "{wifi:?}");
+}
+
+/// The Wi-Fi goes mid-download: the Ethernet, on the same connection until
+/// then, carries the rest, starting with all it is wanted at once, as a link
+/// joining does, not one connection a rebalance (every 2 s here).
+#[tokio::test]
+async fn when_the_carrier_goes_the_other_cable_takes_over() {
+    let (net, live) = Fake::live(vec![wifi(), ethernet()]);
+    let links = one_connection(net).await;
+    const LENGTH: u64 = 24 * MIB;
+    let file = File::new(LENGTH).rate(MIB);
+    let (_server, dir, downloads, id) = start_with("takeover.bin", file, &links, config()).await;
+    let history = record(&downloads, id);
+
+    wait_for(&downloads, id, "4 MiB down", |s| s.done >= 4 * MIB).await;
+    live.set(vec![ethernet()]);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("takeover.bin"), LENGTH);
+    let ethernet = share(&end, "Ethernet 2");
+    assert!(ethernet.bytes > 0, "{end:?}");
+    assert!(share(&end, "Wi-Fi").bytes > 0, "{end:?}");
+    // No longer sitting out (a connection that failed on the way may leave
+    // a note of its own).
+    assert_ne!(ethernet.note.as_deref(), Some(BEHIND_WIFI));
+    let history = history.await.unwrap();
+    let first = history
+        .iter()
+        .filter_map(|(_, s)| s.links.iter().find(|l| l.name == "Ethernet 2"))
+        .map(|l| l.connections)
+        .find(|&n| n > 0);
+    assert_eq!(first, Some(4));
+}
+
+/// The server asks the Wi-Fi to wait 55 minutes: it sits the download out,
+/// and the Ethernet behind it carries the file rather than the download
+/// failing with nobody holding a connection.
+#[tokio::test]
+async fn a_carrier_the_server_turns_away_hands_its_path_over() {
+    let links = one_connection(two_links()).await;
+    const LENGTH: u64 = 16 * MIB;
+    let file = File::new(LENGTH)
+        .rate(2 * MIB)
+        .refuse(WIFI, None, Some("3311"));
+    let (_server, dir, downloads, id) = start_with("handed.bin", file, &links, quick()).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("handed.bin"), LENGTH);
+    let wifi = share(&end, "Wi-Fi");
+    assert_eq!(wifi.bytes, 0, "{end:?}");
+    assert_eq!(
+        wifi.note.as_deref(),
+        Some("sits out: the server asked this cable to wait 55 min 11 s, longer than 1 min")
+    );
+    let ethernet = share(&end, "Ethernet 2");
+    assert_eq!(ethernet.bytes, LENGTH, "{end:?}");
+    assert_ne!(ethernet.note.as_deref(), Some(BEHIND_WIFI));
+}
+
+/// A second address on the Ethernet that cannot find the file is not taking
+/// part, so it keeps its own note: only the addresses taking part sit out
+/// behind the Wi-Fi, and a note of their own is not lost when they stop.
+#[tokio::test]
+async fn an_address_not_taking_part_keeps_its_own_note() {
+    const SECOND: &str = "127.0.0.3";
+    let net = Fake::scripted(vec![vec![
+        wifi(),
+        ethernet(),
+        cand_idx(2, "Ethernet 2", SECOND, true),
+    ]]);
+    let links = behind_one(net, &[SECOND]).await;
+    const LENGTH: u64 = 16 * MIB;
+    let file = File::new(LENGTH)
+        .rate(2 * MIB)
+        .refuse_probe(SECOND, 99, 400, None);
+    let (_server, dir, downloads, id) = start_with("own-note.bin", file, &links, quick()).await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("own-note.bin"), LENGTH);
+    let notes: Vec<Option<&str>> = end
+        .links
+        .iter()
+        .filter(|l| l.name == "Ethernet 2")
+        .map(|l| l.note.as_deref())
+        .collect();
+    assert_eq!(notes.len(), 2, "{end:?}");
+    assert!(notes.contains(&Some(BEHIND_WIFI)), "{notes:?}");
+    assert!(
+        notes.iter().any(|n| n.is_some_and(|n| n.contains("400"))),
+        "{notes:?}"
+    );
 }

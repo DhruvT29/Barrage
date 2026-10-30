@@ -296,6 +296,12 @@ struct Member {
     /// it had left once an answer could not be used; none while it sits the
     /// download out. Until it works again after a wait.
     ceiling: Option<u32>,
+    /// The note it sits out with, behind the cable that carries its internet
+    /// connection (`paths`); none while it is not behind one.
+    behind: Option<String>,
+    /// It has stopped sitting out behind another cable since the last
+    /// rebalance: it takes the path over with all it is wanted at once.
+    took_over: bool,
 }
 
 /// The file once a link has found it.
@@ -664,6 +670,8 @@ impl Download {
                         target: 0,
                         wanted: 0,
                         ceiling: None,
+                        behind: None,
+                        took_over: false,
                     });
                     self.join(link.id);
                 }
@@ -987,7 +995,8 @@ impl Download {
     /// is wanted to hold is that within its ceiling, one while it tries after
     /// a rest, and none while it rests or is gone. A link still finding the
     /// file counts already, so the first to find it starts with its own
-    /// share, not every connection a link may hold.
+    /// share, not every connection a link may hold. A cable on the same
+    /// internet connection as the one carrying it holds none, and says so.
     fn retarget(&mut self) {
         let config = &self.job.config;
         let now = Instant::now();
@@ -997,13 +1006,18 @@ impl Download {
             .filter(|m| m.present && m.resting.is_none() && (m.agrees || m.finding))
             .map(|m| (m.id, most_of(m, config.most_per_link)))
             .collect();
-        let paths: Vec<Path> = paths(&self.links)
-            .into_iter()
-            .map(|mut path| {
-                path.links.retain(|id| taking.contains_key(id));
-                path
+        // A link held to none cannot carry a path, so another cable on its
+        // connection does.
+        let paths: Vec<Path> = paths(&self.links, |id| {
+            taking.get(&id).is_some_and(|&most| most > 0)
+        });
+        let behind: HashMap<&str, &str> = paths
+            .iter()
+            .flat_map(|path| {
+                path.others
+                    .iter()
+                    .map(|other| (other.as_str(), path.carrier.as_str()))
             })
-            .filter(|path| !path.links.is_empty())
             .collect();
         let wants: Vec<Want> = paths
             .iter()
@@ -1032,6 +1046,29 @@ impl Download {
                     member.wanted = member.target.min(most);
                 }
                 _ => member.wanted = 0,
+            }
+            let carrier = behind
+                .get(member.name.as_str())
+                .filter(|_| taking.contains_key(&member.id));
+            match carrier {
+                Some(carrier) => {
+                    let note = format!(
+                        "sits out: it reaches the internet through the same connection as \
+                         {carrier}, so using both gains nothing"
+                    );
+                    member.target = 0;
+                    member.note = Some(note.clone());
+                    member.behind = Some(note);
+                }
+                None => {
+                    if let Some(note) = member.behind.take() {
+                        // Its own note only: another may have taken its place.
+                        if member.note.as_ref() == Some(&note) {
+                            member.note = None;
+                        }
+                        member.took_over = true;
+                    }
+                }
             }
         }
     }
@@ -1062,7 +1099,9 @@ impl Download {
     /// Move each link one connection toward what it is wanted to hold: one
     /// more, while the download's `connections` allow, or the one with least
     /// left of its claim retires. A link with one still retiring waits for it
-    /// to end, so its count never moves by two at once.
+    /// to end, so its count never moves by two at once. A cable taking a path
+    /// over from one that left starts with all it is wanted at once, as a
+    /// link joining does.
     fn rebalance(&mut self) {
         self.rebalanced_at = Instant::now();
         if !matches!(
@@ -1075,14 +1114,17 @@ impl Download {
             return;
         }
         self.retarget();
-        let moves: Vec<(LinkId, u32, u32)> = self
+        let moves: Vec<(LinkId, u32, u32, bool)> = self
             .members
             .iter()
             .filter(|m| m.present)
             .filter(|m| !self.seats.values().any(|s| s.link == m.id && s.retiring))
-            .map(|m| (m.id, self.holding(m.id), m.wanted))
+            .map(|m| (m.id, self.holding(m.id), m.wanted, m.took_over))
             .collect();
-        for (link, holding, wanted) in moves {
+        for member in &mut self.members {
+            member.took_over = false;
+        }
+        for (link, holding, wanted, took_over) in moves {
             if holding > wanted {
                 let leaving = self
                     .seats
@@ -1094,7 +1136,7 @@ impl Download {
                     self.retire(seat);
                 }
             } else if holding < wanted {
-                self.add_workers(link, 1);
+                self.add_workers(link, if took_over { usize::MAX } else { 1 });
             }
         }
         self.hand_out();
@@ -1416,7 +1458,8 @@ impl Download {
     /// file. Once only until a chunk comes through again, so an address that
     /// refuses straight after it was found again is not found over and over.
     /// An address the URL itself names is gone for good: the worker ends, as
-    /// for any answer that cannot be used.
+    /// for any answer that cannot be used, and nothing takes its place, so its
+    /// link's ceiling falls to what it has left, as there.
     fn gone(&mut self, link: LinkId, why: String) {
         let given = self.job.url.clone();
         let Some(member) = self.member(link) else {
@@ -1425,6 +1468,13 @@ impl Download {
         let redirected = member.remote.as_ref().is_some_and(|r| r.url != given);
         if !(member.present && redirected && member.may_find_again && !member.finding) {
             member.note = Some(why);
+            // While it finds the file again, the fresh address's connections
+            // take the old ones' places.
+            if !member.finding {
+                let left = member.workers;
+                member.ceiling = Some(member.ceiling.map_or(left, |c| c.min(left)));
+                self.retarget();
+            }
             return;
         }
         member.may_find_again = false;
@@ -1615,6 +1665,14 @@ impl Download {
             |m: &Member| m.finding || m.workers > 0 || m.resting.is_some() || !m.refills.is_empty();
         if self.members.iter().any(|m| m.present && busy(m)) {
             return;
+        }
+        if !self.stopping {
+            // A cable sitting out behind one that can no longer carry takes
+            // its path over, before the download is judged stuck.
+            self.rebalance();
+            if self.members.iter().any(|m| m.present && busy(m)) {
+                return;
+            }
         }
         let note = self
             .members

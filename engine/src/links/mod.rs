@@ -40,4 +40,4 @@ pub use handle::LinkHandle;
 pub use measure::sample;
 pub use model::{Addr, Candidate, Link, LinkEvent, LinkId, LinkState};
 pub use probe::{Probe, ProbeVerdict, classify, probe};
-pub use upstream::shared_upstreams;
+pub use upstream::{shared_connections, shared_upstreams};

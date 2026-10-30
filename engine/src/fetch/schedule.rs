@@ -5,11 +5,14 @@
 //! extra connections would only split its few megabits, and cost requests,
 //! cuts and data thrown away with them. Links on one cable are one path, its
 //! weight its links' speeds added (or, before they have carried, the cable's
-//! speed test); the download's connections are shared between paths by
-//! weight, then equally between a path's links. A link the server limits
-//! keeps the ceiling it learned. Pure: the coordinator passes the facts.
+//! speed test), and cables on one internet connection are one path, carried
+//! by the fastest while the others sit out; the download's connections are
+//! shared between paths by weight, then equally between a path's links. A
+//! link the server limits keeps the ceiling it learned. Pure: the
+//! coordinator passes the facts.
 
-use crate::links::{Link, LinkId};
+use crate::links::render::cable_speed;
+use crate::links::{Link, LinkId, shared_connections};
 
 /// One path's, or one link's, claim on the connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,12 +23,14 @@ pub struct Want {
     pub most: u32,
 }
 
-/// The usable links on one interface, carried by that cable.
+/// One internet connection as a download uses it: the usable links on one
+/// interface, carried by that cable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Path {
     pub carrier: String,
     pub links: Vec<LinkId>,
-    /// Other cables on the same internet connection (Task 4).
+    /// Other cables taking part on the same internet connection: they sit
+    /// out, holding no connections.
     pub others: Vec<String>,
 }
 
@@ -86,19 +91,68 @@ pub fn allocate(total: u32, least: u32, wants: &[Want]) -> Vec<u32> {
     out
 }
 
-/// The usable links in `links`, one path per interface, in the order each
-/// first appears.
-pub fn paths(links: &[Link]) -> Vec<Path> {
-    let mut out: Vec<Path> = Vec::new();
-    for link in links.iter().filter(|l| l.state.is_usable()) {
-        match out.iter_mut().find(|p| p.carrier == link.name) {
-            Some(path) => path.links.push(link.id),
-            None => out.push(Path {
-                carrier: link.name.clone(),
-                links: vec![link.id],
-                others: Vec::new(),
-            }),
+/// The paths the links in `links` that are `taking` part give a download, in
+/// the order each first appears. A cable's usable links are one path, and
+/// the cables [`shared_connections`] puts on one internet connection are one
+/// too: its carrier is the cable with the fastest speed test, the first of
+/// equals, and the other cables taking part are its `others`, holding no
+/// connections, since using both gains nothing. Which cables share is read
+/// from the whole table, so a cable not taking part still joins the two it
+/// links.
+pub fn paths(links: &[Link], taking: impl Fn(LinkId) -> bool) -> Vec<Path> {
+    // One cable per interface: its links taking part, in table order.
+    let mut cables: Vec<(&str, Vec<LinkId>)> = Vec::new();
+    for link in links.iter().filter(|l| l.state.is_usable() && taking(l.id)) {
+        match cables.iter_mut().find(|(name, _)| *name == link.name) {
+            Some((_, ids)) => ids.push(link.id),
+            None => cables.push((&link.name, vec![link.id])),
         }
+    }
+    let shared = shared_connections(links);
+    let speed = |name: &str| {
+        let cable: Vec<&Link> = links.iter().filter(|l| l.name == name).collect();
+        cable_speed(&cable)
+    };
+
+    let mut out = Vec::new();
+    let mut placed = vec![false; cables.len()];
+    for first in 0..cables.len() {
+        if placed[first] {
+            continue;
+        }
+        let on = shared
+            .iter()
+            .find(|connection| connection.iter().any(|c| c == cables[first].0));
+        let members: Vec<usize> = (first..cables.len())
+            .filter(|&i| {
+                i == first
+                    || on.is_some_and(|connection| connection.iter().any(|c| c == cables[i].0))
+            })
+            .collect();
+        for &i in &members {
+            placed[i] = true;
+        }
+        // The fastest speed test, a figure before none; the first of equals.
+        let carrier = members
+            .iter()
+            .copied()
+            .reduce(|best, i| {
+                if speed(cables[i].0) > speed(cables[best].0) {
+                    i
+                } else {
+                    best
+                }
+            })
+            .expect("a path has its first cable");
+        out.push(Path {
+            carrier: cables[carrier].0.to_string(),
+            links: cables[carrier].1.clone(),
+            others: members
+                .iter()
+                .filter(|&&i| i != carrier)
+                .map(|&i| cables[i].0.to_string())
+                .collect(),
+        });
     }
     out
 }
@@ -195,8 +249,7 @@ mod tests {
             link(4, "Wi-Fi", "2001:db8::11", LinkState::Probing),
             link(5, "Ethernet 3", "203.0.113.9", LinkState::Down),
         ];
-        let got = paths(&links);
-        let ids = |ns: &[u64]| ns.iter().map(|&n| LinkId::new(n)).collect::<Vec<_>>();
+        let got = paths(&links, |_| true);
         assert_eq!(
             got,
             [
@@ -212,7 +265,178 @@ mod tests {
                 },
             ]
         );
-        assert!(paths(&[]).is_empty());
+        assert!(paths(&[], |_| true).is_empty());
+    }
+
+    fn ids(ns: &[u64]) -> Vec<LinkId> {
+        ns.iter().map(|&n| LinkId::new(n)).collect()
+    }
+
+    /// An up link with its speed test, if any, and its public address.
+    fn tested(id: u64, name: &str, addr: &str, bps: Option<u64>, public: &str) -> Link {
+        Link {
+            down_bps: bps,
+            public_ip: Some(public.parse().unwrap()),
+            ..link(id, name, addr, LinkState::Up)
+        }
+    }
+
+    fn path(carrier: &str, links: &[u64], others: &[&str]) -> Path {
+        Path {
+            carrier: carrier.into(),
+            links: ids(links),
+            others: others.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    /// The phone on the laptop's own Wi-Fi: two cables, one internet
+    /// connection, so one path, on the faster cable's speed test.
+    #[test]
+    fn two_cables_behind_one_public_address_are_one_path_carried_by_the_faster() {
+        let links = [
+            tested(1, "Wi-Fi", "192.0.2.10", Some(20_000_000), "198.51.100.7"),
+            tested(
+                2,
+                "Ethernet 2",
+                "192.0.2.20",
+                Some(50_000_000),
+                "198.51.100.7",
+            ),
+        ];
+        assert_eq!(
+            paths(&links, |_| true),
+            [path("Ethernet 2", &[2], &["Wi-Fi"])]
+        );
+    }
+
+    /// Ethernet 2's IPv4 address shares the Wi-Fi's public address, its IPv6
+    /// address Ethernet 3's: all three are on one connection.
+    #[test]
+    fn a_cable_joined_through_a_third_is_on_the_same_path() {
+        let links = [
+            tested(1, "Wi-Fi", "192.0.2.10", Some(30_000_000), "198.51.100.7"),
+            tested(
+                2,
+                "Ethernet 2",
+                "192.0.2.20",
+                Some(10_000_000),
+                "198.51.100.7",
+            ),
+            tested(
+                3,
+                "Ethernet 2",
+                "2001:db8::20",
+                Some(10_000_000),
+                "2001:db8::1",
+            ),
+            tested(
+                4,
+                "Ethernet 3",
+                "2001:db8::30",
+                Some(40_000_000),
+                "2001:db8::1",
+            ),
+            tested(
+                5,
+                "Ethernet 4",
+                "203.0.113.40",
+                Some(5_000_000),
+                "203.0.113.40",
+            ),
+        ];
+        assert_eq!(
+            paths(&links, |_| true),
+            [
+                path("Ethernet 3", &[4], &["Wi-Fi", "Ethernet 2"]),
+                path("Ethernet 4", &[5], &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_speeds_carry_on_the_first_cable() {
+        let shared = |wifi, ethernet| {
+            [
+                tested(1, "Wi-Fi", "192.0.2.10", wifi, "198.51.100.7"),
+                tested(2, "Ethernet 2", "192.0.2.20", ethernet, "198.51.100.7"),
+            ]
+        };
+        let equal = shared(Some(20_000_000), Some(20_000_000));
+        assert_eq!(
+            paths(&equal, |_| true),
+            [path("Wi-Fi", &[1], &["Ethernet 2"])]
+        );
+        // Neither measured: alike, so the first.
+        assert_eq!(
+            paths(&shared(None, None), |_| true),
+            [path("Wi-Fi", &[1], &["Ethernet 2"])]
+        );
+        // A speed test beats none.
+        assert_eq!(
+            paths(&shared(None, Some(1)), |_| true),
+            [path("Ethernet 2", &[2], &["Wi-Fi"])]
+        );
+    }
+
+    /// A link not taking part (resting, finding nothing, not asked for, held
+    /// to no connections) neither carries a path nor sits out behind one; its
+    /// public address still joins the cables it links.
+    #[test]
+    fn a_link_not_taking_part_neither_carries_nor_sits_out() {
+        let links = [
+            tested(1, "Wi-Fi", "192.0.2.10", Some(20_000_000), "198.51.100.7"),
+            tested(
+                2,
+                "Ethernet 2",
+                "192.0.2.20",
+                Some(50_000_000),
+                "198.51.100.7",
+            ),
+        ];
+        assert_eq!(
+            paths(&links, |id| id != LinkId::new(2)),
+            [path("Wi-Fi", &[1], &[])]
+        );
+
+        let through = [
+            tested(1, "Wi-Fi", "192.0.2.10", Some(20_000_000), "198.51.100.7"),
+            tested(
+                2,
+                "Ethernet 2",
+                "192.0.2.20",
+                Some(90_000_000),
+                "198.51.100.7",
+            ),
+            tested(
+                3,
+                "Ethernet 2",
+                "2001:db8::20",
+                Some(90_000_000),
+                "2001:db8::1",
+            ),
+            tested(
+                4,
+                "Ethernet 3",
+                "2001:db8::30",
+                Some(40_000_000),
+                "2001:db8::1",
+            ),
+        ];
+        let resting = [LinkId::new(2), LinkId::new(3)];
+        assert_eq!(
+            paths(&through, |id| !resting.contains(&id)),
+            [path("Ethernet 3", &[4], &["Wi-Fi"])]
+        );
+
+        // One address of a cable out: its other still carries.
+        let dual = [
+            tested(1, "Wi-Fi", "192.0.2.10", None, "198.51.100.7"),
+            tested(2, "Wi-Fi", "2001:db8::10", None, "2001:db8::10"),
+        ];
+        assert_eq!(
+            paths(&dual, |id| id != LinkId::new(1)),
+            [path("Wi-Fi", &[2], &[])]
+        );
     }
 
     #[test]
