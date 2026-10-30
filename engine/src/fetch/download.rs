@@ -117,6 +117,7 @@ use super::remote::{Refused, Remote, differs, find};
 use super::saved::{Saved, load, progress_path, save};
 use super::schedule::{Path, Want, allocate, paths, settle};
 use super::spans::{Claim, Floor, Hand, seat_rate, to_split};
+use super::used::{Counter, Usage};
 use super::worker::{Exit, Outcome, Report, Worker, stamp};
 use super::{
     DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, same_file, size_words,
@@ -140,6 +141,8 @@ pub(crate) struct Job {
     pub dir: PathBuf,
     pub config: DownloadConfig,
     pub status: Arc<watch::Sender<Vec<DownloadStatus>>>,
+    /// What each cable has received, every download together.
+    pub used: Arc<Usage>,
     /// Becomes true when the engine stops.
     pub stopping: watch::Receiver<bool>,
     /// Becomes true when this download alone is asked to stop.
@@ -279,6 +282,8 @@ struct Member {
     may_find_again: bool,
     /// Bytes this link's workers wrote, counted by them.
     written: Arc<AtomicU64>,
+    /// What its cable has received, every download together.
+    used: Arc<Counter>,
     stop: watch::Sender<bool>,
     note: Option<String>,
     /// Its speed in this download, from `written`.
@@ -671,6 +676,7 @@ impl Download {
                         trial: false,
                         may_find_again: true,
                         written: Arc::new(AtomicU64::new(0)),
+                        used: self.job.used.cable(&link.name),
                         stop: watch::channel(false).0,
                         note: None,
                         rate: Rate::default(),
@@ -1313,6 +1319,7 @@ impl Download {
             file: open.file.clone(),
             reports: self.reports_tx.clone(),
             written: member.written.clone(),
+            used: member.used.clone(),
             stop: member.stop.subscribe(),
             read_deadline: self.job.config.read_deadline,
         };
@@ -1785,6 +1792,7 @@ impl Download {
                     true
                 }
             });
+        self.job.used.publish();
     }
 }
 

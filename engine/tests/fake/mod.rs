@@ -326,6 +326,7 @@ pub fn cand_idx(os_index: u32, name: &str, ip: &str, up: bool) -> Candidate {
         name: name.to_string(),
         addr: Addr::from(ip.parse::<IpAddr>().unwrap()),
         up,
+        metered: false,
     }
 }
 

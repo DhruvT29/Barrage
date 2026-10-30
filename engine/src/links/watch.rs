@@ -522,7 +522,12 @@ impl<N: Network> Watcher<N> {
         }
 
         for c in &candidates {
-            if self.links.values().any(|e| is_same_link(c, &e.link)) {
+            if let Some(e) = self.links.values_mut().find(|e| is_same_link(c, &e.link)) {
+                // Set as metered, or no longer: the same link, changed.
+                if e.link.metered != c.metered {
+                    e.link.metered = c.metered;
+                    self.changed = true;
+                }
                 continue;
             }
             let id = LinkId::new(self.next_id);
@@ -535,8 +540,7 @@ impl<N: Network> Watcher<N> {
                 rtt: None,
                 down_bps: None,
                 public_ip: None,
-                // No task reads the Windows network cost type yet.
-                metered: false,
+                metered: c.metered,
             };
             let back = self.left.contains_key(&c.name);
             self.links.insert(

@@ -451,6 +451,53 @@ async fn a_reused_os_index_does_not_inherit_the_old_links_measurements() {
     assert_eq!(after.name, "Dock Ethernet");
 }
 
+/// Windows saying a link's connection is metered changes that link in
+/// place: the same id, no Down or Up, and the table shows it.
+#[tokio::test]
+async fn a_link_turning_metered_keeps_its_id() {
+    let plain = cand("Ethernet 3", "192.0.2.40", true);
+    let metered = Candidate {
+        metered: true,
+        ..plain.clone()
+    };
+    let mut steps = vec![vec![plain]; 5];
+    steps.push(vec![metered]);
+    let net = Arc::new(Fake::scripted(steps));
+    let (_h, mut rx, table) = spawn_watcher(net, WatchConfig::every(ms(20)));
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    let link = wait_for("the link to show as metered", || {
+        table.snapshot().into_iter().find(|l| l.metered)
+    })
+    .await;
+    assert_eq!(link.id, id);
+    assert_eq!(link.state, LinkState::Up);
+    assert_eq!(table.snapshot().len(), 1);
+    assert_eq!(drain_for(&mut rx, ms(200)).await, []);
+}
+
+/// A link on a metered connection when it first appears is metered from
+/// its first table: one poll only, so no later poll can correct it.
+#[tokio::test]
+async fn a_link_metered_from_the_start_shows_it_at_once() {
+    let metered = Candidate {
+        metered: true,
+        ..cand("Ethernet 3", "192.0.2.40", true)
+    };
+    let net = Arc::new(Fake::scripted(vec![vec![metered]]));
+    let (_h, mut rx, table) = spawn_watcher(net, WatchConfig::every(Duration::from_secs(10)));
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    let links = table.snapshot();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].id, id);
+    assert!(links[0].metered, "{links:?}");
+}
+
 fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }

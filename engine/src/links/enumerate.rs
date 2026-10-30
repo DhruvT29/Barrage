@@ -9,6 +9,11 @@
 //! The name is the adapter's friendly name, the one shown in Settings and by
 //! `Get-NetIPAddress` as `InterfaceAlias`.
 //!
+//! Whether a link is metered comes from WinRT's `NetworkInformation`: the
+//! cost of the connection profile its adapter is on, matched by the
+//! adapter's GUID, never its name, since a profile is named after its
+//! network.
+//!
 //! WHAT THE CRATE DROPS BEFORE WE SEE IT
 //!
 //! `if-addrs` is not a raw view. Measured against `Get-NetIPAddress` on the
@@ -27,10 +32,16 @@
 //!    dependency tree, so if any other crate ever switches that feature on,
 //!    this filter disappears with no change to our code.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::Context;
 use if_addrs::Interface;
 
 use super::model::{Addr, Candidate};
+
+/// Whether the log has said Windows would not give connection costs.
+static COSTS_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// Every address on every interface, one `Candidate` per address.
 ///
@@ -40,10 +51,128 @@ use super::model::{Addr, Candidate};
 /// lose one before anything had the chance to judge it.
 pub fn enumerate() -> anyhow::Result<Vec<Candidate>> {
     let interfaces = if_addrs::get_if_addrs().context("listing the OS network interfaces")?;
-    Ok(interfaces.into_iter().filter_map(to_candidate).collect())
+    // Windows refusing says nothing about the links themselves: they are
+    // used as if unmetered, and the log says so once.
+    let metered = match profiles() {
+        Ok(profiles) => metered_adapters(&profiles),
+        Err(e) => {
+            if !COSTS_REFUSED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "Windows would not say which connections are metered; none is treated as metered"
+                );
+            }
+            HashSet::new()
+        }
+    };
+    Ok(interfaces
+        .into_iter()
+        .filter_map(|i| to_candidate(i, &metered))
+        .collect())
 }
 
-fn to_candidate(iface: Interface) -> Option<Candidate> {
+/// What Windows says a connection profile costs, its `NetworkCostType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cost {
+    Unrestricted,
+    /// A data limit: what "Set as metered connection" gives.
+    Fixed,
+    /// Paid by the byte.
+    Variable,
+    Unknown,
+}
+
+/// The connection profile an adapter is on now, as Windows reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// The adapter's GUID, the same one `if-addrs` gives as `adapter_name`.
+    pub adapter: String,
+    /// The network's name, as Settings shows it.
+    pub name: String,
+    pub cost: Cost,
+    pub roaming: bool,
+    pub over_limit: bool,
+}
+
+/// Whether a connection with this cost is metered: a data limit or paid by
+/// the byte, or roaming, or over its limit.
+pub(crate) fn is_metered(cost: Cost, roaming: bool, over_limit: bool) -> bool {
+    matches!(cost, Cost::Fixed | Cost::Variable) || roaming || over_limit
+}
+
+/// The adapters on a metered connection, each GUID in one spelling.
+fn metered_adapters(profiles: &[Profile]) -> HashSet<String> {
+    profiles
+        .iter()
+        .filter(|p| is_metered(p.cost, p.roaming, p.over_limit))
+        .map(|p| adapter_key(&p.adapter))
+        .collect()
+}
+
+/// A GUID in one spelling: WinRT writes it bare and `if-addrs` in braces,
+/// either in any case.
+fn adapter_key(guid: &str) -> String {
+    guid.trim_matches(['{', '}']).to_ascii_lowercase()
+}
+
+/// The adapter's GUID, which `if-addrs` gives only on Windows.
+#[cfg(windows)]
+fn adapter_of(iface: &Interface) -> &str {
+    &iface.adapter_name
+}
+
+#[cfg(not(windows))]
+fn adapter_of(_iface: &Interface) -> &str {
+    ""
+}
+
+/// The connection profile each adapter is on now, with its cost.
+///
+/// Windows lists every network it has saved, each on the adapter that last
+/// joined it: this machine's Wi-Fi has 21, one of them set as metered. Only
+/// a profile the adapter is connected to says anything about the link, so
+/// the rest are skipped before their cost is read, which also halves the
+/// time this takes (about 30 ms a poll here, against 65 reading all).
+#[cfg(windows)]
+pub fn profiles() -> anyhow::Result<Vec<Profile>> {
+    use windows::Networking::Connectivity::{
+        NetworkConnectivityLevel, NetworkCostType, NetworkInformation,
+    };
+
+    let all = NetworkInformation::GetConnectionProfiles().context("listing connection profiles")?;
+    let mut profiles = Vec::new();
+    for profile in &all {
+        if profile.GetNetworkConnectivityLevel()? == NetworkConnectivityLevel::None {
+            continue;
+        }
+        // A profile with no adapter, such as a VPN's, is no cable's.
+        let Ok(adapter) = profile.NetworkAdapter() else {
+            continue;
+        };
+        let cost = profile.GetConnectionCost()?;
+        profiles.push(Profile {
+            adapter: format!("{:?}", adapter.NetworkAdapterId()?),
+            name: profile.ProfileName()?.to_string(),
+            cost: match cost.NetworkCostType()? {
+                NetworkCostType::Unrestricted => Cost::Unrestricted,
+                NetworkCostType::Fixed => Cost::Fixed,
+                NetworkCostType::Variable => Cost::Variable,
+                _ => Cost::Unknown,
+            },
+            roaming: cost.Roaming()?,
+            over_limit: cost.OverDataLimit()?,
+        });
+    }
+    Ok(profiles)
+}
+
+/// No other OS says what a link costs, so nothing is metered there.
+#[cfg(not(windows))]
+pub fn profiles() -> anyhow::Result<Vec<Profile>> {
+    Ok(Vec::new())
+}
+
+fn to_candidate(iface: Interface, metered: &HashSet<String>) -> Option<Candidate> {
     // `if-addrs` reports no index only when the address family is switched off
     // on the adapter, which cannot coincide with the adapter holding an address
     // of that family. Should it happen anyway, the entry is dropped loudly:
@@ -66,6 +195,7 @@ fn to_candidate(iface: Interface) -> Option<Candidate> {
         // it is checked against the real tether rather than assumed: if the
         // phone ever reported anything but Up, this line would hide it.
         up: iface.is_oper_up(),
+        metered: metered.contains(&adapter_key(adapter_of(&iface))),
         name: iface.name,
     })
 }
@@ -104,7 +234,11 @@ mod tests {
 
     #[test]
     fn maps_name_index_address_and_status() {
-        let c = to_candidate(iface("Wi-Fi", Some(16), IfOperStatus::Up, "192.0.2.10")).unwrap();
+        let c = to_candidate(
+            iface("Wi-Fi", Some(16), IfOperStatus::Up, "192.0.2.10"),
+            &none(),
+        )
+        .unwrap();
         assert_eq!(c.name, "Wi-Fi");
         assert_eq!(c.os_index, 16);
         assert_eq!(c.addr.ip(), "192.0.2.10".parse::<IpAddr>().unwrap());
@@ -121,19 +255,110 @@ mod tests {
             IfOperStatus::NotPresent,
             IfOperStatus::LowerLayerDown,
         ] {
-            let c = to_candidate(iface("Ethernet", Some(14), status.clone(), "192.0.2.20"));
+            let c = to_candidate(
+                iface("Ethernet", Some(14), status.clone(), "192.0.2.20"),
+                &none(),
+            );
             assert!(!c.unwrap().up, "{status:?} was treated as up");
         }
     }
 
     #[test]
     fn an_ipv6_address_stays_ipv6() {
-        let c = to_candidate(iface("Wi-Fi", Some(16), IfOperStatus::Up, "2001:db8::10")).unwrap();
+        let c = to_candidate(
+            iface("Wi-Fi", Some(16), IfOperStatus::Up, "2001:db8::10"),
+            &none(),
+        )
+        .unwrap();
         assert!(matches!(c.addr, Addr::V6(_)));
     }
 
     #[test]
     fn an_entry_without_an_index_is_skipped() {
-        assert!(to_candidate(iface("Ghost", None, IfOperStatus::Up, "192.0.2.30")).is_none());
+        let ghost = iface("Ghost", None, IfOperStatus::Up, "192.0.2.30");
+        assert!(to_candidate(ghost, &none()).is_none());
+    }
+
+    fn none() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// `iface` on the adapter with this GUID, as `if-addrs` writes it.
+    fn on_adapter(mut iface: Interface, guid: &str) -> Interface {
+        #[cfg(windows)]
+        {
+            iface.adapter_name = guid.to_string();
+        }
+        let _ = guid;
+        iface
+    }
+
+    fn profile(adapter: &str, name: &str, cost: Cost) -> Profile {
+        Profile {
+            adapter: adapter.to_string(),
+            name: name.to_string(),
+            cost,
+            roaming: false,
+            over_limit: false,
+        }
+    }
+
+    const WIFI_ADAPTER: &str = "{6B29FC40-CA47-1067-B31D-00DD010662DA}";
+    const PHONE_ADAPTER: &str = "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}";
+
+    #[test]
+    fn fixed_and_variable_costs_are_metered_unrestricted_and_unknown_are_not() {
+        assert!(is_metered(Cost::Fixed, false, false));
+        assert!(is_metered(Cost::Variable, false, false));
+        assert!(!is_metered(Cost::Unrestricted, false, false));
+        assert!(!is_metered(Cost::Unknown, false, false));
+    }
+
+    #[test]
+    fn roaming_or_over_the_limit_is_metered() {
+        for cost in [Cost::Unrestricted, Cost::Unknown] {
+            assert!(is_metered(cost, true, false), "{cost:?} roaming");
+            assert!(is_metered(cost, false, true), "{cost:?} over its limit");
+        }
+    }
+
+    /// A profile's name is the network's, which can be anything, another
+    /// adapter's name included. And WinRT writes a GUID bare, in any case,
+    /// where `if-addrs` puts it in braces.
+    #[cfg(windows)]
+    #[test]
+    fn a_cost_is_matched_by_adapter_not_by_name() {
+        let metered = metered_adapters(&[
+            profile("3f2504e0-4f89-11d3-9a0c-0305e82c3301", "Wi-Fi", Cost::Fixed),
+            profile(
+                "6B29FC40-CA47-1067-B31D-00DD010662DA",
+                "Ethernet 3",
+                Cost::Unrestricted,
+            ),
+        ]);
+        let up = IfOperStatus::Up;
+        let phone = on_adapter(
+            iface("Ethernet 3", Some(21), up.clone(), "192.0.2.40"),
+            PHONE_ADAPTER,
+        );
+        let wifi = on_adapter(iface("Wi-Fi", Some(16), up, "192.0.2.10"), WIFI_ADAPTER);
+        assert!(to_candidate(phone, &metered).unwrap().metered);
+        assert!(!to_candidate(wifi, &metered).unwrap().metered);
+    }
+
+    /// Review Focus 5: an adapter Windows has no profile for, or every
+    /// adapter when Windows would not say, is not metered.
+    #[cfg(windows)]
+    #[test]
+    fn an_adapter_with_no_profile_is_not_metered() {
+        let metered = metered_adapters(&[profile(PHONE_ADAPTER, "Phone", Cost::Fixed)]);
+        let wifi = || {
+            on_adapter(
+                iface("Wi-Fi", Some(16), IfOperStatus::Up, "192.0.2.10"),
+                WIFI_ADAPTER,
+            )
+        };
+        assert!(!to_candidate(wifi(), &metered).unwrap().metered);
+        assert!(!to_candidate(wifi(), &none()).unwrap().metered);
     }
 }

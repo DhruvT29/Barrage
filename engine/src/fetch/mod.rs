@@ -30,6 +30,7 @@ pub mod remote;
 mod saved;
 mod schedule;
 mod spans;
+mod used;
 mod worker;
 
 use std::collections::HashMap;
@@ -69,6 +70,8 @@ struct Inner {
     stopping: watch::Sender<bool>,
     /// What stopping and resuming each download needs, by id.
     controls: Mutex<HashMap<DownloadId, Control>>,
+    /// What each cable has received, every download together.
+    used: Arc<used::Usage>,
 }
 
 /// One download's way to be stopped, and started again.
@@ -261,6 +264,14 @@ pub struct DownloadStatus {
     pub note: Option<String>,
 }
 
+/// The data one cable has received for the engine's downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CableUse {
+    /// The cable's name.
+    pub cable: String,
+    pub bytes: u64,
+}
+
 /// One link's part in a download. A link that has gone keeps its share, so
 /// what it carried still shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +307,7 @@ impl Downloads {
                 status: Arc::new(status),
                 stopping: watch::channel(false).0,
                 controls: Mutex::new(HashMap::new()),
+                used: Arc::new(used::Usage::new()),
             }),
         }
     }
@@ -367,6 +379,7 @@ impl Downloads {
             dir: self.inner.dir.clone(),
             config: self.inner.config.clone(),
             status: self.inner.status.clone(),
+            used: self.inner.used.clone(),
             stopping: self.inner.stopping.subscribe(),
             stop: asked,
         }));
@@ -383,6 +396,13 @@ impl Downloads {
     /// Every download's status, updated as they run.
     pub fn status(&self) -> watch::Receiver<Vec<DownloadStatus>> {
         self.inner.status.subscribe()
+    }
+
+    /// What each cable has received for every download since the engine
+    /// started, written or not, in the order cables first carried; updated
+    /// as each download publishes.
+    pub fn used(&self) -> watch::Receiver<Vec<CableUse>> {
+        self.inner.used.subscribe()
     }
 
     /// Stop download `id`: its connections stop and report what they wrote,

@@ -12,13 +12,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use barrage::LinkHandle;
-use barrage::fetch::{DownloadConfig, DownloadStatus, Phase};
+use barrage::fetch::{CableUse, DownloadConfig, DownloadStatus, Downloads, Phase};
 use barrage::links::LinkState;
 use barrage::links::probe::ProbeVerdict;
 use barrage::links::watch::{LinkTable, WatchConfig};
 use fake::{Fake, cand_idx, ms};
 use fetching::*;
-use serve::File;
+use serve::{Answer, File, Server};
 
 /// Wi-Fi and Ethernet 2 over `net`, once both are up and both speed tests
 /// have run, `measured` of them with a figure: a download shares its
@@ -665,5 +665,121 @@ async fn a_link_flapping_costs_a_request_or_two_per_return() {
     assert!(
         since <= 2 * RETURNS,
         "{since} piece requests over {RETURNS} returns"
+    );
+}
+
+/// What `cable` has received, every download together.
+fn used_by(downloads: &Downloads, cable: &str) -> u64 {
+    downloads
+        .used()
+        .borrow()
+        .iter()
+        .find(|u| u.cable == cable)
+        .map_or(0, |u| u.bytes)
+}
+
+/// What `cable` wrote of the download, 0 if it took no part.
+fn wrote(status: &DownloadStatus, cable: &str) -> u64 {
+    status
+        .links
+        .iter()
+        .filter(|l| l.name == cable)
+        .map(|l| l.bytes)
+        .sum()
+}
+
+#[tokio::test]
+async fn each_cable_counts_what_it_carried() {
+    let links = both();
+    const LENGTH: u64 = 4 * MIB;
+    let (server, _dir, downloads, id) = start("used.bin", File::new(LENGTH), &links).await;
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+
+    let seen = server.seen();
+    let used: Vec<CableUse> = downloads.used().borrow().clone();
+    for (cable, source) in [("Wi-Fi", WIFI), ("Ethernet 2", ETHERNET)] {
+        let got = used_by(&downloads, cable);
+        assert!(got >= wrote(&end, cable), "{cable}: {used:?} {end:?}");
+        // Nothing arrives that the server did not send.
+        assert!(got <= served(&seen, source), "{cable}: {used:?}");
+    }
+    assert!(
+        used.iter().map(|u| u.bytes).sum::<u64>() >= LENGTH,
+        "{used:?}"
+    );
+}
+
+/// Review Focus 4. The Ethernet four times slower a connection, so the
+/// Wi-Fi cuts its claims while their answers run on: what arrives past a cut
+/// is thrown away, but it came down the cable, so it counts. Each answer
+/// dropped before its end had at most a piece or two still on its way (the
+/// server sends 64 KiB at a time, paced), which never arrived.
+#[tokio::test]
+async fn bytes_past_a_cut_are_counted_as_used() {
+    let links = both();
+    const LENGTH: u64 = 4 * MIB + 12_345;
+    let file = File::new(LENGTH)
+        .rate_for(WIFI, MIB)
+        .rate_for(ETHERNET, 256 * KIB);
+    let (server, _dir, downloads, id) = start("cut.bin", file, &links).await;
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+
+    let seen = server.seen();
+    let used: Vec<CableUse> = downloads.used().borrow().clone();
+    for (cable, source) in [("Wi-Fi", WIFI), ("Ethernet 2", ETHERNET)] {
+        let dropped = seen
+            .iter()
+            .filter(|s| s.source == ip(source) && !is_probe(s))
+            .filter(|s| s.asked().is_some_and(|(a, b)| s.sent() < b + 1 - a))
+            .count() as u64;
+        let got = used_by(&downloads, cable);
+        let sent = served(&seen, source);
+        assert!(
+            got + dropped * 128 * KIB >= sent,
+            "{cable}: used {got}, sent {sent}, {dropped} answers dropped: {used:?}"
+        );
+        assert!(got <= sent, "{cable}: used {got}, sent {sent}");
+    }
+    let total: u64 = used.iter().map(|u| u.bytes).sum();
+    assert!(total > LENGTH, "nothing past a cut was counted: {used:?}");
+}
+
+/// One count per cable for the engine, every download adding to it.
+#[tokio::test]
+async fn two_downloads_add_to_one_count() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/one.bin", Answer::File(File::new(2 * MIB)));
+    server.at("/two.bin", Answer::File(File::new(3 * MIB)));
+    let dir = Folder::new("two-downloads");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), config());
+    let one = downloads
+        .add(request(&server.url("/one.bin")))
+        .await
+        .unwrap();
+    let two = downloads
+        .add(request(&server.url("/two.bin")))
+        .await
+        .unwrap();
+    let (one, two) = (ended(&downloads, one).await, ended(&downloads, two).await);
+    assert_eq!((one.phase, two.phase), (Phase::Done, Phase::Done));
+
+    let used: Vec<CableUse> = downloads.used().borrow().clone();
+    let mut names: Vec<&str> = used.iter().map(|u| u.cable.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), used.len(), "a cable counted twice: {used:?}");
+    for cable in ["Wi-Fi", "Ethernet 2"] {
+        let both_wrote = wrote(&one, cable) + wrote(&two, cable);
+        assert!(
+            used_by(&downloads, cable) >= both_wrote,
+            "{cable}: {used:?}"
+        );
+    }
+    assert!(
+        used.iter().map(|u| u.bytes).sum::<u64>() >= 5 * MIB,
+        "{used:?}"
     );
 }

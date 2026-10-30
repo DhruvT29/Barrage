@@ -96,6 +96,9 @@ pub struct Candidate {
     /// Whether the OS reports the interface as up. Necessary but nowhere near
     /// sufficient.
     pub up: bool,
+    /// Whether Windows says the connection the interface is on now is
+    /// metered: its connection profile's cost (`enumerate`).
+    pub metered: bool,
 }
 
 /// What we currently believe about a link.

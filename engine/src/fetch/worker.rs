@@ -61,6 +61,7 @@ use tokio::time::Instant;
 use super::disk::write_all_at;
 use super::remote::{Validator, content_range, retry_after};
 use super::spans::Hand;
+use super::used::Counter;
 use super::wait_words;
 use crate::links::{LinkId, bind};
 
@@ -90,6 +91,8 @@ pub(crate) struct Worker {
     pub reports: mpsc::UnboundedSender<Report>,
     /// Bytes this link's workers have written to the file.
     pub written: Arc<AtomicU64>,
+    /// What its cable has received, written or not, every download together.
+    pub used: Arc<Counter>,
     /// Becomes true when the link must stop.
     pub stop: watch::Receiver<bool>,
     pub read_deadline: Duration,
@@ -303,6 +306,9 @@ impl Worker {
                     self.hand
                         .got
                         .fetch_add(piece.len() as u64, Ordering::SeqCst);
+                    // Counted as it arrives: what lies past a cut or the
+                    // claim's end is dropped below, but came down the cable.
+                    self.used.add(piece.len() as u64);
                     piece
                 }
                 Wait::Got(Ok(None)) => break None,

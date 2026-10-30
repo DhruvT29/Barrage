@@ -132,17 +132,15 @@ pub fn paths(links: &[Link], taking: impl Fn(LinkId) -> bool) -> Vec<Path> {
         for &i in &members {
             placed[i] = true;
         }
-        // The fastest speed test, a figure before none; the first of equals.
+        // A cable not metered, whatever its speed: the connection is the
+        // same, and what comes down a metered cable costs. Then the fastest
+        // speed test, a figure before none; the first of equals.
+        let metered = |name: &str| links.iter().any(|l| l.name == name && l.metered);
+        let rank = |i: usize| (!metered(cables[i].0), speed(cables[i].0));
         let carrier = members
             .iter()
             .copied()
-            .reduce(|best, i| {
-                if speed(cables[i].0) > speed(cables[best].0) {
-                    i
-                } else {
-                    best
-                }
-            })
+            .reduce(|best, i| if rank(i) > rank(best) { i } else { best })
             .expect("a path has its first cable");
         out.push(Path {
             carrier: cables[carrier].0.to_string(),
@@ -306,6 +304,39 @@ mod tests {
         assert_eq!(
             paths(&links, |_| true),
             [path("Ethernet 2", &[2], &["Wi-Fi"])]
+        );
+    }
+
+    /// A tether Windows calls metered, on the same connection as the Wi-Fi:
+    /// faster or not, first in the table or not, the Wi-Fi carries it. Both
+    /// metered, the faster again.
+    #[test]
+    fn a_shared_path_is_carried_by_the_cable_not_metered() {
+        let phone = |metered| Link {
+            metered,
+            ..tested(
+                1,
+                "Ethernet 3",
+                "192.0.2.40",
+                Some(50_000_000),
+                "198.51.100.7",
+            )
+        };
+        let wifi = |metered| Link {
+            metered,
+            ..tested(2, "Wi-Fi", "192.0.2.10", Some(20_000_000), "198.51.100.7")
+        };
+        assert_eq!(
+            paths(&[phone(true), wifi(false)], |_| true),
+            [path("Wi-Fi", &[2], &["Ethernet 3"])]
+        );
+        assert_eq!(
+            paths(&[wifi(false), phone(true)], |_| true),
+            [path("Wi-Fi", &[2], &["Ethernet 3"])]
+        );
+        assert_eq!(
+            paths(&[wifi(true), phone(true)], |_| true),
+            [path("Ethernet 3", &[1], &["Wi-Fi"])]
         );
     }
 
