@@ -86,13 +86,13 @@ async fn the_end_of_a_file_splits_so_no_link_waits() {
     let end = ended(&downloads, id).await;
     assert_eq!(end.phase, Phase::Done, "{end:?}");
     assert_same(&dir.read("uneven.bin"), LENGTH);
-    // Halved between them, the Ethernet would carry 8 MiB. Cut by bytes left
-    // alone, it carries about 4: each of its four connections keeps a last
-    // part under twice `min_split`, 1 MiB, which takes it a second while the
-    // Wi-Fi waits. Task 2 cuts by time left, and this comes down.
+    // Halved between them, the Ethernet would carry 8 MiB; cut by bytes
+    // left alone, about 4 (phase 4, Task 1), each of its connections keeping
+    // a last part under 1 MiB, a second's work, while the Wi-Fi waited. By
+    // their speeds, it keeps a seventeenth of what is left at each cut.
     let slow = share(&end, "Ethernet 2").bytes;
     assert!(
-        slow < LENGTH * 3 / 8,
+        slow < LENGTH / 8,
         "the slow link carried {slow} of {LENGTH}"
     );
 }

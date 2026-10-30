@@ -48,7 +48,7 @@ fn downloads_in(table: &LinkTable, dir: &Path) -> Downloads {
         read_deadline: Duration::from_secs(5),
         find_deadline: Duration::from_secs(5),
         publish_every: ms(20),
-        speed_window: ms(200),
+        speed_half_life: ms(500),
         ..DownloadConfig::default()
     };
     Downloads::with_config(table.clone(), dir.to_path_buf(), config)

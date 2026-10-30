@@ -10,6 +10,7 @@
 //! |---|---|
 //! | `ranges` | [`Ranges`]: the bytes done (pure) |
 //! | `spans` | one connection's part of the file, and where to cut one (pure) |
+//! | `rate` | a speed that follows a change in seconds (pure) |
 //! | `name` | [`file_name`], [`free_name`]: safe names, never one taken |
 //! | `remote` | [`find`]: what one link sees at the URL; [`retry_after`] |
 //! | `disk` | the `.part`: full size at once, written at offsets, named last; the Downloads folder |
@@ -23,6 +24,7 @@ mod disk;
 mod download;
 pub mod name;
 pub mod ranges;
+mod rate;
 pub mod remote;
 mod saved;
 mod spans;
@@ -153,8 +155,9 @@ pub struct DownloadConfig {
     /// joining, a note, is published as it happens; the live socket merges
     /// what a slow page has not read yet.
     pub publish_every: Duration,
-    /// The span a speed is measured over.
-    pub speed_window: Duration,
+    /// How quickly a measured speed follows a change: half of it within
+    /// this long (rate.rs).
+    pub speed_half_life: Duration,
     /// How long a fresh connection waits to take the place of one that
     /// failed while the rest of its link kept working.
     pub retry_connection: Duration,
@@ -168,11 +171,14 @@ pub struct DownloadConfig {
     /// How often a download's progress is saved beside its `.part`, so an
     /// engine that is killed loses no more than this much of it.
     pub save_every: Duration,
-    /// The least a cut leaves each side: a connection's part with less than
-    /// twice this left is not cut for another. Every cut costs a request,
-    /// and the end of a file is still split finely enough that no link waits
-    /// long on another.
+    /// Before a connection's speed is known, the least a cut leaves each
+    /// side: a part with less than twice this left is not cut for another.
+    /// Every cut costs a request, and throws away what is on its way past it.
     pub min_split: u64,
+    /// Once speeds are known, how much sooner a cut must bring a part's end:
+    /// a slow link's last part is cut whatever its size, and one about to
+    /// finish is left alone.
+    pub min_split_time: Duration,
 }
 
 impl Default for DownloadConfig {
@@ -183,7 +189,7 @@ impl Default for DownloadConfig {
             // Several round trips per hop, and the tether's reached 934 ms.
             find_deadline: Duration::from_secs(20),
             publish_every: Duration::from_millis(250),
-            speed_window: Duration::from_secs(2),
+            speed_half_life: Duration::from_millis(1500),
             retry_connection: Duration::from_secs(1),
             rest_first: Duration::from_secs(5),
             rest_max: Duration::from_secs(60),
@@ -191,6 +197,7 @@ impl Default for DownloadConfig {
             max_retry_after: Duration::from_secs(60),
             save_every: Duration::from_secs(1),
             min_split: 512 << 10,
+            min_split_time: Duration::from_millis(500),
         }
     }
 }

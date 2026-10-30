@@ -296,6 +296,9 @@ impl Worker {
             let piece = match self.within(response.chunk()).await {
                 Wait::Got(Ok(Some(piece))) => {
                     self.heard.store(stamp(self.epoch), Ordering::SeqCst);
+                    self.hand
+                        .got
+                        .fetch_add(piece.len() as u64, Ordering::SeqCst);
                     piece
                 }
                 Wait::Got(Ok(None)) => break None,

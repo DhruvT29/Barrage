@@ -89,7 +89,14 @@ fn ethernet_pieces(seen: &[Seen]) -> Vec<&Seen> {
 #[tokio::test]
 async fn one_stalled_connection_is_retried_while_its_link_keeps_working() {
     let links = both();
-    let file = busy().stalls(ETHERNET, 256 * KIB, Some(1));
+    // 1 MiB a second a connection, so the download is still running once
+    // the stalled connection is given up and a fresh one takes its place.
+    // Faster, the others finish their parts first and cut the stalled one's
+    // down to its last 64 KiB, its speed having fallen to nothing, and the
+    // download ends before the fresh one starts (phase 4, Task 2).
+    let file = File::new(LENGTH)
+        .rate(MIB)
+        .stalls(ETHERNET, 256 * KIB, Some(1));
     // Two seconds for the deadline: with several suites at once, a healthy
     // connection can go a whole second unscheduled, which would rightly
     // read as a link with no data.

@@ -94,7 +94,7 @@
 //! stopped by the user leaves nothing behind: resuming starts it over under
 //! the same name.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
@@ -110,9 +110,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::disk::{create_part, mark_from_internet, name_finished, reopen_part};
 use super::name::{names_like, taken};
+use super::rate::Rate;
 use super::remote::{Refused, Remote, differs, find};
 use super::saved::{Saved, load, progress_path, save};
-use super::spans::{Claim, Hand, to_split};
+use super::spans::{Claim, Floor, Hand, seat_rate, to_split};
 use super::worker::{Exit, Outcome, Report, Worker, stamp};
 use super::{
     DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, same_file, size_words,
@@ -229,6 +230,8 @@ struct Seat {
     hand: Arc<Hand>,
     /// Nothing to do: it has reported its claim done, or has had none yet.
     idle: bool,
+    /// Its speed over all its claims, from `hand.got`.
+    rate: Rate,
 }
 
 /// One link's part in the download.
@@ -265,7 +268,8 @@ struct Member {
     written: Arc<AtomicU64>,
     stop: watch::Sender<bool>,
     note: Option<String>,
-    speed: Speed,
+    /// Its speed in this download, from `written`.
+    rate: Rate,
 }
 
 /// The file once a link has found it.
@@ -430,10 +434,14 @@ impl Download {
             }
             Event::Wake => self.wake(),
             Event::Tick => {
-                let (now, window) = (Instant::now(), self.job.config.speed_window);
+                let (now, half_life) = (Instant::now(), self.job.config.speed_half_life);
                 for member in &mut self.members {
                     let bytes = member.written.load(Ordering::SeqCst);
-                    member.speed.sample(now, bytes, window);
+                    member.rate.sample(now, bytes, half_life);
+                }
+                for seat in self.seats.values_mut() {
+                    let bytes = seat.hand.got.load(Ordering::SeqCst);
+                    seat.rate.sample(now, bytes, half_life);
                 }
                 // A link trying again after a rest works once its connection
                 // receives bytes: the rest need not wait for a whole chunk.
@@ -614,7 +622,7 @@ impl Download {
                         written: Arc::new(AtomicU64::new(0)),
                         stop: watch::channel(false).0,
                         note: None,
-                        speed: Speed::default(),
+                        rate: Rate::default(),
                     });
                     self.join(link.id);
                 }
@@ -895,11 +903,15 @@ impl Download {
     }
 
     /// Give every connection with nothing to do a part of the file: the
-    /// first part nobody has, or else the back half of the claim with the
-    /// most left, until none can be cut. One after another, so several at
-    /// once each ask for their own part, never the same.
+    /// first part nobody has, or else the back of the claim that would
+    /// finish last, cut where the two would finish together, until none is
+    /// worth cutting. One after another, so several at once each ask for
+    /// their own part, never the same.
     fn hand_out(&mut self) {
-        let min = self.job.config.min_split;
+        let floor = Floor {
+            min: self.job.config.min_split,
+            min_time: self.job.config.min_split_time,
+        };
         let Some(Open {
             mode: Mode::Pieces { unclaimed, .. },
             ..
@@ -909,30 +921,37 @@ impl Download {
         };
         // A link that is stopping or resting gives no work and takes none:
         // its connections are ending, and their rest comes back by itself.
-        let taking: Vec<LinkId> = self
+        // Each other's speed, and connections, for a seat not measured yet.
+        let taking: HashMap<LinkId, (Option<u64>, u32)> = self
             .members
             .iter()
             .filter(|m| m.present && m.agrees && m.resting.is_none())
-            .map(|m| m.id)
+            .map(|m| (m.id, (m.rate.bps(), m.workers)))
             .collect();
+        let rate_of = |seat: &Seat| {
+            let (link, connections) = taking.get(&seat.link).copied().unwrap_or((None, 0));
+            seat_rate(seat.rate.bps(), link, connections)
+        };
         let mut idle: Vec<u64> = self
             .seats
             .iter()
-            .filter(|(_, s)| s.idle && taking.contains(&s.link))
+            .filter(|(_, s)| s.idle && taking.contains_key(&s.link))
             .map(|(seat, _)| *seat)
             .collect();
         idle.sort_unstable();
         for seat in idle {
             let range = if unclaimed.is_empty() {
-                let busy: Vec<(u64, Claim)> = self
+                let busy: Vec<(u64, Claim, Option<u64>)> = self
                     .seats
                     .iter()
-                    .filter(|(_, s)| !s.idle && taking.contains(&s.link))
-                    .map(|(at, s)| (*at, *s.hand.claim.lock().unwrap()))
+                    .filter(|(_, s)| !s.idle && taking.contains_key(&s.link))
+                    .map(|(at, s)| (*at, *s.hand.claim.lock().unwrap(), rate_of(s)))
                     .collect();
-                let Some(cut) = to_split(&busy, min)
-                    .and_then(|victim| self.seats[&victim].hand.claim.lock().unwrap().split(min))
-                else {
+                let taker = rate_of(&self.seats[&seat]);
+                let Some(cut) = to_split(&busy, taker, floor).and_then(|cut| {
+                    let mut claim = self.seats[&cut.seat].hand.claim.lock().unwrap();
+                    claim.split(cut.keep)
+                }) else {
                     return;
                 };
                 cut
@@ -964,6 +983,7 @@ impl Download {
                 heard: heard.clone(),
                 hand: hand.clone(),
                 idle: true,
+                rate: Rate::default(),
             },
         );
         member.workers += 1;
@@ -1396,7 +1416,7 @@ impl Download {
                 link: m.id,
                 name: m.name.clone(),
                 bytes: m.written.load(Ordering::SeqCst),
-                bps: if moving { m.speed.bps } else { 0 },
+                bps: if moving { m.rate.bps().unwrap_or(0) } else { 0 },
                 connections: m.workers,
                 note: m.note.clone(),
             })
@@ -1468,30 +1488,6 @@ fn next_rest(rest: Duration, most: Duration) -> Duration {
 fn heard_within(heard: u64, now: u64, window: Duration) -> bool {
     let window = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
     heard > 0 && now.saturating_sub(heard) < window
-}
-
-/// A link's speed over the last window, from its byte count at each tick.
-#[derive(Default)]
-struct Speed {
-    samples: VecDeque<(Instant, u64)>,
-    bps: u64,
-}
-
-impl Speed {
-    fn sample(&mut self, now: Instant, bytes: u64, window: Duration) {
-        self.samples.push_back((now, bytes));
-        // The oldest kept is the newest at least a window old.
-        while self.samples.len() > 1 && now.duration_since(self.samples[1].0) >= window {
-            self.samples.pop_front();
-        }
-        let (then, before) = self.samples[0];
-        let secs = now.duration_since(then).as_secs_f64();
-        self.bps = if secs > 0.0 {
-            ((bytes - before) as f64 * 8.0 / secs).round() as u64
-        } else {
-            0
-        };
-    }
 }
 
 #[cfg(test)]
