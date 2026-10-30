@@ -14,7 +14,7 @@ use barrage::fetch::{ControlError, DownloadConfig, Downloads, Phase};
 use fake::ms;
 use fetching::*;
 use serde_json::Value;
-use serve::{Answer, File, Seen, Server};
+use serve::{Answer, File, Server};
 
 /// Progress saved every 100 ms.
 fn saving() -> DownloadConfig {
@@ -32,17 +32,17 @@ fn slow() -> File {
     File::new(LENGTH).rate(2 * MIB).etag("\"v1\"")
 }
 
-/// The file from a server that holds every answer after its first MiB. Of
-/// its nine chunks, the five of 4 MiB (the last of them 3) stop a MiB in and
-/// the four of a quarter MiB at the end finish, so the download never gets
-/// past 6 MiB however slowly the test runs: an engine stopped there is
-/// stopped mid-download.
+/// The file from a server that holds every answer after its first MiB. Each
+/// of the eight connections asks for its part, about 2.5 MiB, and stops a
+/// MiB in, so the download never gets past 8 MiB however slowly the test
+/// runs: an engine stopped there is stopped mid-download, every connection
+/// partway through its part.
 fn held() -> File {
     File::new(LENGTH).stall_after(MIB)
 }
 
-/// What the finished chunks of [`held`] come to, the four at the end. Bytes
-/// written past this are of chunks still under way.
+/// More than any one connection of [`held`] writes. Bytes written past this
+/// are of several connections' parts under way, none of them finished.
 const FINISHED: u64 = MIB;
 
 /// The progress file for `name`, as the engine wrote it.
@@ -61,13 +61,10 @@ fn done_in(saved: &Value) -> u64 {
         .sum()
 }
 
-/// The file's bytes the server sent since request `from`, probes aside.
-fn sent_since(server: &Server, from: usize) -> u64 {
-    server.seen()[from..]
-        .iter()
-        .filter(|s| !is_probe(s))
-        .map(Seen::sent)
-        .sum()
+/// The file's bytes asked for since request `from`, probes aside, each
+/// counted once.
+fn asked_since(server: &Server, from: usize) -> u64 {
+    asked(&server.seen()[from..]).covered()
 }
 
 /// What is in the folder, by name, in order.
@@ -78,6 +75,38 @@ fn listing(dir: &Folder) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Review Focus 2 (phase 4): the progress saved while a download runs counts
+/// what each connection has written of its part so far, so an engine that
+/// is killed rather than stopped keeps it. No part here ends: the server
+/// holds every answer after its first MiB, and the read deadline would give
+/// one up only after 5 s.
+#[tokio::test]
+async fn progress_saved_while_running_counts_parts_under_way() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/running.bin", Answer::File(held().etag("\"v1\"")));
+    let dir = Folder::new("running");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), saving());
+    let id = downloads
+        .add(request(&server.url("/running.bin")))
+        .await
+        .unwrap();
+    wait_for(&downloads, id, "parts under way", |s| s.done > FINISHED).await;
+
+    // Saved every 100 ms: seen within 3 s, before any part could end.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let saved = loop {
+        let saved = progress(&dir, "running.bin").map_or(0, |p| done_in(&p));
+        if saved > FINISHED || std::time::Instant::now() > deadline {
+            break saved;
+        }
+        tokio::time::sleep(ms(50)).await;
+    };
+    let written = status_of(&downloads, id).done;
+    assert!(saved > FINISHED, "saved {saved} while {written} written");
+    downloads.shutdown().await;
 }
 
 #[tokio::test]
@@ -127,19 +156,15 @@ async fn stopping_saves_progress_and_adding_again_resumes() {
         note.starts_with("resumed: ") && note.ends_with(" were already here"),
         "{note}"
     );
-    let again = sent_since(&server, before);
-    assert!(
-        again <= LENGTH - had,
-        "sent {again}, but only {} were missing",
-        LENGTH - had
-    );
+    // Asked for exactly what was missing.
+    assert_eq!(asked_since(&server, before), LENGTH - had);
     assert_eq!(listing(&dir), ["resume.bin"]);
 }
 
 /// Saved while it runs, without being asked, with what each connection has
-/// written of the chunk it is on: here no big chunk ever finishes, so
-/// progress on disk past the small ones can only be that, and an engine
-/// killed mid-chunk loses no more than a save's worth.
+/// written of its part: here no part ever finishes, so progress on disk can
+/// only be that, and an engine killed mid-part loses no more than a save's
+/// worth.
 #[tokio::test]
 async fn progress_is_on_disk_while_it_runs() {
     let links = both();
@@ -192,7 +217,7 @@ async fn a_changed_file_starts_over() {
     );
     assert_same(&dir.read("changes.bin"), LENGTH);
     // Fetched in full: nothing kept of the old version.
-    assert_eq!(sent_since(&server, before), LENGTH);
+    assert_eq!(asked_since(&server, before), LENGTH);
     assert_eq!(listing(&dir), ["changes.bin"]);
 }
 
@@ -274,7 +299,7 @@ async fn a_file_with_no_version_starts_over() {
         )
     );
     assert_same(&dir.read("unnamed.bin"), LENGTH);
-    assert_eq!(sent_since(&server, before), LENGTH);
+    assert_eq!(asked_since(&server, before), LENGTH);
 }
 
 /// Another download's progress, under the name this one would take, is not
@@ -382,12 +407,8 @@ async fn stopping_one_download_saves_it_and_resuming_carries_on() {
         note.starts_with("resumed: ") && note.ends_with(" were already here"),
         "{note}"
     );
-    let again = sent_since(&server, before);
-    assert!(
-        again <= LENGTH - had,
-        "sent {again}, but only {} were missing",
-        LENGTH - had
-    );
+    // Asked for exactly what was missing.
+    assert_eq!(asked_since(&server, before), LENGTH - had);
     assert_same(&dir.read("paused.bin"), LENGTH);
     assert_eq!(listing(&dir), ["paused.bin"]);
     // One download all along, under its one id.

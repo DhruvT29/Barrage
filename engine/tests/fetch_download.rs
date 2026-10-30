@@ -34,8 +34,19 @@ async fn a_file_comes_down_through_every_link_byte_for_byte() {
         wifi > 0 && ethernet > 0,
         "Wi-Fi {wifi}, Ethernet 2 {ethernet}"
     );
-    // No byte twice: beyond the probes, the server sent exactly the file.
-    assert_eq!(wifi + ethernet, length);
+    // No byte written twice: `done` adds up what each link wrote, and it is
+    // the file (above). What the server sent is at least the file; past each
+    // cut it also sent what was already on its way when the cut connection
+    // reached its new end and closed (phase 4, Task 1): nothing on a quiet
+    // machine, up to the rest of the request on a loaded one (PLAN.md 3.6),
+    // so it is not bounded here. A request a part, not one a 4 MiB chunk.
+    let sent = wifi + ethernet;
+    assert!(sent >= length, "sent {sent} for {length}");
+    let pieces = seen
+        .iter()
+        .filter(|s| s.range.is_some() && !is_probe(s))
+        .count();
+    assert!(pieces <= 24, "{pieces} requests for parts of the file");
 }
 
 /// A finished file carries the mark a browser gives a download, so Windows

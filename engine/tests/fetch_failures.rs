@@ -52,6 +52,17 @@ fn busy() -> File {
     File::new(LENGTH).rate(4 * MIB)
 }
 
+/// For a link that leaves and comes back: the Wi-Fi at 512 KiB a second a
+/// connection, so alone it would take some 14 s over what is left, and the
+/// Ethernet comes back to plenty to cut however late a loaded machine lets
+/// the test see each step. Each connection's part is cut only while it has
+/// 1 MiB left, and the download no longer pauses between 4 MiB chunks, so
+/// at the old rates a step seen 2 s late came after the last cut (phase 4,
+/// Task 1).
+fn slow_wifi() -> File {
+    File::new(LENGTH).rate(2 * MIB).rate_for(WIFI, MIB / 2)
+}
+
 /// Ethernet 2's share in `status`, once it has one.
 fn ethernet_in(status: &DownloadStatus) -> Option<&LinkShare> {
     status.links.iter().find(|l| l.name == "Ethernet 2")
@@ -269,15 +280,13 @@ async fn a_link_leaving_the_table_loses_no_written_bytes() {
 #[tokio::test]
 async fn a_link_that_comes_back_rejoins() {
     let (links, live) = live_links(vec![wifi(), ethernet()]);
-    // Half the usual rate, so the Wi-Fi alone is slow to finish: finding a
-    // link again takes a while on a loaded machine.
-    let file = File::new(LENGTH).rate(2 * MIB);
+    let file = slow_wifi();
     let (server, dir, downloads, id) = start_with("returns.bin", file, &links, failing()).await;
     wait_for(&downloads, id, "30%", |s| s.done >= LENGTH * 3 / 10).await;
     live.set(vec![wifi()]);
     // Back as soon as it is seen gone, while most of the file is still to
-    // fetch: on a loaded machine finding it again takes a while, and a link
-    // that comes back to an empty pile has nothing to carry.
+    // fetch: a link that comes back when every part left is too small to
+    // cut has nothing to carry.
     wait_for(&downloads, id, "Ethernet 2 gone", |s| {
         ethernet_in(s).is_some_and(|l| l.connections == 0)
     })
@@ -319,7 +328,7 @@ async fn a_link_that_stops_working_and_works_again_rejoins_as_itself() {
         ..WatchConfig::every(ms(20))
     };
     let links = LinkHandle::start_with(Arc::new(net), watch).unwrap();
-    let file = File::new(LENGTH).rate(2 * MIB);
+    let file = slow_wifi();
     let (server, dir, downloads, id) = start_with("blips.bin", file, &links, failing()).await;
     wait_for(&downloads, id, "30% with Ethernet 2 carrying", |s| {
         s.done >= LENGTH * 3 / 10 && ethernet_in(s).is_some_and(|l| l.bytes > 0)
@@ -586,33 +595,58 @@ async fn a_server_error_to_a_piece_rests_the_link_rather_than_drop_it() {
 async fn a_retry_after_of_nothing_still_rests_and_backs_off() {
     let links = both();
     let file = busy().refuse(ETHERNET, None, Some("0"));
+    let began = std::time::Instant::now();
     let (server, dir, downloads, id) = start_with("no-time.bin", file, &links, failing()).await;
     let history = record(&downloads, id);
 
     let end = ended(&downloads, id).await;
+    let took = began.elapsed();
     assert_eq!(end.phase, Phase::Done, "{end:?}");
     assert_same(&dir.read("no-time.bin"), LENGTH);
     let notes = ethernet_notes(&history.await.unwrap());
     let rest = "the server refused this cable's connections (429 Too Many Requests); it rests";
     assert!(notes.iter().any(|n| n.starts_with(rest)), "{notes:?}");
-    // Four at the start, then one trial a rest (200, 400, 800 ms, then a
-    // second each) while the Wi-Fi fetches the file alone.
+    // Four at the start, then one trial a rest while the Wi-Fi fetches the
+    // file alone: as many as the rests leave room for in the time it took,
+    // however long a loaded machine made that. Asked again at once, or every
+    // 200 ms, it would be many more.
     let refusals = refused(&server.seen()).len();
+    let allowed = 4 + trials_within(took);
     assert!(
-        refusals <= 12,
-        "{refusals} refusals: it asked again at once"
+        refusals <= allowed,
+        "{refusals} refusals in {took:?}, room for {allowed}: it asked again too soon"
     );
+}
+
+/// How many trials rests of 200, 400 and 800 ms, then a second each, as
+/// [`failing`] sets them, leave room for in `time`.
+fn trials_within(time: Duration) -> usize {
+    let (mut rest, mut at, mut trials) = (ms(200), Duration::ZERO, 0);
+    loop {
+        at += rest;
+        if at > time {
+            return trials;
+        }
+        trials += 1;
+        rest = (rest * 2).min(ms(1000));
+    }
 }
 
 /// A link redirected to an address that stops working, as signed CDN
 /// addresses do when they expire, finds the file again from the URL given,
-/// and carries on through the fresh address.
+/// and carries on through the fresh address. Each answer here carries at
+/// most 4 MiB, as some CDNs' do, so connections ask the expired address
+/// again: one answer already under way would carry its part to the end
+/// (phase 4, Task 1), and no expiry would show.
 #[tokio::test]
 async fn an_expired_redirect_is_followed_again() {
     let links = both();
     let server = Server::start().await;
     server.at("/get", Answer::Redirect(302, "/signed-1".to_string()));
-    server.at("/signed-1", Answer::File(busy().etag("\"v1\"")));
+    server.at(
+        "/signed-1",
+        Answer::File(busy().etag("\"v1\"").max_answer(4 * MIB)),
+    );
     let dir = Folder::new("expired");
     let downloads = Downloads::with_config(links.table(), dir.0.clone(), failing());
     let id = downloads.add(request(&server.url("/get"))).await.unwrap();

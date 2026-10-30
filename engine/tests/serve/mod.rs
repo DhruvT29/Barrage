@@ -74,6 +74,11 @@ pub struct File {
     pub stalls: Vec<Stall>,
     pub caps: Vec<Cap>,
     pub refusals: Vec<Refusal>,
+    /// Refusals for probes alone: the first ranged request of each link.
+    pub probe_refusals: Vec<Refusal>,
+    pub limits: Vec<Limit>,
+    /// The rate one source is sent at instead of `rate`.
+    pub rate_for: Vec<(IpAddr, u64)>,
     /// The ETag one source is sent instead of `etag`: another version of the
     /// file, as one CDN node might hold.
     pub etag_for: Vec<(IpAddr, String)>,
@@ -183,6 +188,36 @@ impl Refusal {
     }
 }
 
+/// Answer `429 Too Many Requests`, with no `Retry-After`, to one source's
+/// requests beyond what a bucket allows: `burst` at once, then one more each
+/// `every`. Probes count too. Hetzner's speed servers limit requests per
+/// address this way (phase 3, Task 12).
+#[derive(Clone, Debug)]
+pub struct Limit {
+    source: IpAddr,
+    burst: f64,
+    every: Duration,
+    /// Tokens left, and when they were last counted.
+    bucket: Arc<Mutex<(f64, Instant)>>,
+}
+
+impl Limit {
+    /// Spend a token on one request, if there is one.
+    fn take(&self) -> bool {
+        let mut bucket = self.bucket.lock().unwrap();
+        let now = Instant::now();
+        let earned = now.duration_since(bucket.1).as_secs_f64() / self.every.as_secs_f64();
+        bucket.0 = (bucket.0 + earned).min(self.burst);
+        bucket.1 = now;
+        if bucket.0 >= 1.0 {
+            bucket.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl File {
     pub fn new(length: u64) -> Self {
         Self {
@@ -201,6 +236,9 @@ impl File {
             stalls: Vec::new(),
             caps: Vec::new(),
             refusals: Vec::new(),
+            probe_refusals: Vec::new(),
+            limits: Vec::new(),
+            rate_for: Vec::new(),
             etag_for: Vec::new(),
             replaced: None,
             requests: Arc::new(AtomicUsize::new(0)),
@@ -340,6 +378,45 @@ impl File {
             status,
             retry_after: retry_after.map(str::to_string),
         });
+        self
+    }
+
+    /// Refuse the next `times` probes from `source` with `status` and this
+    /// `Retry-After` if any. Pieces pass.
+    pub fn refuse_probe(
+        mut self,
+        source: &str,
+        times: usize,
+        status: u16,
+        retry_after: Option<&str>,
+    ) -> Self {
+        self.probe_refusals.push(Refusal {
+            source: source.parse().unwrap(),
+            left: Some(Arc::new(AtomicUsize::new(times))),
+            status,
+            retry_after: retry_after.map(str::to_string),
+        });
+        self
+    }
+
+    /// Allow `source` `burst` requests at once, then one more each `every`,
+    /// refusing the rest with 429 and no `Retry-After`, probes included.
+    pub fn limit(mut self, source: &str, burst: u32, every: Duration) -> Self {
+        let burst = f64::from(burst);
+        self.limits.push(Limit {
+            source: source.parse().unwrap(),
+            burst,
+            every,
+            bucket: Arc::new(Mutex::new((burst, Instant::now()))),
+        });
+        self
+    }
+
+    /// Send `source` its answers at this many bytes a second, whatever
+    /// `rate` says for the others.
+    pub fn rate_for(mut self, source: &str, bytes_per_second: u64) -> Self {
+        self.rate_for
+            .push((source.parse().unwrap(), bytes_per_second));
         self
     }
 }
@@ -593,6 +670,8 @@ struct Plan {
     refused: Option<(u16, Option<String>)>,
     /// Its place under a [`Cap`], held for as long as it is answered.
     slot: Option<Slot>,
+    /// Bytes a second, if paced.
+    rate: Option<u64>,
     /// The file as this request finds it.
     length: u64,
     etag: Option<String>,
@@ -648,7 +727,16 @@ impl File {
         let piece = range.end - range.start > PROBE_BYTES && matches!(kind, Kind::Partial);
         // A piece is refused before anything else is decided about it.
         let (mut refused, mut slot) = (None, None);
-        if piece {
+        if self.limits.iter().any(|l| l.source == source && !l.take()) {
+            refused = Some((429, None));
+        } else if !piece
+            && let Some(r) = self
+                .probe_refusals
+                .iter()
+                .find(|r| r.source == source && r.take())
+        {
+            refused = Some((r.status, r.retry_after.clone()));
+        } else if piece {
             if let Some(r) = self
                 .refusals
                 .iter()
@@ -678,6 +766,12 @@ impl File {
             stall,
             refused,
             slot,
+            rate: self
+                .rate_for
+                .iter()
+                .find(|(s, _)| *s == source)
+                .map(|(_, rate)| *rate)
+                .or(self.rate),
             length,
             etag,
         }
@@ -794,7 +888,7 @@ fn body(file: &File, plan: Plan, sent: Arc<AtomicU64>, finished: Arc<OnceLock<In
     let Range { start, end } = plan.range;
     let real_until = plan.real_until;
     let cut = plan.cut;
-    let rate = file.rate;
+    let rate = plan.rate;
     let stop = file
         .stall_after
         .map_or(end, |bytes| end.min(start.saturating_add(bytes)))

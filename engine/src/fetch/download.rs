@@ -10,11 +10,17 @@
 //! item 14). Every usable link, or only the named cables, finds the file
 //! from the URL itself, through its own redirects. The first to answer fixes
 //! the file: its name, its length, its version, and a full-size `.part` in
-//! the download folder. Every chunk of [`plan`] goes on one pile, and each
-//! link that found the same file gets its workers, which take chunks until
-//! none are left. A worker reports what it wrote and the rest of its chunk
-//! goes back on the pile. Once every byte is written the file is flushed to
-//! disk and named, and the download is done.
+//! the download folder. Each link that found the same file gets its
+//! workers, and the coordinator gives each one a part of the file, a claim
+//! (`spans.rs`), which it asks for in one request. A worker with nothing to
+//! do takes the first part nobody has; when there is none, the claim with
+//! the most left is cut in two and it takes the back half, so a download
+//! sends a request per cut, not one per 4 MiB (PLAN.md phase 3 item 8).
+//! Several with nothing to do, as when a link joins, are each given theirs
+//! before any asks. A worker that fails reports what it wrote, and the rest
+//! of its claim is given to the next one with nothing to do. Once every
+//! byte is written the file is flushed to disk and named, and the download
+//! is done.
 //!
 //! WHEN THE SERVER AND THE LINKS DISAGREE
 //!
@@ -33,8 +39,8 @@
 //! link received bytes within the read deadline, the connection was bad, not
 //! the link: a fresh one takes its place after `retry_connection`. If none
 //! did, the link is failing for this download: all its connections stop,
-//! what they wrote stays written and the rest of their chunks go back on the
-//! pile for the other links, and it rests, `rest_first` doubling with each
+//! what they wrote stays written and the rest of their claims goes to the
+//! other links, and it rests, `rest_first` doubling with each
 //! rest in a row up to `rest_max`, before one connection tries again. That
 //! one working brings back the rest. A link that leaves the table, or stops
 //! being usable, is stopped at once, without waiting for a deadline; if it
@@ -54,7 +60,9 @@
 //! `Retry-After` asks, up to `max_retry_after`, and sits the download out if
 //! asked to wait longer; with no `Retry-After`, or one shorter than a rest,
 //! it rests as a failing link. A link that works again after waiting may
-//! hold all its connections again, and learns the ceiling afresh.
+//! hold all its connections again, and learns the ceiling afresh. A refused
+//! probe is waited out or rested the same way, and then the link finds the
+//! file again (BRG-64).
 //!
 //! WHEN AN ADDRESS EXPIRES
 //!
@@ -70,8 +78,8 @@
 //! WHEN THE ENGINE STOPS
 //!
 //! Progress is saved beside the `.part` (`saved.rs`) at most every
-//! `save_every`, with what each connection has written of the chunk it is
-//! on, and once more at the end: when the engine stops, every connection
+//! `save_every`, with what each connection has written of its claim, and
+//! once more at the end: when the engine stops, every connection
 //! stops and reports what it wrote first, and a download that fails saves
 //! what it had before it shows as failed. Each save flushes the `.part`
 //! first, and runs in the background, one at a time, so a slow disk holds
@@ -91,8 +99,8 @@ use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Url;
@@ -102,12 +110,13 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::disk::{create_part, mark_from_internet, name_finished, reopen_part};
 use super::name::{names_like, taken};
-use super::remote::{Remote, differs, find};
+use super::remote::{Refused, Remote, differs, find};
 use super::saved::{Saved, load, progress_path, save};
+use super::spans::{Claim, Hand, to_split};
 use super::worker::{Exit, Outcome, Report, Worker, stamp};
 use super::{
-    DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, plan, same_file,
-    size_words, wait_words,
+    DownloadConfig, DownloadId, DownloadStatus, LinkShare, Phase, Ranges, same_file, size_words,
+    wait_words,
 };
 use crate::links::watch::LinkTable;
 use crate::links::{Link, LinkId};
@@ -216,8 +225,10 @@ struct Seat {
     link: LinkId,
     /// When its connection last received bytes (`Worker::heard`).
     heard: Arc<AtomicU64>,
-    /// What it has written of the chunk it is on (`Worker::doing`).
-    doing: Arc<Mutex<Option<Range<u64>>>>,
+    /// Its claim on the file, shared with its worker (`Worker::hand`).
+    hand: Arc<Hand>,
+    /// Nothing to do: it has reported its claim done, or has had none yet.
+    idle: bool,
 }
 
 /// One link's part in the download.
@@ -268,11 +279,12 @@ struct Open {
 }
 
 enum Mode {
-    /// Pieces, off one pile, from every link that agrees about the file.
+    /// Pieces, from every link that agrees about the file.
     Pieces {
         length: u64,
-        pile: flume::Sender<Range<u64>>,
-        taken: flume::Receiver<Range<u64>>,
+        /// What no connection has claimed, in file order: the file's missing
+        /// parts at first, then what failed connections leave.
+        unclaimed: Vec<Range<u64>>,
     },
     /// The whole file through one link, for a server that sends no pieces
     /// or no length.
@@ -405,6 +417,7 @@ impl Download {
                     if let (Some(link), Some(why)) = (link, exit) {
                         self.broken(link, why);
                     }
+                    self.hand_out();
                 }
             }
             Event::Table(true) => {
@@ -502,8 +515,8 @@ impl Download {
     }
 
     /// The progress now, with what saving it needs: the bytes written, every
-    /// chunk reported and what each connection has written of the chunk it
-    /// is on. `None` for a file fetched whole, or not yet found.
+    /// part reported and what each connection has written of its claim so
+    /// far. `None` for a file fetched whole, or not yet found.
     fn snapshot(&self) -> Option<Snapshot> {
         let open = self.file.as_ref()?;
         let Mode::Pieces { length, .. } = open.mode else {
@@ -512,9 +525,8 @@ impl Download {
         let path = self.progress_file.clone()?;
         let mut done = open.done.clone();
         for seat in self.seats.values() {
-            if let Some(range) = seat.doing.lock().unwrap().clone() {
-                done.insert(range);
-            }
+            let claim = *seat.hand.claim.lock().unwrap();
+            done.insert(claim.start..claim.written);
         }
         let saved = Saved {
             url: self.job.url.to_string(),
@@ -653,8 +665,20 @@ impl Download {
         }
         let remote = match found {
             Ok(remote) => remote,
+            // A 429 or a 503 to the probe: the server limits this address,
+            // it does not refuse the file (BRG-64).
             Err(e) => {
-                member.note = Some(format!("{e:#}"));
+                match e.downcast_ref::<Refused>() {
+                    Some(refused) => {
+                        let why = format!(
+                            "the server refused this cable's request for the file ({})",
+                            refused.status
+                        );
+                        let wait = refused.wait;
+                        self.turned_away(link, why, wait);
+                    }
+                    None => member.note = Some(format!("{e:#}")),
+                }
                 return;
             }
         };
@@ -682,9 +706,8 @@ impl Download {
     }
 
     /// Fix the file as `remote`, found through `link`, describes it: a
-    /// full-size `.part` and the chunks still missing on the pile, or the
-    /// whole file for `link` alone when the server sends no pieces or no
-    /// length.
+    /// full-size `.part` and what is still missing to hand out, or the whole
+    /// file for `link` alone when the server sends no pieces or no length.
     fn open(&mut self, remote: &Remote, link: LinkId) -> Result<(), String> {
         let pieces = remote.length.filter(|_| remote.ranges);
         let (name, part, file, done) = match pieces {
@@ -700,15 +723,10 @@ impl Download {
         mark_from_internet(&part, &remote.url);
         let mode = match pieces {
             Some(length) => {
-                let (pile, taken) = flume::unbounded();
-                for chunk in plan(length, &done) {
-                    let _ = pile.send(chunk);
-                }
                 self.progress_file = Some(progress_path(&part));
                 Mode::Pieces {
                     length,
-                    pile,
-                    taken,
+                    unclaimed: done.missing(length),
                 }
             }
             None => {
@@ -831,6 +849,8 @@ impl Download {
         if whole {
             let length = self.length;
             if let Some((seat, worker)) = self.seat(link) {
+                // Its claim is the whole file, however long it turns out.
+                *worker.hand.claim.lock().unwrap() = Claim::new(0..length.unwrap_or(u64::MAX));
                 let task = self.workers.spawn(worker.run_whole(length));
                 self.working.insert(task.id(), seat);
             }
@@ -841,16 +861,17 @@ impl Download {
 
     /// Start up to `n` more workers on `link`, taking pieces, never past as
     /// many as it may hold: one while it is trying after a rest, else
-    /// `workers_per_link`. None while it rests.
+    /// `workers_per_link`. None while it rests. Each is given its part of
+    /// the file before any asks.
     fn add_workers(&mut self, link: LinkId, n: usize) {
         let Some(Open {
-            mode: Mode::Pieces { length, taken, .. },
+            mode: Mode::Pieces { length, .. },
             ..
         }) = &self.file
         else {
             return;
         };
-        let (length, taken) = (*length, taken.clone());
+        let length = *length;
         let Some(member) = self.members.iter().find(|m| m.id == link) else {
             return;
         };
@@ -865,10 +886,65 @@ impl Download {
         let room = most.saturating_sub(member.workers) as usize;
         for _ in 0..n.min(room) {
             let Some((seat, worker)) = self.seat(link) else {
-                return;
+                break;
             };
-            let task = self.workers.spawn(worker.run(taken.clone(), length));
+            let task = self.workers.spawn(worker.run(length));
             self.working.insert(task.id(), seat);
+        }
+        self.hand_out();
+    }
+
+    /// Give every connection with nothing to do a part of the file: the
+    /// first part nobody has, or else the back half of the claim with the
+    /// most left, until none can be cut. One after another, so several at
+    /// once each ask for their own part, never the same.
+    fn hand_out(&mut self) {
+        let min = self.job.config.min_split;
+        let Some(Open {
+            mode: Mode::Pieces { unclaimed, .. },
+            ..
+        }) = &mut self.file
+        else {
+            return;
+        };
+        // A link that is stopping or resting gives no work and takes none:
+        // its connections are ending, and their rest comes back by itself.
+        let taking: Vec<LinkId> = self
+            .members
+            .iter()
+            .filter(|m| m.present && m.agrees && m.resting.is_none())
+            .map(|m| m.id)
+            .collect();
+        let mut idle: Vec<u64> = self
+            .seats
+            .iter()
+            .filter(|(_, s)| s.idle && taking.contains(&s.link))
+            .map(|(seat, _)| *seat)
+            .collect();
+        idle.sort_unstable();
+        for seat in idle {
+            let range = if unclaimed.is_empty() {
+                let busy: Vec<(u64, Claim)> = self
+                    .seats
+                    .iter()
+                    .filter(|(_, s)| !s.idle && taking.contains(&s.link))
+                    .map(|(at, s)| (*at, *s.hand.claim.lock().unwrap()))
+                    .collect();
+                let Some(cut) = to_split(&busy, min)
+                    .and_then(|victim| self.seats[&victim].hand.claim.lock().unwrap().split(min))
+                else {
+                    return;
+                };
+                cut
+            } else {
+                unclaimed.remove(0)
+            };
+            let given = &self.seats[&seat];
+            *given.hand.claim.lock().unwrap() = Claim::new(range);
+            given.hand.ready.notify_one();
+            if let Some(given) = self.seats.get_mut(&seat) {
+                given.idle = false;
+            }
         }
     }
 
@@ -880,13 +956,14 @@ impl Download {
         let seat = self.next_seat;
         self.next_seat += 1;
         let heard = Arc::new(AtomicU64::new(0));
-        let doing = Arc::new(Mutex::new(None));
+        let hand = Arc::new(Hand::default());
         self.seats.insert(
             seat,
             Seat {
                 link,
                 heard: heard.clone(),
-                doing: doing.clone(),
+                hand: hand.clone(),
+                idle: true,
             },
         );
         member.workers += 1;
@@ -895,7 +972,7 @@ impl Download {
             seat,
             heard,
             epoch: self.epoch,
-            doing,
+            hand,
             local: member.local,
             url: remote.url.clone(),
             validator: remote.validator.clone(),
@@ -909,11 +986,25 @@ impl Download {
     }
 
     /// `seat`'s worker has ended, or reported an end: it is no longer one of
-    /// its link's connections.
+    /// its link's connections, and what it had not written of its claim is
+    /// for someone else.
     fn release(&mut self, seat: u64) {
-        if let Some(gone) = self.seats.remove(&seat)
-            && let Some(member) = self.member(gone.link)
+        let Some(gone) = self.seats.remove(&seat) else {
+            return;
+        };
+        let rest = gone.hand.claim.lock().unwrap().give_up();
+        if let (
+            Some(rest),
+            Some(Open {
+                mode: Mode::Pieces { unclaimed, .. },
+                ..
+            }),
+        ) = (rest, &mut self.file)
         {
+            let at = unclaimed.partition_point(|r| r.start < rest.start);
+            unclaimed.insert(at, rest);
+        }
+        if let Some(member) = self.member(gone.link) {
             member.workers -= 1;
         }
     }
@@ -922,36 +1013,27 @@ impl Download {
         let Some(open) = &mut self.file else {
             return;
         };
-        let Range { start, end } = report.range;
+        let start = report.range.start;
         let written_to = start + report.written;
         open.done.insert(start..written_to);
-        // Counted in `done` now. The worker may have begun its next chunk
-        // already, which it says itself, so only this one's is cleared.
-        if let Some(seat) = self.seats.get(&report.seat) {
-            let mut doing = seat.doing.lock().unwrap();
-            if doing.as_ref().is_some_and(|r| r.start == start) {
-                *doing = None;
-            }
-        }
-        let whole = match &open.mode {
-            Mode::Pieces { pile, .. } => {
-                if written_to < end {
-                    // Only what is still missing goes back.
-                    let _ = pile.send(written_to..end);
-                }
-                false
-            }
-            Mode::Whole { .. } => true,
-        };
+        let whole = matches!(open.mode, Mode::Whole { .. });
         let complete = match &open.mode {
             Mode::Pieces { length, .. } => open.done.is_complete(*length),
             Mode::Whole { .. } => report.outcome == Outcome::Done,
         };
         let part = open.part.clone();
-        // A worker carries on after a chunk it got; after anything else it
-        // is ending, and no longer one of its link's connections.
-        if !matches!(report.outcome, Outcome::Done | Outcome::Short) {
-            self.release(report.seat);
+        match report.outcome {
+            // Its claim is done: it waits for the next part.
+            Outcome::Done => {
+                if let Some(seat) = self.seats.get_mut(&report.seat) {
+                    seat.idle = true;
+                }
+            }
+            // It asks again for the rest of its claim.
+            Outcome::Short => {}
+            // It is ending, and no longer one of its link's connections; the
+            // rest of its claim is for someone else.
+            _ => self.release(report.seat),
         }
         match (whole, report.outcome) {
             (_, Outcome::Changed(why)) => return self.fail(why),
@@ -997,6 +1079,8 @@ impl Download {
                 self.length = Some(written_to);
             }
             self.finish().await;
+        } else {
+            self.hand_out();
         }
     }
 
@@ -1030,7 +1114,6 @@ impl Download {
     /// say, or asked for less than a rest: asking again at once, round after
     /// round, is what a server limiting requests counts against it.
     fn capped(&mut self, link: LinkId, refused: &str, wait: Option<Duration>) {
-        let (most, least) = (self.job.config.max_retry_after, self.job.config.rest_first);
         let Some(member) = self.member(link) else {
             return;
         };
@@ -1045,14 +1128,26 @@ impl Download {
             ));
             return;
         }
+        let why = format!("the server refused this cable's connections ({refused})");
+        self.turned_away(link, why, wait);
+    }
+
+    /// The server turned `link` away altogether, asking it to wait `wait`
+    /// if it said: it waits that long, sits the download out if that is
+    /// longer than `max_retry_after`, or rests as a failing link, saying
+    /// `why`, when the server did not say or asked for less than a rest.
+    fn turned_away(&mut self, link: LinkId, why: String, wait: Option<Duration>) {
+        let (most, least) = (self.job.config.max_retry_after, self.job.config.rest_first);
         match wait {
             Some(wait) if wait > most => {
-                member.refills.clear();
-                member.note = Some(format!(
-                    "sits out: the server asked this cable to wait {}, longer than {}",
-                    wait_words(wait),
-                    wait_words(most)
-                ));
+                if let Some(member) = self.member(link) {
+                    member.refills.clear();
+                    member.note = Some(format!(
+                        "sits out: the server asked this cable to wait {}, longer than {}",
+                        wait_words(wait),
+                        wait_words(most)
+                    ));
+                }
             }
             Some(wait) if wait >= least => {
                 let note = format!(
@@ -1061,10 +1156,7 @@ impl Download {
                 );
                 self.pause(link, wait, note);
             }
-            _ => self.rest(
-                link,
-                format!("the server refused this cable's connections ({refused})"),
-            ),
+            _ => self.rest(link, why),
         }
     }
 
@@ -1162,7 +1254,8 @@ impl Download {
     }
 
     /// Start whatever is due: one connection trying each link whose rest is
-    /// over, and fresh connections in place of failed ones.
+    /// over, after finding the file again if it was turned away before it
+    /// found it, and fresh connections in place of failed ones.
     fn wake(&mut self) {
         let now = Instant::now();
         let mut due = Vec::new();
@@ -1181,7 +1274,15 @@ impl Download {
             }
         }
         for (link, n) in due {
-            self.add_workers(link, n);
+            let found = self
+                .members
+                .iter()
+                .any(|m| m.id == link && m.remote.is_some());
+            if found {
+                self.add_workers(link, n);
+            } else {
+                self.join(link);
+            }
         }
     }
 
@@ -1194,7 +1295,7 @@ impl Download {
         let Open {
             part, file, mode, ..
         } = open;
-        // A closed pile ends the workers waiting on it, and a stop the rest.
+        // The stop ends every worker, those waiting for a part too.
         drop(mode);
         for member in &self.members {
             member.stop.send_replace(true);

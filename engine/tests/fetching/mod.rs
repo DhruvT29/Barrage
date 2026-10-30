@@ -14,7 +14,7 @@ use std::time::Duration;
 use barrage::LinkHandle;
 use barrage::fetch::{
     AddRequest, DownloadConfig, DownloadId, DownloadStatus, Downloads, LinkShare, PROBE_BYTES,
-    Phase,
+    Phase, Ranges,
 };
 use barrage::links::Candidate;
 use barrage::links::watch::WatchConfig;
@@ -175,6 +175,19 @@ pub fn record(
 
 pub fn is_probe(seen: &Seen) -> bool {
     seen.asked() == Some((0, PROBE_BYTES - 1))
+}
+
+/// Every byte of the file these requests asked for, probes aside, each
+/// counted once. Since phase 4 a connection's request can be cut short and
+/// another asks for the back of it, so what the server sent includes what
+/// was on its way past a cut; what was asked says which bytes the engine
+/// wanted.
+pub fn asked(seen: &[Seen]) -> Ranges {
+    let mut asked = Ranges::new();
+    for (start, last) in seen.iter().filter(|s| !is_probe(s)).filter_map(Seen::asked) {
+        asked.insert(start..last + 1);
+    }
+    asked
 }
 
 /// The file's bytes the server sent to `source`, its probes aside.

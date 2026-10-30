@@ -1,29 +1,31 @@
 //! Downloads: one file fetched through every working link at once.
 //!
-//! Each link's workers pull the next chunk from a shared pile, fetch it with
-//! a `Range` request through their own address, and write it at its place in
-//! the file, so a faster link simply fetches more.
+//! Each link's workers are given a long part of the file each, fetch it with
+//! one `Range` request through their own address, and write it at its place
+//! in the file. One with nothing left to do takes half of what another has
+//! left, so a faster link simply fetches more, with tens of requests per
+//! download rather than hundreds.
 //!
 //! | module | role |
 //! |---|---|
 //! | `ranges` | [`Ranges`]: the bytes done (pure) |
-//! | `chunk` | [`plan`]: the chunks still to fetch (pure) |
+//! | `spans` | one connection's part of the file, and where to cut one (pure) |
 //! | `name` | [`file_name`], [`free_name`]: safe names, never one taken |
 //! | `remote` | [`find`]: what one link sees at the URL; [`retry_after`] |
 //! | `disk` | the `.part`: full size at once, written at offsets, named last; the Downloads folder |
 //! | `saved` | the progress beside the `.part`, so the next engine resumes it |
-//! | `worker` | one connection: a chunk, its bytes, a report |
+//! | `worker` | one connection: its part, its bytes, a report |
 //! | `download` | one download's coordinator, the owner of its state |
 //!
 //! [`Downloads`] starts a coordinator per URL and gathers their status.
 
-pub mod chunk;
 mod disk;
 mod download;
 pub mod name;
 pub mod ranges;
 pub mod remote;
 mod saved;
+mod spans;
 mod worker;
 
 use std::collections::HashMap;
@@ -40,11 +42,10 @@ use tokio::task::JoinHandle;
 use crate::links::LinkId;
 use crate::links::watch::LinkTable;
 
-pub use chunk::plan;
 pub use disk::downloads_folder;
 pub use name::{file_name, free_name};
 pub use ranges::Ranges;
-pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Remote, Validator, find, retry_after};
+pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Refused, Remote, Validator, find, retry_after};
 
 /// Every download the engine runs, and what each is doing. Cheap to clone:
 /// the clones share the downloads.
@@ -167,6 +168,11 @@ pub struct DownloadConfig {
     /// How often a download's progress is saved beside its `.part`, so an
     /// engine that is killed loses no more than this much of it.
     pub save_every: Duration,
+    /// The least a cut leaves each side: a connection's part with less than
+    /// twice this left is not cut for another. Every cut costs a request,
+    /// and the end of a file is still split finely enough that no link waits
+    /// long on another.
+    pub min_split: u64,
 }
 
 impl Default for DownloadConfig {
@@ -184,6 +190,7 @@ impl Default for DownloadConfig {
             // Cloudflare answered Retry-After: 3311 in phase 2.
             max_retry_after: Duration::from_secs(60),
             save_every: Duration::from_secs(1),
+            min_split: 512 << 10,
         }
     }
 }

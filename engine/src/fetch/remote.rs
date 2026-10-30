@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, bail, ensure};
 use reqwest::header::{
     CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderName, LAST_MODIFIED,
-    LOCATION, RANGE,
+    LOCATION, RANGE, RETRY_AFTER,
 };
 use reqwest::{Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,24 @@ pub fn differs(fixed: &Remote, other: &Remote) -> Option<String> {
     }
 }
 
+/// The server answered the probe `429 Too Many Requests` or `503 Service
+/// Unavailable`: it limits this address, and may say how long to wait. Not a
+/// verdict on the file, so the link waits or rests and finds it again
+/// (BRG-64). Carried inside the error [`find`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub status: StatusCode,
+    pub wait: Option<Duration>,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the server answered {}", self.status)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// How long a `Retry-After` header asks to wait, from `now`: whole seconds,
 /// or until an HTTP date in any of HTTP's three forms. A date already past
 /// is no wait; more seconds than a clock can hold are as long as can be.
@@ -210,6 +228,13 @@ fn describe(url: Url, response: &Response) -> anyhow::Result<Remote> {
         // 416, with `Content-Range: bytes */0`.
         StatusCode::RANGE_NOT_SATISFIABLE if unsatisfied_length(headers) == Some(0) => {
             (Some(0), true)
+        }
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+            let wait = headers
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| retry_after(v, SystemTime::now()));
+            return Err(Refused { status, wait }.into());
         }
         _ => bail!("{url} answered {status}"),
     };
