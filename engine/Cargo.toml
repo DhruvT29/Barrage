@@ -13,6 +13,11 @@ dns-lookup = "4.0.2"
 # the tree through hyper, so no new code is fetched.
 httpdate = "1.0.3"
 if-addrs = "0.15.0"
+# BitTorrent, from the fork that lets BARRAGE open each peer connection
+# itself (librqbit 9.1 cannot bind one to a chosen address on Windows).
+# Pinned by commit: github.com/DhruvT29/rqbit, branch `barrage`. rustls,
+# as reqwest here; the default TLS would add a second stack.
+librqbit = { git = "https://github.com/DhruvT29/rqbit", rev = "00f330c28c75358f80f22aeb1fb5cbe8c7b4bfab", default-features = false, features = ["rust-tls"] }
 open = "5.4.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
