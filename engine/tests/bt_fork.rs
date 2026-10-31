@@ -372,3 +372,41 @@ async fn a_choked_peer_that_asks_anyway_gets_no_piece() {
     );
     std::mem::forget(seeds);
 }
+
+#[tokio::test]
+async fn udp_sockets_bind_to_the_chosen_address() {
+    let ip: IpAddr = "127.0.0.2".parse().unwrap();
+    let mut options = listening_on("0.0.0.0");
+    if let Some(listen) = options.listen.as_mut() {
+        listen.mode = librqbit::ListenerMode::TcpAndUtp;
+    }
+    // DHT and UDP trackers on, but told of nobody, so nothing is sent.
+    options.dht = Some(librqbit::DhtSessionConfig {
+        bootstrap_addrs: Some(vec![]),
+        port: None,
+        persistence: None,
+    });
+    options.disable_trackers = false;
+    options.udp_bind_ip = Some(ip);
+
+    let session = Session::new_with_opts(fresh_dir("udp-bind"), options)
+        .await
+        .unwrap();
+    let udp = session.udp_local_addrs();
+    assert!(
+        udp.len() >= 3,
+        "the DHT, UDP tracker and uTP sockets: {udp:?}"
+    );
+    for addr in &udp {
+        assert_eq!(
+            addr.ip(),
+            ip,
+            "a UDP socket bound to {addr}, not the chosen address"
+        );
+    }
+    assert_eq!(
+        session.listen_addr().map(|a| a.ip()),
+        Some(ip),
+        "the listener moves to the chosen address too"
+    );
+}
