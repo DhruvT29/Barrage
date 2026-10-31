@@ -16,7 +16,11 @@ export function SharedNotice({ table }: { table: TableView }) {
   })
 
   return notices.map((n) => (
-    <div className="panel shared" key={n.key} data-testid="shared-notice">
+    <div className="ml-notice" key={n.key} data-testid="shared-notice">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <circle cx="8" cy="8" r="6.5" />
+        <path d="M8 4.5v4.2M8 11.2v.1" />
+      </svg>
       <p>
         <strong>One connection.</strong> {n.names} reach the internet through one connection ({n.publicIp}), so
         using both gains nothing.

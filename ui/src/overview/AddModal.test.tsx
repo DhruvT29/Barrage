@@ -1,8 +1,8 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
+import { useState } from 'react'
 import { afterEach, expect, test, vi } from 'vitest'
 
-import type { DownloadView, DownloadsView } from '../api/types'
-import { Downloads } from './Downloads'
+import { AddModal } from './AddModal'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -28,23 +28,33 @@ function engine(...answers: Answer[]) {
   return asked
 }
 
-const NOTHING: DownloadsView = { live: { bps: 0, parts: [] }, list: [], used: [] }
-
-function download(id: number, name: string): DownloadView {
-  return {
-    id,
-    url: `https://example.com/${name}`,
-    name,
-    state: 'done',
-    length: 1000,
-    done: 1000,
-    bps: 0,
-    note: null,
-    cables: [],
-  }
+/** A page with a button that opens the window, as the hero and the queue do. */
+function Page({ onClose = () => {} }: { onClose?: () => void }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <button onClick={() => setOpen(true)}>Open</button>
+      <AddModal
+        open={open}
+        onClose={() => {
+          onClose()
+          setOpen(false)
+        }}
+      />
+    </>
+  )
 }
 
-const field = () => screen.getByRole('textbox', { name: 'Download a file from its link' })
+function openWindow(onClose?: () => void) {
+  render(<Page onClose={onClose} />)
+  const opener = screen.getByRole('button', { name: 'Open' })
+  opener.focus()
+  fireEvent.click(opener)
+  return opener
+}
+
+const dialog = () => screen.getByRole('dialog', { name: 'Add a download' })
+const field = () => screen.getByRole('textbox', { name: 'Link' })
 const button = () => screen.getByRole('button', { name: 'Download' })
 
 /** Types an address, presses Download, and lets the answer arrive. */
@@ -55,45 +65,65 @@ async function add(url: string) {
   })
 }
 
+test('closed, there is no window', () => {
+  render(<AddModal open={false} onClose={() => {}} />)
+  expect(screen.queryByRole('dialog')).toBeNull()
+})
+
+test('open: a modal window, the field focused, with a hint', () => {
+  openWindow()
+  expect(dialog()).toHaveAttribute('aria-modal', 'true')
+  expect(field()).toHaveFocus()
+  expect(field()).toHaveAccessibleDescription(/http or https/)
+})
+
 test("adding posts the URL as JSON and shows the engine's refusal in its own words", async () => {
   const asked = engine(
     { status: 409, body: { error: 'already downloading, as download 4', id: 4 } },
     { status: 400, body: { error: 'only http and https addresses can be downloaded, not ftp:' } },
   )
-  render(<Downloads downloads={NOTHING} />)
+  openWindow()
 
-  await add('https://example.com/releases/ubuntu.iso')
+  await add('https://example.com/releases/distro.iso')
   expect(asked).toEqual([
     {
       url: '/api/downloads',
       init: {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: 'https://example.com/releases/ubuntu.iso' }),
+        body: JSON.stringify({ url: 'https://example.com/releases/distro.iso' }),
       },
     },
   ])
   expect(screen.getByRole('alert')).toHaveTextContent(/^already downloading, as download 4$/)
-  // Refused, the address stays, to be put right.
-  expect(field()).toHaveValue('https://example.com/releases/ubuntu.iso')
+  // Refused, the address stays, to be put right, and the window stays open.
+  expect(field()).toHaveValue('https://example.com/releases/distro.iso')
+  expect(dialog()).toBeInTheDocument()
 
   await add('ftp://example.com/file.iso')
   expect(screen.getByRole('alert')).toHaveTextContent(/^only http and https addresses can be downloaded, not ftp:$/)
 })
 
-test('an address the engine takes leaves the field empty for the next', async () => {
+test('an address the engine takes clears the field and closes the window, focus back on the opener', async () => {
   const asked = engine({ status: 201, body: { id: 5 } })
-  render(<Downloads downloads={NOTHING} />)
+  const onClose = vi.fn()
+  const opener = openWindow(onClose)
 
   await add('  https://example.com/a.iso  ')
   expect(JSON.parse(String(asked[0].init.body))).toEqual({ url: 'https://example.com/a.iso' })
+  expect(onClose).toHaveBeenCalledOnce()
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(opener).toHaveFocus()
+
+  // Opened again, the field is empty for the next one.
+  fireEvent.click(opener)
   expect(field()).toHaveValue('')
   expect(screen.queryByRole('alert')).toBeNull()
 })
 
 test('changing the address clears the last refusal', async () => {
   engine({ status: 409, body: { error: 'already downloading, as download 4', id: 4 } })
-  render(<Downloads downloads={NOTHING} />)
+  openWindow()
 
   await add('https://example.com/a.iso')
   expect(screen.getByRole('alert')).toBeInTheDocument()
@@ -103,7 +133,7 @@ test('changing the address clears the last refusal', async () => {
 
 test('an engine that answers oddly, or not at all, is said in words', async () => {
   engine({ status: 502, text: 'Bad Gateway' })
-  render(<Downloads downloads={NOTHING} />)
+  openWindow()
 
   await add('https://example.com/a.iso')
   expect(screen.getByRole('alert')).toHaveTextContent(/^the engine answered 502$/)
@@ -116,7 +146,7 @@ test('an engine that answers oddly, or not at all, is said in words', async () =
 
 test('an empty address cannot be sent', () => {
   const asked = engine()
-  render(<Downloads downloads={NOTHING} />)
+  openWindow()
 
   expect(button()).toBeDisabled()
   fireEvent.change(field(), { target: { value: '   ' } })
@@ -126,30 +156,54 @@ test('an empty address cannot be sent', () => {
   expect(asked).toHaveLength(0)
 })
 
-test('Download waits while an address is on its way', async () => {
-  vi.stubGlobal('fetch', () => new Promise(() => {}))
-  render(<Downloads downloads={NOTHING} />)
+test('Download waits while an address is on its way, and a second press sends nothing', async () => {
+  const asked: string[] = []
+  vi.stubGlobal('fetch', (url: string) => {
+    asked.push(url)
+    return new Promise(() => {})
+  })
+  openWindow()
 
   await add('https://example.com/a.iso')
   expect(button()).toBeDisabled()
+  await act(async () => {
+    fireEvent.submit(field().closest('form')!)
+  })
+  expect(asked).toHaveLength(1)
 })
 
-test('the newest download comes first', () => {
-  const list = [download(1, 'a.iso'), download(2, 'b.iso'), download(3, 'c.iso')]
-  render(<Downloads downloads={{ ...NOTHING, list }} />)
-  expect(screen.getAllByRole('region').map((r) => r.getAttribute('aria-label'))).toEqual(['c.iso', 'b.iso', 'a.iso'])
+test('Escape, the close button and a click on the backdrop each close it; a click inside does not', () => {
+  const onClose = vi.fn()
+  const opener = openWindow(onClose)
+
+  fireEvent.mouseDown(dialog())
+  fireEvent.click(dialog())
+  expect(onClose).not.toHaveBeenCalled()
+
+  fireEvent.keyDown(field(), { key: 'Escape' })
+  expect(onClose).toHaveBeenCalledTimes(1)
+  expect(opener).toHaveFocus()
+
+  fireEvent.click(opener)
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+  expect(onClose).toHaveBeenCalledTimes(2)
+
+  fireEvent.click(opener)
+  const backdrop = screen.getByTestId('modal-backdrop')
+  fireEvent.mouseDown(backdrop)
+  fireEvent.click(backdrop)
+  expect(onClose).toHaveBeenCalledTimes(3)
 })
 
-test('no downloads yet: says so, and how', () => {
-  render(<Downloads downloads={NOTHING} />)
-  expect(screen.getByText(/Nothing downloaded yet/)).toHaveTextContent(
-    'Nothing downloaded yet. Paste a link to a file above.',
-  )
-})
+test('Tab stays inside the window', () => {
+  openWindow()
+  fireEvent.change(field(), { target: { value: 'https://example.com/a.iso' } })
+  const close = screen.getByRole('button', { name: 'Close' })
 
-test('before the engine has said anything: the field, and no empty-list message', () => {
-  render(<Downloads downloads={null} />)
-  expect(field()).toBeInTheDocument()
-  expect(screen.queryByText(/Nothing downloaded yet/)).toBeNull()
-  expect(screen.queryAllByRole('region')).toHaveLength(0)
+  // From the last control, Tab wraps to the first; Shift+Tab from the first wraps to the last.
+  button().focus()
+  fireEvent.keyDown(button(), { key: 'Tab' })
+  expect(close).toHaveFocus()
+  fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })
+  expect(button()).toHaveFocus()
 })

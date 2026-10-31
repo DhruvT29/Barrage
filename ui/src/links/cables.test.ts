@@ -1,7 +1,20 @@
 import { expect, test } from 'vitest'
 
-import type { LinkView, TableView } from '../api/types'
-import { cables, joinNames, mbps, publicText, rtt } from './cables'
+import type { DownloadsView, LinkView, TableView } from '../api/types'
+import {
+  addressSummary,
+  cables,
+  fastest,
+  fractionText,
+  interfaceKind,
+  joinNames,
+  liveBps,
+  liveShare,
+  mbps,
+  publicText,
+  rtt,
+  utilization,
+} from './cables'
 
 let nextId = 1
 
@@ -187,4 +200,70 @@ test('each cable carries the data BARRAGE has used through it, 0 when none', () 
     ['Ethernet 3', 0],
   ])
   expect(cables(t).map((c) => c.used)).toEqual([0, 0, 0])
+})
+
+function downloading(parts: { name: string; bps: number }[]): DownloadsView {
+  return { live: { bps: parts.reduce((a, p) => a + p.bps, 0), parts }, list: [], used: [] }
+}
+
+test("a cable's live speed is its part of what the downloads fetch, null while it carries nothing", () => {
+  const d = downloading([
+    { name: 'Wi-Fi', bps: 48_200_000 },
+    { name: 'Ethernet 2', bps: 0 },
+  ])
+  expect(liveBps(d, 'Wi-Fi')).toBe(48_200_000)
+  // A part at 0 carries nothing right now.
+  expect(liveBps(d, 'Ethernet 2')).toBeNull()
+  expect(liveBps(d, 'Ethernet 3')).toBeNull()
+  expect(liveBps(null, 'Wi-Fi')).toBeNull()
+})
+
+test('the share of the live total is unknown while nothing downloads, 0 for a cable that carries nothing', () => {
+  expect(liveShare(25_000_000, 100_000_000)).toBe(0.25)
+  expect(liveShare(null, 100_000_000)).toBe(0)
+  expect(liveShare(null, 0)).toBeNull()
+  expect(liveShare(5, 0)).toBeNull()
+})
+
+test('utilization is live over measured, unknown unless both are known', () => {
+  expect(utilization(11_000_000, 18_000_000)).toBeCloseTo(0.6111, 4)
+  expect(utilization(null, 18_000_000)).toBeNull()
+  expect(utilization(11_000_000, null)).toBeNull()
+  expect(utilization(11_000_000, 0)).toBeNull()
+})
+
+test('percentages are whole, "-" when unknown', () => {
+  expect(fractionText(0.6111)).toBe('61%')
+  expect(fractionText(0)).toBe('0%')
+  expect(fractionText(1.25)).toBe('125%')
+  expect(fractionText(null)).toBe('-')
+})
+
+test('the fastest cable is the one with the highest measured speed, none before any is measured', () => {
+  const t = table([
+    link('Wi-Fi', '192.0.2.10', { down_bps: 18_000_000 }),
+    link('Ethernet', '192.0.2.81', { down_bps: 30_000_000 }),
+    link('Ethernet 2', '198.51.100.12', { down_bps: 30_000_000 }),
+    link('Ethernet 3', '198.51.100.13', { down_bps: null }),
+  ])
+  // A tie goes to the first in the table.
+  expect(fastest(cables(t))).toBe('Ethernet')
+  expect(fastest(cables(table([link('Wi-Fi', '192.0.2.10', { down_bps: null })])))).toBeNull()
+  expect(fastest([])).toBeNull()
+})
+
+test('the address summary counts the addresses and names their families', () => {
+  expect(addressSummary([link('Wi-Fi', '192.0.2.10')])).toBe('1 address · IPv4')
+  expect(addressSummary([link('Wi-Fi', '192.0.2.10'), link('Wi-Fi', '2001:db8::10')])).toBe('2 addresses · IPv4 + IPv6')
+  expect(addressSummary([link('Wi-Fi', '2001:db8::10'), link('Wi-Fi', '2001:db8::11')])).toBe('2 addresses · IPv6')
+})
+
+test("the icon follows the interface's name honestly: Wi-Fi, Bluetooth, else a cable", () => {
+  expect(interfaceKind('Wi-Fi')).toBe('wifi')
+  expect(interfaceKind('Wi-Fi 2')).toBe('wifi')
+  expect(interfaceKind('WLAN')).toBe('wifi')
+  expect(interfaceKind('Wireless Network Connection')).toBe('wifi')
+  expect(interfaceKind('Bluetooth Network')).toBe('bluetooth')
+  expect(interfaceKind('Ethernet 2')).toBe('cable')
+  expect(interfaceKind('Local Area Connection')).toBe('cable')
 })

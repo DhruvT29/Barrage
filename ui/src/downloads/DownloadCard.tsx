@@ -1,33 +1,22 @@
-import { useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
 
 import type { CableShare, DownloadState, DownloadView } from '../api/types'
 import { mbps } from '../links/cables'
-import { formatBytes, percent } from './format'
+import { controlDownload } from '../overview/control'
+import { formatBytes, percent, percentText } from './format'
+import {
+  CableIcon,
+  ChevronIcon,
+  ClockIcon,
+  ConnectionsIcon,
+  DriveIcon,
+  GaugeIcon,
+  PauseIcon,
+  PlayIcon,
+} from './icons'
+import { blockCount, etaText, pieceBlocks } from './queue'
 
-/** What the engine made of a stop or a resume: done, or why not, in its words. */
-type Asked = { ok: true } | { refused: string }
-
-/**
- * Asks the engine that served the page to stop or resume download `id`. The
- * body is `{}` as JSON, which a form on another site cannot send; the
- * engine's refusals (404, 409) are passed on as they are.
- */
-async function control(id: number, action: 'stop' | 'resume'): Promise<Asked> {
-  let answer: Response
-  try {
-    answer = await fetch(`/api/downloads/${id}/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    })
-  } catch {
-    return { refused: 'the engine is not answering' }
-  }
-  if (answer.ok) return { ok: true }
-  const body: unknown = await answer.json().catch(() => null)
-  const { error } = (body ?? {}) as { error?: unknown }
-  return { refused: typeof error === 'string' ? error : `the engine answered ${answer.status}` }
-}
+import './downloads.css'
 
 /** What a download in this state can be asked: Stop while it runs, Resume once stopped. */
 function actionFor(state: DownloadState): 'stop' | 'resume' | null {
@@ -53,7 +42,7 @@ function useAction(id: number, state: DownloadState) {
     busy.current = true
     setSending(true)
     setRefused(null)
-    const asked = await control(id, action)
+    const asked = await controlDownload(id, action)
     busy.current = false
     setSending(false)
     if ('refused' in asked) setRefused({ words: asked.refused, state })
@@ -62,27 +51,52 @@ function useAction(id: number, state: DownloadState) {
   return { action, sending, refused: refused?.state === state ? refused.words : null, press }
 }
 
-/** What a card says in place of a speed, while it has none to show. */
+/** What a card says while it has no speed to show and is still under way. */
 const WAITING_WORDS: Partial<Record<DownloadState, string>> = {
   starting: 'finding the file',
   waiting: 'no cable to fetch it through yet',
 }
 
+/** The address's host, to tell where a file comes from at a glance; null if it does not parse. */
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host || null
+  } catch {
+    return null
+  }
+}
+
+type CardProps = {
+  download: DownloadView
+  /** Each cable's colour by name (palette.ts); a cable missing from it is dim. */
+  colors?: Record<string, string>
+  /** Whether the list of cables is open, when the queue holds the user's choice; otherwise the card does. */
+  expanded?: boolean
+  /** Told the user's choice to open (true) or close the list of cables. */
+  onToggle?: (open: boolean) => void
+}
+
 /**
- * One download: its name (its address until the file is found), its state,
- * its speed while it downloads, how far it has got, and a row per cable with
- * what that cable carried. Every note is the engine's own words.
+ * One download in the transfer queue: its state in a word, its number, its
+ * name (its address until the file is found) and host; the Stop or Resume
+ * it can be asked; the piece bar, filled in each cable's colour by what that
+ * cable carried, with the percent done; the five figures (fetched, speed,
+ * time left, connections, cables); the engine's note; and, behind a toggle,
+ * a row per cable. Every note is the engine's own words.
  *
- * The state is a colour, a shape (both from the `dl <state>` classes) and
- * the engine's word, always written out. A running download can be stopped,
- * its progress saved, and a stopped one resumed from there.
+ * The state is a colour (from the `tq-<state>` class) and the engine's word,
+ * always written out. The list of cables starts open while downloading and
+ * closed otherwise, until the user opens or closes it.
  */
-export function DownloadCard({ download: d }: { download: DownloadView }) {
+export function DownloadCard({ download: d, colors = {}, expanded, onToggle }: CardProps) {
   const title = d.name ?? d.url
+  const host = d.name !== null ? hostOf(d.url) : null
   const moving = d.state === 'downloading'
   const words = WAITING_WORDS[d.state]
-  const progress = progressOf(d)
   const { action, sending, refused, press } = useAction(d.id, d.state)
+  const [mine, setMine] = useState<boolean | null>(null)
+  const open = expanded ?? mine ?? moving
+
   // A cable's note that repeats the download's own says nothing new, and a
   // cable that carried nothing, holds nothing open, is wanted none and has
   // nothing new to say is left out.
@@ -90,98 +104,241 @@ export function DownloadCard({ download: d }: { download: DownloadView }) {
     .map((c) => ({ ...c, notes: c.notes.filter((n) => n !== d.note) }))
     .filter((c) => c.bytes > 0 || c.connections > 0 || c.notes.length > 0 || (moving && c.wanted > 0))
 
+  function toggle() {
+    setMine(!open)
+    onToggle?.(!open)
+  }
+
   return (
-    <section className={`panel dl ${d.state}`} aria-label={title}>
-      <div className="top">
-        <h2 className="name">{title}</h2>
-        <span className="state">
-          <span className="mark" aria-hidden="true" />
-          <span data-testid="state">{d.state}</span>
-        </span>
+    <section className={`tq-card tq-${d.state}`} aria-label={title}>
+      <div className="tq-head">
+        <div className="tq-ident">
+          <div className="tq-tags">
+            <span className="tq-badge">
+              {moving && <span className="tq-dot" aria-hidden="true" />}
+              <span data-testid="state">{d.state}</span>
+            </span>
+            <span className="tq-id" data-testid="id">
+              #{d.id}
+            </span>
+          </div>
+          <h3 className="tq-name">{title}</h3>
+          {host !== null && (
+            <span className="tq-host" data-testid="host" title={d.url}>
+              {host}
+            </span>
+          )}
+        </div>
         {action !== null && (
-          <button type="button" className={`act ${action}`} disabled={sending} onClick={press}>
-            {action === 'stop' ? 'Stop' : 'Resume'}
-          </button>
+          <div className="tq-actions">
+            <button
+              type="button"
+              className={`tq-act tq-${action}`}
+              aria-label={action === 'stop' ? 'Stop' : 'Resume'}
+              title={action === 'stop' ? 'Stop' : 'Resume'}
+              disabled={sending}
+              onClick={press}
+            >
+              {action === 'stop' ? <PauseIcon /> : <PlayIcon />}
+            </button>
+          </div>
         )}
       </div>
 
-      {(moving || words || progress) && (
-        <div className="figures">
-          {moving && <Speed bps={d.bps} />}
-          {words && (
-            <span className="words" data-testid="words">
-              {words}
-            </span>
-          )}
-          {progress && (
-            <span className="progress">
-              <span data-testid="progress">{progress.text}</span>
-              {progress.percent !== null && <b data-testid="percent">{progress.percent}%</b>}
-            </span>
-          )}
-        </div>
-      )}
-      {progress && progress.fill !== null && (
-        <div className="beam" aria-hidden="true">
-          <span data-testid="progress-fill" style={{ width: `${progress.fill}%` }} />
-        </div>
-      )}
+      <div className="tq-progress">
+        <PieceBar download={d} colors={colors} />
+        <span className={d.state !== 'done' && d.length === null ? 'tq-percent unknown' : 'tq-percent'} data-testid="percent">
+          {d.state === 'done' ? '100.0%' : percentText(d.done, d.length)}
+        </span>
+      </div>
 
+      <Stats download={d} />
+
+      {words && (
+        <p className="tq-words" data-testid="words">
+          {words}
+        </p>
+      )}
       {d.note !== null && (
-        <p className="note" data-testid="note">
+        <p className={d.state === 'failed' ? 'tq-note failure' : 'tq-note'} data-testid="note">
           {d.note}
         </p>
       )}
       {refused !== null && (
-        <p className="refused" role="alert">
+        <p className="tq-refused" role="alert">
           {refused}
         </p>
       )}
 
-      {rows.length > 0 && (
-        <ul className="shares" aria-label="Cables">
-          {rows.map((c) => (
-            <Share key={c.name} cable={c} done={d.done} bps={d.bps} moving={moving} />
-          ))}
-        </ul>
-      )}
-
-      <div className="foot" data-testid="foot">
-        {d.name !== null && <span className="url">{d.url}</span>}
-        <span className="id">download {d.id}</span>
-      </div>
+      <Distribution rows={rows} open={open} onToggle={toggle} download={d} colors={colors} />
     </section>
   )
 }
 
-type Progress = {
-  text: string
-  /** Whole percent done; null without a length, or once done. */
-  percent: number | null
-  /** How far along the beam, 0 to 100; null without a length to measure against. */
-  fill: number | null
+/** As many blocks as fit the bar's width, measured as it changes; 64 until measured. */
+function useBlockCount(ref: RefObject<HTMLElement | null>): number {
+  const [count, setCount] = useState(64)
+  useEffect(() => {
+    const element = ref.current
+    if (!element || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(([entry]) => setCount(blockCount(entry.contentRect.width)))
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [ref])
+  return count
 }
 
-/** How far a download has got; null while there is nothing to say. */
-function progressOf(d: DownloadView): Progress | null {
-  if (d.state === 'done') return { text: formatBytes(d.length ?? d.done), percent: null, fill: 100 }
-  if (d.length !== null) {
-    return {
-      text: `${formatBytes(d.done)} of ${formatBytes(d.length)}`,
-      percent: percent(d.done, d.length),
-      fill: d.length === 0 ? 100 : Math.min(100, (d.done * 100) / d.length),
-    }
-  }
-  if (d.done > 0) return { text: formatBytes(d.done), percent: null, fill: null }
-  return null
-}
+/**
+ * The piece bar: a row of blocks filled up to the part done, in the colours
+ * of the cables that fetched it (queue.ts), the rest dim. Without a length
+ * there is nothing to fill against: while the download is under way, a
+ * shimmer runs along the dim blocks instead.
+ */
+function PieceBar({ download: d, colors }: { download: DownloadView; colors: Record<string, string> }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const count = useBlockCount(ref)
+  const blocks = pieceBlocks(d, colors, count)
+  // The filled blocks come first, so the last of them is the leading edge.
+  const lastOn = (blocks ?? []).filter((b) => b !== null).length - 1
+  const known = d.state === 'done' ? 100 : d.length !== null ? percent(d.done, d.length) : null
 
-function Speed({ bps }: { bps: number }) {
-  const [figure, unit] = mbps(bps).split(' ')
   return (
-    <span className="figure" data-testid="speed">
-      {figure} <small>{unit}</small>
-    </span>
+    <div
+      ref={ref}
+      className={blocks === null ? 'tq-pieces unknown' : 'tq-pieces'}
+      role="progressbar"
+      aria-label="Progress"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={known ?? undefined}
+    >
+      {(blocks ?? Array<null>(count).fill(null)).map((color, i) => (
+        <span
+          key={i}
+          data-testid="piece"
+          className={color === null ? 'tq-piece' : i === lastOn ? 'tq-piece on edge' : 'tq-piece on'}
+          style={color === null ? undefined : ({ '--c': color } as CSSProperties)}
+        />
+      ))}
+    </div>
+  )
+}
+
+/** Fetched of the whole: "16.6 GB / 34.2 GB"; "-" before a byte or a length. */
+function fetched(d: DownloadView): ReactNode {
+  const whole = d.state === 'done' ? (d.length ?? d.done) : d.length
+  const got = d.state === 'done' ? whole! : d.done
+  if (whole === null && got === 0) return '-'
+  return (
+    <>
+      <b>{formatBytes(got)}</b>
+      <span className="tq-of"> / {whole === null ? '-' : formatBytes(whole)}</span>
+    </>
+  )
+}
+
+/**
+ * The five figures under the bar: what is fetched of the whole, the speed
+ * (only while downloading), the time left (or the state in a word), the
+ * connections open on every cable, and how many cables carried it.
+ */
+function Stats({ download: d }: { download: DownloadView }) {
+  const connections = d.cables.reduce((sum, c) => sum + c.connections, 0)
+  const carrying = d.cables.filter((c) => c.bytes > 0 || c.connections > 0).length
+  const [figure, unit] = mbps(d.bps).split(' ')
+
+  return (
+    <dl className="tq-stats">
+      <Stat icon={<DriveIcon />} label="Fetched" id="progress">
+        {fetched(d)}
+      </Stat>
+      <Stat icon={<GaugeIcon />} label="Speed" id="speed" tone={d.state === 'downloading' ? 'live' : undefined}>
+        {d.state === 'downloading' ? (
+          <>
+            {figure} <small>{unit}</small>
+          </>
+        ) : (
+          '-'
+        )}
+      </Stat>
+      <Stat icon={<ClockIcon />} label="ETA" id="eta">
+        {etaText(d)}
+      </Stat>
+      <Stat icon={<ConnectionsIcon />} label="Connections" id="connections">
+        {connections > 0 ? connections : '-'}
+      </Stat>
+      <Stat icon={<CableIcon />} label="Cables" id="cables">
+        {carrying}
+      </Stat>
+    </dl>
+  )
+}
+
+function Stat({
+  icon,
+  label,
+  id,
+  tone,
+  children,
+}: {
+  icon: ReactNode
+  label: string
+  id: string
+  tone?: 'live'
+  children: ReactNode
+}) {
+  return (
+    <div className={tone === 'live' ? 'tq-stat live' : 'tq-stat'}>
+      <dt>
+        {icon}
+        {label}
+      </dt>
+      <dd data-testid={id}>{children}</dd>
+    </div>
+  )
+}
+
+/**
+ * The card's foot: "Link distribution · 2 cables", a toggle for the list of
+ * cables below it. With no cable to list there is nothing to open, so it is
+ * a plain line, not a button.
+ */
+function Distribution({
+  rows,
+  open,
+  onToggle,
+  download: d,
+  colors,
+}: {
+  rows: CableShare[]
+  open: boolean
+  onToggle: () => void
+  download: DownloadView
+  colors: Record<string, string>
+}) {
+  const listId = useId()
+  const moving = d.state === 'downloading'
+
+  if (rows.length === 0) {
+    return (
+      <div className="tq-dist" data-testid="distribution">
+        <span className="tq-dist-toggle static">Link distribution · no cables</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className={open ? 'tq-dist open' : 'tq-dist'} data-testid="distribution">
+      <button type="button" className="tq-dist-toggle" aria-expanded={open} aria-controls={listId} onClick={onToggle}>
+        {`Link distribution · ${rows.length} ${rows.length === 1 ? 'cable' : 'cables'}`}
+        <ChevronIcon />
+      </button>
+      <ul id={listId} className="tq-shares" aria-label="Cables" hidden={!open}>
+        {rows.map((c) => (
+          <Share key={c.name} cable={c} color={colors[c.name] ?? 'var(--dim)'} done={d.done} bps={d.bps} moving={moving} />
+        ))}
+      </ul>
+    </div>
   )
 }
 
@@ -190,7 +347,19 @@ function Speed({ bps }: { bps: number }) {
  * its speed, its share of the download's speed and its connections, with
  * what the download wants it to hold when that differs.
  */
-function Share({ cable: c, done, bps, moving }: { cable: CableShare; done: number; bps: number; moving: boolean }) {
+function Share({
+  cable: c,
+  color,
+  done,
+  bps,
+  moving,
+}: {
+  cable: CableShare
+  color: string
+  done: number
+  bps: number
+  moving: boolean
+}) {
   const share = done > 0 ? Math.min(100, (c.bytes * 100) / done) : 0
   const out = c.bytes === 0 && c.connections === 0
   // A cable with nothing open and nothing measured has no speed to give.
@@ -199,21 +368,22 @@ function Share({ cable: c, done, bps, moving }: { cable: CableShare; done: numbe
   const carrying = taking && bps > 0 ? Math.floor((c.bps * 100) / bps) : null
 
   return (
-    <li className={out ? 'out' : undefined} data-testid="cable">
-      <span className="share-name" data-testid="cable-name">
+    <li className={out ? 'tq-share out' : 'tq-share'} data-testid="cable" style={{ '--c': color } as CSSProperties}>
+      <span className="tq-share-dot" aria-hidden="true" />
+      <span className="tq-share-name" data-testid="cable-name">
         {c.name}
       </span>
-      <span className="share-bar" aria-hidden="true">
+      <span className="tq-share-bar" aria-hidden="true">
         <span data-testid="cable-share" style={{ width: `${share}%` }} />
       </span>
-      <span className="share-bytes" data-testid="cable-bytes">
+      <span className="tq-share-bytes" data-testid="cable-bytes">
         {formatBytes(c.bytes)}
       </span>
-      <span className="share-speed" data-testid="cable-speed">
+      <span className="tq-share-speed" data-testid="cable-speed">
         {speed}
       </span>
       {taking && (
-        <span className="share-detail" data-testid="cable-detail">
+        <span className="tq-share-detail" data-testid="cable-detail">
           {carrying !== null && <span data-testid="cable-carrying">carrying {carrying}%</span>}
           {carrying !== null && ' · '}
           <span data-testid="cable-connections">{`${c.connections} connection${c.connections === 1 ? '' : 's'}`}</span>
@@ -225,7 +395,7 @@ function Share({ cable: c, done, bps, moving }: { cable: CableShare; done: numbe
         </span>
       )}
       {c.notes.map((n) => (
-        <span className="share-note" data-testid="cable-note" key={n}>
+        <span className="tq-share-note" data-testid="cable-note" key={n}>
           {n}
         </span>
       ))}

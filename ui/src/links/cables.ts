@@ -1,6 +1,6 @@
 // The link table as the cards show it: one card per cable, and the figures
 // written exactly as `brg-links` writes them (engine/src/links/render.rs).
-import type { LinkState, LinkView, TableView, UseView } from '../api/types'
+import type { DownloadsView, LinkState, LinkView, TableView, UseView } from '../api/types'
 
 /** One interface, with every address on it. */
 export type Cable = {
@@ -94,4 +94,71 @@ export function publicText(link: LinkView): string {
 export function joinNames(names: string[]): string {
   if (names.length <= 1) return names.join('')
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+}
+
+/**
+ * What the downloads fetch through this cable right now, in bits per second;
+ * null while it carries nothing (no part, or a part at 0), so "carrying" is
+ * a single test everywhere.
+ */
+export function liveBps(downloads: DownloadsView | null, name: string): number | null {
+  const bps = downloads?.live.parts.find((p) => p.name === name)?.bps ?? 0
+  return bps > 0 ? bps : null
+}
+
+/**
+ * A cable's part of the live total, 0 to 1. Unknown (null) while nothing
+ * downloads; a cable that carries nothing while others do has a real 0.
+ */
+export function liveShare(bps: number | null, total: number): number | null {
+  if (total <= 0) return null
+  return (bps ?? 0) / total
+}
+
+/** How much of its measured speed a cable is using: unknown unless both are known. */
+export function utilization(live: number | null, measured: number | null): number | null {
+  if (live === null || measured === null || measured <= 0) return null
+  return live / measured
+}
+
+/**
+ * A fraction as "61%", whole, or "-" when unknown. Can pass 100%: a
+ * measurement can be beaten. (A download's own percent done, rounded down
+ * to a tenth, is `percentText` in downloads/format.ts.)
+ */
+export function fractionText(fraction: number | null): string {
+  return fraction === null ? '-' : `${Math.round(fraction * 100)}%`
+}
+
+/** The cable with the highest measured speed (the first on a tie), or null before any is measured. */
+export function fastest(list: Cable[]): string | null {
+  let best: Cable | null = null
+  for (const cable of list) {
+    if (cable.downBps !== null && cable.downBps > 0 && (best === null || cable.downBps > best.downBps!)) best = cable
+  }
+  return best?.name ?? null
+}
+
+/** "2 addresses · IPv4 + IPv6": how many addresses a cable has, and of which families. */
+export function addressSummary(links: LinkView[]): string {
+  const families = [
+    ...(links.some((l) => l.family === 'ipv4') ? ['IPv4'] : []),
+    ...(links.some((l) => l.family === 'ipv6') ? ['IPv6'] : []),
+  ]
+  const count = `${links.length} ${links.length === 1 ? 'address' : 'addresses'}`
+  return families.length ? `${count} · ${families.join(' + ')}` : count
+}
+
+export type InterfaceKind = 'wifi' | 'bluetooth' | 'cable'
+
+/**
+ * Which icon a cable gets, from the only thing the engine says about it: the
+ * interface's name, as Windows gives it. Anything not plainly wireless or
+ * Bluetooth is drawn as a cable, a tethered phone included, since nothing
+ * tells it apart from an adapter.
+ */
+export function interfaceKind(name: string): InterfaceKind {
+  if (/wi-?fi|wlan|wireless/i.test(name)) return 'wifi'
+  if (/bluetooth/i.test(name)) return 'bluetooth'
+  return 'cable'
 }
