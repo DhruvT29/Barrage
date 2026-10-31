@@ -18,11 +18,19 @@ function MB([double]$Bytes) { [math]::Round($Bytes / 1e6, 1) }
 
 # Bytes through an adapter both ways: what a phone's data counter counts. An
 # adapter gone, its cable pulled, carries nothing more: its last count stands.
+# One added again counts from nothing, so the old one's count is carried over.
 $script:LastBytes = @{}
+$script:BytesBefore = @{}
 function Get-AdapterBytes([string]$Name) {
     $s = Get-NetAdapterStatistics -Name $Name -ErrorAction SilentlyContinue
-    if ($s) { $script:LastBytes[$Name] = [double]$s.ReceivedBytes + [double]$s.SentBytes }
-    return [double]$script:LastBytes[$Name]
+    if ($s) {
+        $now = [double]$s.ReceivedBytes + [double]$s.SentBytes
+        if ($now -lt [double]$script:LastBytes[$Name]) {
+            $script:BytesBefore[$Name] = [double]$script:BytesBefore[$Name] + [double]$script:LastBytes[$Name]
+        }
+        $script:LastBytes[$Name] = $now
+    }
+    return [double]$script:BytesBefore[$Name] + [double]$script:LastBytes[$Name]
 }
 
 # A cable's IPv4 address as Windows holds it: Preferred, not link-local.

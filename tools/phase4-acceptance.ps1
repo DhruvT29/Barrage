@@ -103,12 +103,33 @@ function Get-Usable($Table, [string]$Name) {
     @($Table.links | Where-Object { $_.name -eq $Name -and $_.state -in @("up", "degraded") })
 }
 
-# Bytes Windows says an adapter received; the last count stands once it is gone.
+# Bytes Windows says an adapter received; the last count stands once it is
+# gone. An adapter added again (tethering off and on) counts from nothing, so
+# what the old one counted is carried over: polled often, little is lost.
 $script:LastReceived = @{}
+$script:ReceivedBefore = @{}
 function Get-AdapterReceived([string]$Name) {
     $s = Get-NetAdapterStatistics -Name $Name -ErrorAction SilentlyContinue
-    if ($s) { $script:LastReceived[$Name] = [double]$s.ReceivedBytes }
-    return [double]$script:LastReceived[$Name]
+    if ($s) {
+        $now = [double]$s.ReceivedBytes
+        if ($now -lt [double]$script:LastReceived[$Name]) {
+            $script:ReceivedBefore[$Name] = [double]$script:ReceivedBefore[$Name] + [double]$script:LastReceived[$Name]
+        }
+        $script:LastReceived[$Name] = $now
+    }
+    return [double]$script:ReceivedBefore[$Name] + [double]$script:LastReceived[$Name]
+}
+
+# What each cable receives over `Seconds` while nothing of ours runs: other
+# programs' traffic (Windows Update, a game launcher, a sync client), which
+# Windows' count holds as well as the engine's.
+function Get-Background([string[]]$Cables, [int]$Seconds = 5) {
+    $before = @{}
+    foreach ($c in $Cables) { $before[$c] = Get-AdapterReceived $c }
+    Start-Sleep -Seconds $Seconds
+    $got = @{}
+    foreach ($c in $Cables) { $got[$c] = (Get-AdapterReceived $c) - $before[$c] }
+    return $got
 }
 
 # What the engine says each cable has received, every download together.
@@ -201,6 +222,7 @@ function Clear-Downloads {
 # connections, wanted and speed at every poll. `Each` sees each poll's
 # download and table, and may return "stop" to stop the download there.
 function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scriptblock]$Each = $null) {
+    $quietBefore = Get-Background $Cables
     $received = @{}
     foreach ($c in $Cables) { $received[$c] = Get-AdapterReceived $c }
     $usedBefore = Get-EngineUsed
@@ -214,6 +236,7 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
         Start-Sleep -Milliseconds 400
         $d = Get-Download $id $What
         $table = Get-Links
+        foreach ($c in $Cables) { [void](Get-AdapterReceived $c) }
         Add-Notes $notes $d
         if ($d.state -eq "downloading") {
             foreach ($c in @($d.cables)) {
@@ -249,6 +272,11 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
             Windows = (Get-AdapterReceived $c) - $received[$c]
         }
     }
+    $quietAfter = Get-Background $Cables
+    foreach ($c in $Cables) {
+        $use[$c] | Add-Member Before $quietBefore[$c]
+        $use[$c] | Add-Member After $quietAfter[$c]
+    }
     $requests = Measure-Requests (Read-Log $logStart).Text
     Clear-Downloads
     [pscustomobject]@{
@@ -267,15 +295,21 @@ function Pass([string]$Row, [bool]$Ok, [string]$Why) {
 
 # The data used row, for each cable that carried in a run: the engine's count
 # at most a tenth under what Windows' adapter received, and never over it by
-# more than a rounding.
+# more than a rounding. Judged only when the adapter was quiet for the
+# 5 s before and after (under 0.1 MB each): Windows counts every program's
+# traffic, and a burst of another's makes the engine look short.
 function Show-Used([string]$Row, $Res) {
     foreach ($c in $Res.Use.Keys) {
         $u = $Res.Use[$c]
         if ($u.Engine -lt 1e6) { continue }
         $ratio = 0
         if ($u.Windows -gt 0) { $ratio = $u.Engine / $u.Windows }
-        Pass $Row (($ratio -ge 0.9) -and ($ratio -le 1.02)) `
-            ("data used, $($c): the engine $(MB $u.Engine) MB, Windows received $(MB $u.Windows) MB ({0:P0})" -f $ratio)
+        $what = "data used, $($c): the engine $(MB $u.Engine) MB, Windows received $(MB $u.Windows) MB ({0:P0})" -f $ratio
+        if ($u.Before -ge 1e5 -or $u.After -ge 1e5) {
+            "  SKIP  $what; not judged: other programs received $(MB $u.Before) MB in the 5 s before, $(MB $u.After) MB after"
+            continue
+        }
+        Pass $Row (($ratio -ge 0.9) -and ($ratio -le 1.02)) $what
     }
 }
 
@@ -342,15 +376,19 @@ function Invoke-Weights {
 # When the engine's mark and Windows' cost each turn to `To`, and the time
 # between.
 function Wait-Metered([bool]$To) {
-    $windowsAt = $null
-    $engineAt = $null
+    # Script-scoped: Wait-For runs the check in a scope of its own each time,
+    # so a plain variable set there is gone by the next poll.
+    $script:WindowsAt = $null
+    $script:EngineAt = $null
     Wait-For "the metered setting to change" {
         $now = Get-Date
-        if ($null -eq $windowsAt -and (Get-WindowsMetered $script:TetherName) -eq $To) { $windowsAt = $now }
+        if ($null -eq $script:WindowsAt -and (Get-WindowsMetered $script:TetherName) -eq $To) { $script:WindowsAt = $now }
         $mark = @((Get-Links).links | Where-Object { $_.name -eq $script:TetherName -and $_.metered -eq $To }).Count -gt 0
-        if ($null -eq $engineAt -and $mark) { $engineAt = $now }
-        ($null -ne $windowsAt) -and ($null -ne $engineAt)
+        if ($null -eq $script:EngineAt -and $mark) { $script:EngineAt = $now }
+        ($null -ne $script:WindowsAt) -and ($null -ne $script:EngineAt)
     } | Out-Null
+    $windowsAt = $script:WindowsAt
+    $engineAt = $script:EngineAt
     $lag = ($engineAt - $windowsAt).TotalSeconds
     Pass "Metered" ($lag -le 10) ("metered {0}: Windows at {1:HH:mm:ss}, the engine {2:N1} s later" -f $To, $windowsAt, $lag)
 }
@@ -404,17 +442,22 @@ function Invoke-Flap {
         $now = Get-Date
         $links = @($table.links | Where-Object { $_.name -eq $script:TetherName })
         $held = [int](@($d.cables | Where-Object { $_.name -eq $script:TetherName }) | Measure-Object -Property connections -Sum).Sum
+        $gone = @($links | Where-Object { $_.state -in @("up", "degraded") }).Count -eq 0
+        if ($f.Phase -eq "carry" -and $gone) {
+            # Turned off before a poll saw it carry: on to its return.
+            $f.Phase = "off"
+        }
         switch ($f.Phase) {
             "carry" {
                 if ($held -gt 0) {
-                    "  CUE: the tether carries ($held connections): turn USB tethering OFF now" | Out-Host
+                    Write-Host "  CUE: the tether carries ($held connections): turn USB tethering OFF now"
                     $f.Phase = "off"
                 }
             }
             "off" {
-                if (@($links | Where-Object { $_.state -in @("up", "degraded") }).Count -eq 0) {
+                if ($gone) {
                     $f.Off = $now
-                    "  the tether has gone. CUE: turn USB tethering back ON within 20 s" | Out-Host
+                    Write-Host "  the tether has gone. CUE: turn USB tethering back ON within 20 s"
                     $f.Phase = "back"
                 }
             }
@@ -422,11 +465,11 @@ function Invoke-Flap {
                 if (@($links | Where-Object { $_.state -eq "up" }).Count -gt 0) {
                     $f.Up = $now
                     $f.Phase = "share"
-                    "  the tether came back straight up, not degraded" | Out-Host
+                    Write-Host "  the tether came back straight up, not degraded"
                 } elseif (@($links | Where-Object { $_.state -eq "degraded" }).Count -gt 0) {
                     $f.Degraded = $now
                     $f.Phase = "degraded"
-                    "  the tether is back, degraded" | Out-Host
+                    Write-Host "  the tether is back, degraded"
                 }
             }
             "degraded" {
@@ -434,7 +477,7 @@ function Invoke-Flap {
                 if (@($links | Where-Object { $_.state -eq "up" }).Count -gt 0) {
                     $f.Up = $now
                     $f.Phase = "share"
-                    "  the tether is up again" | Out-Host
+                    Write-Host "  the tether is up again"
                 }
             }
             "share" {
@@ -493,6 +536,7 @@ try {
     }
 
     "== Preflight: no engine yet"
+    "  (other programs' downloads blur the data used row: pause Windows Update and quit Steam and OneDrive for the session)"
     $script:TetherName = Find-Tether
     $script:TetherStart = Get-AdapterBytes $script:TetherName
     "  the tether is $($script:TetherName)"
