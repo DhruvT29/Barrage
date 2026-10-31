@@ -6,6 +6,19 @@ A Multi Device Internet Pooling System for Torrent Download
 
 You need Rust (`cargo`) and Node with pnpm.
 
+One command, from the repository's root, starts the engine and the page
+together and opens the browser; Ctrl+C stops both:
+
+```
+.\dev.ps1            # the engine, and the page with live reload (http://127.0.0.1:5173)
+.\dev.ps1 -App       # the page built and served by the engine, as it ships (http://127.0.0.1:7700)
+.\dev.ps1 -Preview   # the page alone with made-up data: no engine, no network
+```
+
+`-Release` builds the engine optimised; `-Downloads DIR`, `-Log FILE` and
+`-NoOpen` are passed on as below. The first run installs the page's packages
+and compiles the engine. By hand, the same steps are:
+
 ```
 pnpm --dir ui install
 pnpm --dir ui build
