@@ -3,3 +3,11 @@
 //! is meant to be replaced).
 
 pub mod choose;
+mod connect;
+pub mod source;
+mod status;
+mod torrents;
+
+pub use source::{Source, TorrentAddError};
+pub use status::{TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus};
+pub use torrents::{TorrentConfig, Torrents};

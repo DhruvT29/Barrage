@@ -591,6 +591,34 @@ pub(crate) fn size_words(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+impl crate::transfer::TransferEngine for Downloads {
+    type Request = AddRequest;
+    type Id = DownloadId;
+    type Status = DownloadStatus;
+    type AddError = AddError;
+    type ControlError = ControlError;
+
+    async fn add(&self, request: AddRequest) -> Result<DownloadId, AddError> {
+        Downloads::add(self, request).await
+    }
+
+    fn status(&self) -> watch::Receiver<Vec<DownloadStatus>> {
+        Downloads::status(self)
+    }
+
+    async fn stop(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::stop(self, id).await
+    }
+
+    async fn resume(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::resume(self, id).await
+    }
+
+    async fn shutdown(&self) {
+        Downloads::shutdown(self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
