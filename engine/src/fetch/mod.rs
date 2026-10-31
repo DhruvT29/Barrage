@@ -29,7 +29,7 @@ pub mod ranges;
 mod rate;
 pub mod remote;
 mod saved;
-mod schedule;
+pub(crate) mod schedule;
 mod spans;
 mod used;
 mod worker;
