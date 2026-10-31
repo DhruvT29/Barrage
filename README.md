@@ -33,7 +33,10 @@ link to a file, which then comes down through every working connection at
 once; each download shows its progress, its speed and what each connection
 carried, and while it runs, each connection's share of the speed and its
 connections, with how many it is wanted to hold while that changes. A tethered
-phone's part comes out of its mobile data. The faster a connection delivers,
+phone's part comes out of its mobile data, and the phone counts about a tenth
+more than the card shows: when a connection's part is handed to another, what
+was already on its way is thrown away unread, and on a phone's slower round
+trip that adds up. The faster a connection delivers,
 the more of a download's connections it holds. Two cables that reach the
 internet through the same connection count as one: one carries and the other
 sits out, and a cable Windows calls metered is the one that sits out. A

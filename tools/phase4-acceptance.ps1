@@ -184,6 +184,22 @@ function Measure-Requests([string]$Text) {
     return $by
 }
 
+# The engine's speed tests in a stretch of the log, bytes by cable: a cable
+# that comes back is measured again, through it, but that is no download's.
+# Each sample line is followed by the speed lines of the cable it measured.
+function Measure-SpeedTests([string]$Text) {
+    $by = @{}
+    $pending = $null
+    foreach ($line in ($Text -split "`n")) {
+        if ($line -match "throughput sample .*bytes=(\d+)") { $pending = [double]$Matches[1]; continue }
+        if ($null -ne $pending -and $line -match "barrage: (.+) \S+: speed ") {
+            $by[$Matches[1]] = [double]$by[$Matches[1]] + $pending
+            $pending = $null
+        }
+    }
+    return $by
+}
+
 # Wait until `Check` returns something, or the row's time runs out.
 function Wait-For([string]$What, [scriptblock]$Check, [int]$Seconds = $Minutes * 60) {
     $deadline = (Get-Date).AddSeconds($Seconds)
@@ -265,11 +281,14 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
     # The engine publishes its counts with each status; one more beat for the last.
     Start-Sleep -Milliseconds 500
     $usedAfter = Get-EngineUsed
+    $log = (Read-Log $logStart).Text
+    $tests = Measure-SpeedTests $log
     $use = @{}
     foreach ($c in $Cables) {
         $use[$c] = [pscustomobject]@{
             Engine  = [double]$usedAfter[$c] - [double]$usedBefore[$c]
-            Windows = (Get-AdapterReceived $c) - $received[$c]
+            Windows = (Get-AdapterReceived $c) - $received[$c] - [double]$tests[$c]
+            Tests   = [double]$tests[$c]
         }
     }
     $quietAfter = Get-Background $Cables
@@ -277,7 +296,7 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
         $use[$c] | Add-Member Before $quietBefore[$c]
         $use[$c] | Add-Member After $quietAfter[$c]
     }
-    $requests = Measure-Requests (Read-Log $logStart).Text
+    $requests = Measure-Requests $log
     Clear-Downloads
     [pscustomobject]@{
         Download = $d; Secs = [math]::Round($watch.Elapsed.TotalSeconds, 1); Samples = $samples
@@ -294,8 +313,10 @@ function Pass([string]$Row, [bool]$Ok, [string]$Why) {
 }
 
 # The data used row, for each cable that carried in a run: the engine's count
-# at most a tenth under what Windows' adapter received, and never over it by
-# more than a rounding. Judged only when the adapter was quiet for the
+# at most 15% under what Windows' adapter received, less the engine's speed
+# tests, and never over it by more than a rounding. Not a tenth: on a phone
+# what was on its way when a part is handed on is thrown away unread, about
+# 0.2 MB a time, and read 87 to 88% live (the Wi-Fi 97%, its framing). Judged only when the adapter was quiet for the
 # 5 s before and after (under 0.1 MB each): Windows counts every program's
 # traffic, and a burst of another's makes the engine look short.
 function Show-Used([string]$Row, $Res) {
@@ -304,12 +325,14 @@ function Show-Used([string]$Row, $Res) {
         if ($u.Engine -lt 1e6) { continue }
         $ratio = 0
         if ($u.Windows -gt 0) { $ratio = $u.Engine / $u.Windows }
-        $what = "data used, $($c): the engine $(MB $u.Engine) MB, Windows received $(MB $u.Windows) MB ({0:P0})" -f $ratio
+        $tests = ""
+        if ($u.Tests -gt 0) { $tests = ", less $(MB $u.Tests) MB of speed tests" }
+        $what = "data used, $($c): the engine $(MB $u.Engine) MB, Windows received $(MB $u.Windows) MB$tests ({0:P0})" -f $ratio
         if ($u.Before -ge 1e5 -or $u.After -ge 1e5) {
             "  SKIP  $what; not judged: other programs received $(MB $u.Before) MB in the 5 s before, $(MB $u.After) MB after"
             continue
         }
-        Pass $Row (($ratio -ge 0.9) -and ($ratio -le 1.02)) $what
+        Pass $Row (($ratio -ge 0.85) -and ($ratio -le 1.02)) $what
     }
 }
 
@@ -434,14 +457,16 @@ function Invoke-Shared {
 }
 
 function Invoke-Flap {
-    $script:Flap = [ordered]@{ Phase = "carry"; Off = $null; Degraded = $null; Up = $null; Share = $null; HeldDegraded = 0; FirstAfterUp = $null }
+    $script:Flap = [ordered]@{ Phase = "carry"; Off = $null; Degraded = $null; Up = $null; Share = $null; HeldDegraded = 0; Jump = $null; JumpWanted = $null }
     "  waiting for the tether to carry, then the cue"
     $res = Invoke-Download $LongUrl @($Wifi, $script:TetherName) "flap" {
         param($d, $table)
         $f = $script:Flap
         $now = Get-Date
         $links = @($table.links | Where-Object { $_.name -eq $script:TetherName })
-        $held = [int](@($d.cables | Where-Object { $_.name -eq $script:TetherName }) | Measure-Object -Property connections -Sum).Sum
+        $tether = @($d.cables | Where-Object { $_.name -eq $script:TetherName })
+        $held = [int]($tether | Measure-Object -Property connections -Sum).Sum
+        $wanted = [int]($tether | Measure-Object -Property wanted -Sum).Sum
         $gone = @($links | Where-Object { $_.state -in @("up", "degraded") }).Count -eq 0
         if ($f.Phase -eq "carry" -and $gone) {
             # Turned off before a poll saw it carry: on to its return.
@@ -481,8 +506,9 @@ function Invoke-Flap {
                 }
             }
             "share" {
-                if ($null -eq $f.FirstAfterUp -and $held -gt 0) { $f.FirstAfterUp = $held }
                 if ($held -gt 1) {
+                    $f.Jump = $held
+                    $f.JumpWanted = $wanted
                     $f.Share = $now
                     return "stop"
                 }
@@ -503,8 +529,10 @@ function Invoke-Flap {
     if ($f.Up) {
         $at = $null
         if ($f.Share) { $at = ($f.Share - $f.Up).TotalSeconds }
-        Pass "Flap" ($null -ne $at -and $at -le 5 -and $f.FirstAfterUp -gt 1) `
-            ("its share at once: {0} connections first after up, more than one {1} s after" -f $f.FirstAfterUp, $at)
+        # At once: by the next rebalance (every 2 s), from one straight to all
+        # it is wanted, not one more a rebalance.
+        Pass "Flap" ($null -ne $at -and $at -le 3 -and $f.Jump -ge 2 -and $f.Jump -eq $f.JumpWanted) `
+            ("its share at once: from one to {0} of the {1} wanted, {2:N1} s after it was up" -f $f.Jump, $f.JumpWanted, $at)
     }
     Show-Used "Flap" $res
 }
