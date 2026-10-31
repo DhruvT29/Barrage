@@ -96,7 +96,7 @@
 //! stopped by the user leaves nothing behind: resuming starts it over under
 //! the same name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
@@ -305,8 +305,13 @@ struct Member {
     /// connection (`paths`); none while it is not behind one.
     behind: Option<String>,
     /// The most it might hold at the last retarget: 0 while it is not
-    /// taking part, 1 while it is degraded or tries after a rest.
+    /// taking part, 1 while it tries after a rest or holds its degraded
+    /// cable's one.
     allowed: u32,
+    /// Held to none while its cable is degraded, another of its addresses
+    /// holding the cable's one: trusted, it is allowed more, as one held to
+    /// one is.
+    held: bool,
     /// Allowed more than before, until then its weight is unknown, counted as
     /// the others' average, while its speed starts again from what it carries
     /// now.
@@ -686,6 +691,7 @@ impl Download {
                         ceiling: None,
                         behind: None,
                         allowed: 0,
+                        held: false,
                         unweighed_until: None,
                         at_once: false,
                     });
@@ -1009,7 +1015,8 @@ impl Download {
     /// Each link's share of the download's connections, by what its path
     /// delivers (schedule.rs). Its target moves only by two or more; what it
     /// is wanted to hold is that within its ceiling, one while it tries after
-    /// a rest or is degraded, and none while it rests or is gone. A link
+    /// a rest, one for a degraded cable over all its addresses, and none
+    /// while it rests or is gone. A link
     /// still finding the file counts already, so the first to find it starts
     /// with its own share, not every connection a link may hold. A cable on
     /// the same internet connection as the one carrying it holds none, and
@@ -1018,21 +1025,33 @@ impl Download {
         let config = &self.job.config;
         let now = Instant::now();
         // Back from down and not trusted yet: if it drops again, it takes one
-        // connection's part with it, not a full share.
+        // connection's part with it, not a full share. One for the cable, not
+        // one for each of its addresses, since they go down together: the
+        // first taking part holds it, the others none.
         let degraded = |id: LinkId| {
             self.links
                 .iter()
                 .any(|l| l.id == id && l.state == LinkState::Degraded)
         };
-        let taking: HashMap<LinkId, u32> = self
+        let mut holding_one: HashSet<&str> = HashSet::new();
+        let mut held: HashSet<LinkId> = HashSet::new();
+        let mut taking: HashMap<LinkId, u32> = HashMap::new();
+        for m in self
             .members
             .iter()
             .filter(|m| m.present && m.resting.is_none() && (m.agrees || m.finding))
-            .map(|m| {
-                let most = most_of(m, config.most_per_link);
-                (m.id, if degraded(m.id) { most.min(1) } else { most })
-            })
-            .collect();
+        {
+            let most = match (degraded(m.id), most_of(m, config.most_per_link)) {
+                (false, most) => most,
+                (true, 0) => 0,
+                (true, _) if holding_one.insert(&m.name) => 1,
+                (true, _) => {
+                    held.insert(m.id);
+                    0
+                }
+            };
+            taking.insert(m.id, most);
+        }
         // A link allowed more than a moment ago: what it carried held to less
         // says nothing of what it carries now (when a server limits each
         // connection, a link held to one carries a quarter as much and would
@@ -1042,12 +1061,16 @@ impl Download {
         // carry on all of theirs.
         for member in &mut self.members {
             let most = taking.get(&member.id).copied().unwrap_or(0);
-            if member.allowed > 0 && most > member.allowed {
+            if (member.allowed > 0 || member.held) && most > member.allowed {
                 member.rate = Rate::default();
                 member.unweighed_until = Some(now + config.rebalance_every);
                 member.at_once = true;
+                // Its target from held to less is no guide either: it takes
+                // what it is computed, as a link joining does, even one more.
+                member.target = 0;
             }
             member.allowed = most;
+            member.held = held.contains(&member.id);
         }
         // A link held to none cannot carry a path, so another cable on its
         // connection does.
