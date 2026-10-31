@@ -1,12 +1,14 @@
 import { act, render, screen, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
 
-import { formatBytes, percent } from '../downloads/format'
-import { Combined } from '../links/Combined'
+import { formatBytes, percentText } from '../downloads/format'
 import { Dashboard } from '../links/Dashboard'
+import { Hero } from '../overview/Hero'
+import { colorsByName } from '../palette'
 import type { Tab } from '../tabs'
 import { messages } from './contract'
-import type { DownloadsView, LinkView, LiveMessage } from './types'
+import { EMPTY_HISTORY } from './history'
+import type { DownloadsView, LinkView, LiveMessage, TableView } from './types'
 import { useLive } from './useLive'
 
 // Every other test here builds its tables by hand. This one uses messages the
@@ -29,6 +31,17 @@ function Page({ open, tab }: { open: (url: string) => WebSocket; tab: Tab }) {
   return <Dashboard {...useLive('ws://127.0.0.1:7700/api/live', open)} tab={tab} onTab={() => {}} />
 }
 
+/** The page on `tab`, fed every message in the contract; `each` runs after each one, with the page. */
+function feedAll(tab: Tab, each?: (message: LiveMessage, page: HTMLElement) => void) {
+  const socket = new EngineSocket()
+  const { container } = render(<Page open={() => socket as unknown as WebSocket} tab={tab} />)
+  for (const message of messages as LiveMessage[]) {
+    socket.send(JSON.stringify(message))
+    each?.(message, container)
+  }
+  return container
+}
+
 /** The cables, by name, in the order they first appear. */
 const cableNames = (links: LinkView[]) => [...new Set(links.map((l) => l.name))]
 
@@ -39,32 +52,31 @@ function lastDownloads(all: LiveMessage[]): DownloadsView {
   return sent[sent.length - 1]
 }
 
-test('the dashboard draws every message the engine really sends', () => {
-  const all: LiveMessage[] = messages
-  const socket = new EngineSocket()
-  const open = () => socket as unknown as WebSocket
-  const { container } = render(<Page open={open} tab="links" />)
+/** The last change the engine sent: the contract ends with one. */
+function lastChange(): Extract<LiveMessage, { type: 'change' }> {
+  const last = messages[messages.length - 1] as LiveMessage
+  if (last.type !== 'change') throw new Error('the contract ends with a change')
+  return last
+}
 
+/** One cable's card in the download manager's left column. */
+const cableCard = (name: string) => within(screen.getByRole('region', { name: 'Mesh links' })).getByRole('region', { name })
+
+test('the download manager draws every message the engine really sends: the cables and the hero', () => {
   // A downloads message carries no table: the cards stay as the last table drew them.
   let drawn: LinkView[] = []
-  for (const message of all) {
-    socket.send(JSON.stringify(message))
+  feedAll('downloads', (message, page) => {
     if (message.type !== 'downloads') drawn = message.table.links
-    expect(container.querySelectorAll('section.cable')).toHaveLength(cableNames(drawn).length)
-  }
+    expect(page.querySelectorAll('section.ml-card')).toHaveLength(cableNames(drawn).length)
+  })
 
-  const last = all[all.length - 1]
-  if (last.type !== 'change') throw new Error('the contract ends with a change')
-  const { table } = last
-  const { bps, parts, not_counted } = table.combined
+  const { table } = lastChange()
   // The loops below prove nothing over an empty file.
   expect(table.links.length, 'links').toBeGreaterThan(0)
-  expect(parts.length, 'combined parts').toBeGreaterThan(0)
-  expect(not_counted.length, 'cables left out of the sum').toBeGreaterThan(0)
 
   // Every cable, with each of its addresses in order.
   for (const name of cableNames(table.links)) {
-    const shown = within(screen.getByRole('region', { name })).getAllByTestId('address')
+    const shown = within(cableCard(name)).getAllByTestId('address')
     const own = table.links.filter((l) => l.name === name)
     expect(shown).toHaveLength(own.length)
     own.forEach((link, i) => expect(shown[i]).toHaveTextContent(link.address))
@@ -77,8 +89,8 @@ test('the dashboard draws every message the engine really sends', () => {
     return states.includes('degraded') && states.includes('portal')
   })
   expect(mixed, 'a cable with a degraded and a portal address').toBeDefined()
-  const card = within(screen.getByRole('region', { name: mixed }))
-  expect(card.getByTestId('state')).toHaveTextContent('degraded')
+  const card = within(cableCard(mixed!))
+  expect(card.getByTestId('state')).toHaveTextContent(/^degraded$/)
   expect(card.getByText('portal')).toBeInTheDocument()
 
   // The cables on one connection are named in the notice.
@@ -87,36 +99,68 @@ test('the dashboard draws every message the engine really sends', () => {
   for (const name of table.connections.flat()) expect(notice).toHaveTextContent(name)
 
   // A download is running, so the hero is its live speed, by cable.
-  const { live } = lastDownloads(all)
+  const { live } = lastDownloads(messages)
   expect(live.parts.length, 'cables carrying data').toBeGreaterThan(0)
   const running = within(screen.getByRole('region', { name: 'Downloading at' }))
   expect(running.getByTestId('total')).toHaveTextContent(`${(live.bps / 1e6).toFixed(1)} Mbps`)
   expect(running.getAllByTestId('part').map((p) => p.querySelector('b')?.textContent)).toEqual(
     live.parts.map((p) => p.name),
   )
+})
 
-  // With nothing downloading, the same place is the combined speed: its
-  // parts, and what it left out and why.
-  const { container: alone } = render(<Combined combined={table.combined} downloads={null} />)
-  const hero = within(within(alone).getByRole('region', { name: 'Combined speed available' }))
+test('with nothing downloading, the hero is the combined speed: its parts, and what it left out and why', () => {
+  const { table } = lastChange()
+  const { bps, parts, not_counted } = table.combined
+  expect(parts.length, 'combined parts').toBeGreaterThan(0)
+  expect(not_counted.length, 'cables left out of the sum').toBeGreaterThan(0)
+
+  const colors = colorsByName(cableNames(table.links))
+  render(
+    <Hero
+      status="live"
+      table={table}
+      feed={[]}
+      downloads={null}
+      history={EMPTY_HISTORY}
+      colors={colors}
+      onAdd={() => {}}
+      onTab={() => {}}
+    />,
+  )
+  const hero = within(screen.getByRole('region', { name: 'Combined speed available' }))
   expect(hero.getByTestId('total')).toHaveTextContent(`${(bps / 1e6).toFixed(1)} Mbps`)
   expect(hero.getAllByTestId('part').map((p) => p.querySelector('b')?.textContent)).toEqual(parts.map((p) => p.name))
   const note = hero.getByTestId('note')
   for (const other of parts.flatMap((p) => p.shared_with)) expect(note).toHaveTextContent(other)
   for (const { name, why } of not_counted) expect(note).toHaveTextContent(`${name} (${why})`)
+})
+
+test('the radar draws every message the engine really sends: a node and a roster row per cable, and the change lines', () => {
+  let drawn: TableView | null = null
+  const container = feedAll('links', (message, page) => {
+    if (message.type !== 'downloads') drawn = message.table
+    const names = drawn ? cableNames(drawn.links) : []
+    expect(page.querySelectorAll('.rd-node')).toHaveLength(names.length)
+    expect(page.querySelectorAll('.rd-row')).toHaveLength(names.length)
+  })
+
+  const last = lastChange()
+  // Each node is named with its cable and its state in words.
+  for (const name of cableNames(last.table.links)) {
+    const node = [...container.querySelectorAll('.rd-node')].find((n) => n.getAttribute('aria-label')!.startsWith(`${name}:`))
+    expect(node, `${name}'s node`).toBeDefined()
+  }
 
   // The change's lines, in the activity feed.
   expect(last.lines.length, 'the change has lines').toBeGreaterThan(0)
-  for (const line of last.lines) expect(screen.getByText(line)).toBeInTheDocument()
+  const activity = within(screen.getByRole('complementary', { name: 'Activity' }))
+  for (const line of last.lines) expect(activity.getByText(line)).toBeInTheDocument()
 })
 
-test('the contract file renders on the Downloads tab too', () => {
-  const all: LiveMessage[] = messages
-  const socket = new EngineSocket()
-  render(<Page open={() => socket as unknown as WebSocket} tab="downloads" />)
-  for (const message of all) socket.send(JSON.stringify(message))
+test('the contract file renders on the download manager: every download card', () => {
+  feedAll('downloads')
 
-  const { list } = lastDownloads(all)
+  const { list } = lastDownloads(messages)
   // The checks below prove nothing unless every kind of card is in the file.
   const states = list.map((d) => d.state)
   for (const state of ['starting', 'waiting', 'downloading', 'done', 'failed', 'stopped'] as const) {
@@ -127,25 +171,29 @@ test('the contract file renders on the Downloads tab too', () => {
 
   // Every download, the newest first, by its name or else its address.
   const titles = list.map((d) => d.name ?? d.url)
-  const cards = screen.getAllByRole('region').filter((r) => r.classList.contains('dl'))
+  const queue = screen.getByRole('region', { name: 'Transfer queue' })
+  const cards = within(queue)
+    .getAllByRole('region')
+    .filter((r) => r.classList.contains('tq-card'))
   expect(cards.map((c) => c.getAttribute('aria-label'))).toEqual([...titles].reverse())
 
   for (const d of list) {
-    const card = within(screen.getByRole('region', { name: d.name ?? d.url }))
+    const card = within(within(queue).getByRole('region', { name: d.name ?? d.url }))
     expect(card.getByTestId('state')).toHaveTextContent(new RegExp(`^${d.state}$`))
-    expect(card.getByTestId('foot')).toHaveTextContent(`download ${d.id}`)
+    expect(card.getByTestId('id')).toHaveTextContent(new RegExp(`^#${d.id}$`))
     if (d.note !== null) expect(card.getByTestId('note')).toHaveTextContent(d.note)
     if (d.state === 'downloading' && d.length !== null) {
-      expect(card.getByTestId('progress')).toHaveTextContent(`${formatBytes(d.done)} of ${formatBytes(d.length)}`)
-      expect(card.getByTestId('percent')).toHaveTextContent(`${percent(d.done, d.length)}%`)
+      expect(card.getByTestId('progress')).toHaveTextContent(`${formatBytes(d.done)} / ${formatBytes(d.length)}`)
+      expect(card.getByTestId('percent')).toHaveTextContent(percentText(d.done, d.length))
     }
-    // Each cable that carried bytes, holds connections or says something
-    // new, with its bytes and its notes.
+    // Each cable that carried bytes, holds connections, is wanted by a
+    // running download or says something new, with its bytes and its notes.
     const rows = card.queryAllByTestId('cable')
     for (const c of d.cables) {
       const row = rows.find((r) => within(r).getByTestId('cable-name').textContent === c.name)
       const notes = c.notes.filter((n) => n !== d.note)
-      if (c.bytes === 0 && c.connections === 0 && notes.length === 0) {
+      const wanted = d.state === 'downloading' && c.wanted > 0
+      if (c.bytes === 0 && c.connections === 0 && notes.length === 0 && !wanted) {
         expect(row, `${c.name} on ${d.name ?? d.url} has nothing to say`).toBeUndefined()
         continue
       }
@@ -172,28 +220,22 @@ test('the contract carries a metered cable, a cable wanting more than it holds, 
 })
 
 test("the contract's cards show the metered mark, the data used, and each cable's share and wanted", () => {
-  const socket = new EngineSocket()
-  const open = () => socket as unknown as WebSocket
-  const { unmount } = render(<Page open={open} tab="links" />)
-  for (const message of messages) socket.send(JSON.stringify(message))
-  const last = messages[messages.length - 1]
-  if (last.type !== 'change') throw new Error('the contract ends with a change')
+  feedAll('downloads')
+  const last = lastChange()
   const { used, list } = lastDownloads(messages)
 
   for (const name of cableNames(last.table.links)) {
-    const card = within(screen.getByRole('region', { name }))
+    const card = within(cableCard(name))
     const metered = last.table.links.some((l) => l.name === name && l.metered)
     expect(card.queryByTestId('metered') !== null, `${name} metered`).toBe(metered)
+    if (metered) expect(card.getByTestId('metered')).toHaveTextContent('metered')
     const bytes = used.find((u) => u.cable === name)?.bytes ?? 0
-    if (bytes > 0) expect(card.getByTestId('used')).toHaveTextContent(`used ${formatBytes(bytes)}`)
-    else expect(card.queryByTestId('used'), `${name} used`).toBeNull()
+    expect(card.getByTestId('stat-used'), `${name} used`).toHaveTextContent(bytes > 0 ? formatBytes(bytes) : /^Used-$/)
   }
-  unmount()
 
-  render(<Page open={open} tab="downloads" />)
-  for (const message of messages) socket.send(JSON.stringify(message))
+  const queue = screen.getByRole('region', { name: 'Transfer queue' })
   for (const d of list.filter((d) => d.state === 'downloading')) {
-    const card = within(screen.getByRole('region', { name: d.name ?? d.url }))
+    const card = within(within(queue).getByRole('region', { name: d.name ?? d.url }))
     for (const c of d.cables.filter((c) => c.connections > 0)) {
       const row = card.getAllByTestId('cable').find((r) => within(r).getByTestId('cable-name').textContent === c.name)!
       expect(within(row).getByTestId('cable-carrying')).toHaveTextContent(

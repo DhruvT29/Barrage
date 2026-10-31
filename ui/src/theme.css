@@ -1,0 +1,55 @@
+/* BARRAGE design tokens, from the designs of 2026-10-30 (designs/, kept out
+   of git): near-black with a faint green grid, neon green as the main
+   colour, a colour per cable, monospace labels in wide-spaced capitals.
+   Every section's stylesheet uses these names; never hard-code a colour. */
+:root {
+  /* Surfaces */
+  --bg: #030604;
+  --bg-grid: rgba(34, 255, 102, 0.035);
+  --panel: #06100a;
+  --panel-2: #081610; /* an inset: a stat tile, a field */
+  --panel-hover: #0a1d13;
+  --edge: rgba(34, 255, 102, 0.16);
+  --edge-strong: rgba(34, 255, 102, 0.42);
+
+  /* Text */
+  --text: #e8fff0;
+  --text-2: #b9d8c4; /* secondary figures */
+  --dim: #5f8a70; /* labels */
+  --faint: #36513f; /* edges, baselines, marks and placeholders: too faint for text that says something */
+  --ink: #000000; /* pure black: shadows and the window's scrim */
+
+  /* Meaning */
+  --green: #22ff66; /* working, speeds, the main action */
+  --green-deep: #0fbf4a;
+  --cyan: #22d3ee;
+  --lime: #b6f53b;
+  --amber: #ffb020; /* degraded, probing, portal; waiting, stopped */
+  --red: #ff4d5e; /* down; failed */
+  --magenta: #ff2bd6; /* shared internet */
+
+  /* One per cable, in table order (palette.ts holds the same list) */
+  --cable-0: #22ff66;
+  --cable-1: #22d3ee;
+  --cable-2: #b6f53b;
+  --cable-3: #ffb020;
+  --cable-4: #5eead4;
+  --cable-5: #a78bfa;
+  --cable-6: #f472b6;
+
+  /* Glow */
+  --glow: 0 0 6px rgba(34, 255, 102, 0.55), 0 0 22px rgba(34, 255, 102, 0.22);
+  --glow-soft: 0 0 0 1px rgba(34, 255, 102, 0.1), 0 0 40px rgba(34, 255, 102, 0.06);
+
+  /* Type */
+  --display: 'Space Grotesk', system-ui, sans-serif; /* names, headings, big figures */
+  --mono: 'JetBrains Mono', ui-monospace, Consolas, monospace; /* labels, figures, body */
+  --label-spacing: 0.22em; /* the wide-spaced capitals of every small label */
+
+  /* Shape */
+  --radius: 4px;
+  --gutter: 24px;
+  --max-width: 1560px;
+
+  color-scheme: dark;
+}

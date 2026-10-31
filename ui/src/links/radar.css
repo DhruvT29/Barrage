@@ -1,0 +1,1132 @@
+/* The "Device radar" tab: the radar, the selected cable, the roster and the
+   activity log. Designer B's module: every class starts with `rd-`.
+   Colours are tokens from theme.css; the selected cable's own colour
+   arrives as `--c` and its state's as `--tone`. */
+
+.rd-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 440px);
+  grid-template-areas:
+    'scope detail'
+    'roster detail'
+    'feed detail';
+  grid-template-rows: auto auto 1fr;
+  gap: 28px var(--gutter);
+  align-items: start;
+  min-width: 0;
+}
+
+@media (max-width: 1100px) {
+  .rd-page {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: 'scope' 'detail' 'roster' 'feed';
+    grid-template-rows: none;
+  }
+}
+
+/* Tones: the state's colour; the word is always beside it. */
+.rd-tone-up {
+  color: var(--green);
+}
+.rd-tone-warn {
+  color: var(--amber);
+}
+.rd-tone-down {
+  color: var(--red);
+}
+.rd-bg-up {
+  background: var(--green);
+}
+.rd-bg-down {
+  background: var(--red);
+}
+
+.rd-eyebrow {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.rd-accent {
+  color: var(--green);
+  text-shadow: 0 0 14px color-mix(in srgb, var(--green) 45%, transparent);
+}
+
+.rd-quiet {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.rd-panel {
+  position: relative;
+  min-width: 0;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--glow-soft);
+}
+
+.rd-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--badge, var(--green)) 55%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--badge, var(--green)) 8%, transparent);
+  color: var(--badge, var(--green));
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.rd-badge::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+
+.rd-watch-disconnected {
+  --badge: var(--red);
+}
+.rd-watch-connecting {
+  --badge: var(--amber);
+}
+
+/* ---------- The radar panel ---------- */
+
+.rd-scopepanel {
+  grid-area: scope;
+  container-type: inline-size;
+}
+
+.rd-scopehead {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 20px 20px 18px;
+  border-bottom: 1px solid var(--edge);
+}
+
+.rd-h1 {
+  margin: 2px 0 0;
+  font-family: var(--display);
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.rd-desc {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.rd-filter {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  width: fit-content;
+  margin-top: 6px;
+  padding: 3px;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.rd-filter button {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.rd-filter button:hover {
+  color: var(--text);
+  background: var(--panel-hover);
+}
+
+.rd-filter button[aria-pressed='true'] {
+  background: var(--green);
+  color: var(--bg);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--green) 40%, transparent);
+}
+
+.rd-filter button:focus-visible,
+.rd-row:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+.rd-scopebody {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 210px;
+  gap: 20px;
+  padding: 20px;
+}
+
+@container (max-width: 720px) {
+  .rd-scopebody {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rd-side {
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  }
+}
+
+/* The scope: a square that scales with the panel. */
+.rd-scope {
+  position: relative;
+  width: 100%;
+  max-width: 680px;
+  aspect-ratio: 1;
+  margin: 0 auto;
+}
+
+.rd-readout {
+  position: absolute;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rd-azimuth {
+  left: 0;
+}
+
+.rd-range {
+  right: 0;
+  align-items: flex-end;
+}
+
+.rd-readfig {
+  font-family: var(--display);
+  font-size: clamp(18px, 4cqi, 28px);
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.rd-azimuth .rd-readfig {
+  color: var(--green);
+  text-shadow: 0 0 14px color-mix(in srgb, var(--green) 50%, transparent);
+}
+
+.rd-readfig small {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/* The sweep: a conic wedge on the radar's disc (250 of 640 units, centred). */
+.rd-sweep {
+  position: absolute;
+  left: 10.9375%;
+  top: 10.9375%;
+  width: 78.125%;
+  height: 78.125%;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg 250deg,
+    color-mix(in srgb, var(--green) 3%, transparent) 290deg,
+    color-mix(in srgb, var(--green) 26%, transparent) 360deg
+  );
+  animation: rd-spin 4s linear infinite;
+  pointer-events: none;
+}
+
+.rd-sweep::after {
+  content: '';
+  position: absolute;
+  left: calc(50% - 1px);
+  top: 0;
+  width: 2px;
+  height: 50%;
+  background: linear-gradient(to top, transparent, var(--green));
+  box-shadow: 0 0 10px var(--green);
+  opacity: 0.85;
+}
+
+@keyframes rd-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.rd-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.rd-floor-in {
+  stop-color: color-mix(in srgb, var(--green) 8%, transparent);
+}
+.rd-floor-out {
+  stop-color: color-mix(in srgb, var(--green) 2%, transparent);
+}
+
+.rd-edge {
+  stroke: color-mix(in srgb, var(--green) 75%, transparent);
+  stroke-width: 1.5;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--green) 50%, transparent));
+}
+
+.rd-ring {
+  fill: none;
+  stroke: color-mix(in srgb, var(--green) 32%, transparent);
+  stroke-dasharray: 3 6;
+}
+
+.rd-cross {
+  stroke: color-mix(in srgb, var(--green) 14%, transparent);
+}
+
+.rd-ringlabel {
+  fill: color-mix(in srgb, var(--dim) 75%, transparent);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.rd-tick {
+  stroke: color-mix(in srgb, var(--green) 35%, transparent);
+}
+
+.rd-tick.rd-major {
+  stroke: color-mix(in srgb, var(--green) 85%, transparent);
+  stroke-width: 1.5;
+}
+
+.rd-deg {
+  fill: var(--text-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+.rd-beam {
+  stroke-width: 1.3;
+  stroke-dasharray: 4 6;
+  opacity: 0.75;
+  animation: rd-flow 1.2s linear infinite;
+}
+
+/* Data flows in, toward the hub. */
+@keyframes rd-flow {
+  to {
+    stroke-dashoffset: 10;
+  }
+}
+
+.rd-hubring {
+  fill: var(--bg);
+  stroke: var(--green);
+  stroke-width: 2.5;
+  filter: drop-shadow(0 0 8px var(--green));
+}
+
+.rd-hubcore {
+  fill: var(--green);
+}
+
+.rd-hublabel {
+  fill: var(--text);
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+.rd-node {
+  cursor: pointer;
+  outline: none;
+}
+
+.rd-hit {
+  fill: transparent;
+}
+
+.rd-focusring {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 3;
+  opacity: 0;
+}
+
+.rd-node:focus-visible .rd-focusring {
+  opacity: 1;
+}
+
+.rd-dot {
+  fill: currentColor;
+  stroke: color-mix(in srgb, currentColor 40%, var(--bg));
+  stroke-width: 3;
+  paint-order: stroke;
+  filter: drop-shadow(0 0 6px currentColor);
+}
+
+.rd-dot.rd-hollow {
+  fill: var(--bg);
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
+.rd-node:hover .rd-dot {
+  filter: drop-shadow(0 0 10px currentColor);
+}
+
+.rd-pulse {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: rd-pulse 1.8s ease-out infinite;
+}
+
+@keyframes rd-pulse {
+  from {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(3);
+    opacity: 0;
+  }
+}
+
+.rd-nname {
+  fill: currentColor;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3px;
+}
+
+.rd-nfig {
+  fill: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3px;
+}
+
+.rd-brackets path {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 2;
+  filter: drop-shadow(0 0 4px var(--text));
+}
+
+/* On a narrow radar, the drawing's text grows back to a readable size. */
+@container (max-width: 560px) {
+  .rd-nname {
+    font-size: 19px;
+  }
+  .rd-nfig,
+  .rd-ringlabel {
+    font-size: 15px;
+  }
+  .rd-deg,
+  .rd-hublabel {
+    font-size: 17px;
+  }
+}
+
+.rd-scopeempty {
+  position: absolute;
+  left: 50%;
+  top: 62%;
+  z-index: 1;
+  width: min(70%, 360px);
+  margin: 0;
+  padding: 10px 14px;
+  transform: translateX(-50%);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+  color: var(--text-2);
+}
+
+/* Beside the radar: the states and the legend. */
+.rd-side {
+  display: grid;
+  align-content: start;
+  gap: 26px;
+}
+
+.rd-states {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: separate;
+  border-spacing: 0 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.rd-states th,
+.rd-states td {
+  padding: 7px 10px;
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
+  background: var(--panel-2);
+}
+
+.rd-states th {
+  border-left: 1px solid var(--edge);
+  border-radius: 2px 0 0 2px;
+  text-align: left;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.rd-states td {
+  border-right: 1px solid var(--edge);
+  border-radius: 0 2px 2px 0;
+  text-align: right;
+  font-weight: 600;
+  color: var(--green);
+  font-variant-numeric: tabular-nums;
+}
+
+.rd-states .rd-zero th,
+.rd-states .rd-zero td {
+  color: var(--dim);
+  background: transparent;
+}
+
+.rd-pip {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 8px;
+  border-radius: 50%;
+  vertical-align: 1px;
+}
+
+.rd-states .rd-zero .rd-pip {
+  opacity: 0.35;
+}
+
+.rd-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.rd-legend li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.rd-lg {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.rd-lg-up {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+}
+.rd-lg-warn {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+.rd-lg-down {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+}
+.rd-lg-beam {
+  width: 14px;
+  height: 0;
+  border-radius: 0;
+  border-top: 1.5px dashed var(--green);
+}
+.rd-lg-hollow {
+  border: 1.5px solid var(--text-2);
+}
+
+.rd-scopefoot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 20px;
+  padding: 14px 20px 16px;
+  border-top: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/* ---------- The selected cable ---------- */
+
+.rd-detail {
+  --c: var(--dim);
+  --tone: var(--green);
+  grid-area: detail;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 20px;
+  border-color: color-mix(in srgb, var(--tone) 50%, transparent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--tone) 12%, transparent),
+    0 0 32px color-mix(in srgb, var(--tone) 16%, transparent),
+    inset 0 0 40px color-mix(in srgb, var(--tone) 4%, transparent);
+  transition:
+    border-color 0.3s,
+    box-shadow 0.3s;
+}
+
+/* The design's corner marks, in the state's colour. */
+.rd-detail::before,
+.rd-detail::after {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  pointer-events: none;
+}
+.rd-detail::before {
+  top: -1px;
+  left: -1px;
+  border-top: 2px solid var(--tone);
+  border-left: 2px solid var(--tone);
+}
+.rd-detail::after {
+  right: -1px;
+  bottom: -1px;
+  border-right: 2px solid var(--tone);
+  border-bottom: 2px solid var(--tone);
+}
+
+@media (min-width: 1101px) {
+  .rd-detail {
+    position: sticky;
+    top: 16px;
+  }
+}
+
+.rd-dhead {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.rd-iconbox {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid color-mix(in srgb, var(--tone) 55%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--tone) 7%, var(--panel-2));
+  color: var(--tone);
+}
+
+.rd-dhead .rd-badge {
+  --badge: var(--tone);
+}
+
+.rd-dname {
+  margin: 8px 0 0;
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.rd-dsub {
+  margin: 4px 0 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.rd-throughput {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.rd-tprow {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.rd-tpfig {
+  margin: 8px 0 0;
+  font-family: var(--display);
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--c);
+  text-shadow: 0 0 16px color-mix(in srgb, var(--c) 45%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.rd-tpfig small {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--dim);
+  text-shadow: none;
+}
+
+.rd-cap {
+  text-align: right;
+}
+
+.rd-capfig {
+  margin: 8px 0 0;
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.rd-tpbar {
+  height: 4px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--c) 10%, var(--bg));
+  overflow: hidden;
+}
+
+.rd-tpbar span {
+  display: block;
+  height: 100%;
+  background: var(--c);
+  box-shadow: 0 0 8px var(--c);
+  transition: width 0.6s ease;
+}
+
+.rd-idle {
+  margin: -2px 0 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.rd-tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.rd-tile {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.rd-tile > div {
+  min-width: 0;
+}
+
+.rd-ringsvg {
+  flex: none;
+  transform: rotate(-90deg);
+}
+
+.rd-ringtrack {
+  fill: none;
+  stroke: color-mix(in srgb, var(--green) 10%, var(--bg));
+  stroke-width: 3.5;
+}
+
+.rd-ringfill {
+  fill: none;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.6s ease;
+}
+
+.rd-tilefig {
+  margin: 5px 0 2px;
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rd-tilesub {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rd-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin: 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.rd-facts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.rd-facts dt {
+  flex: none;
+  color: var(--dim);
+}
+
+.rd-facts dd {
+  margin: 0;
+  min-width: 0;
+  text-align: right;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- The roster ---------- */
+
+.rd-roster {
+  grid-area: roster;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.rd-sectionhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.rd-sectionhead > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rd-title {
+  margin: 0;
+  font-family: var(--display);
+  font-size: 21px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.rd-aside {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.rd-aside .rd-pip {
+  box-shadow: 0 0 6px currentColor;
+}
+
+.rd-rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 10px;
+}
+
+.rd-row {
+  --tone: var(--green);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    border-color 0.2s,
+    background 0.2s,
+    box-shadow 0.2s;
+}
+
+.rd-row-warn {
+  --tone: var(--amber);
+}
+.rd-row-down {
+  --tone: var(--red);
+}
+
+.rd-row:hover {
+  background: var(--panel-hover);
+  border-color: var(--edge-strong);
+}
+
+.rd-row[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--tone) 70%, transparent);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--tone) 18%, transparent);
+}
+
+.rd-rowicon {
+  flex: none;
+  display: grid;
+  place-items: center;
+}
+
+.rd-rowid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.rd-rowname {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rd-rowstate {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.rd-rowfigs {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  flex: none;
+  font-family: var(--mono);
+}
+
+.rd-rowspeed {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.rd-rowping {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+.rd-own {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+}
+
+.rd-rosterempty {
+  padding: 16px;
+  border: 1px dashed var(--edge);
+  border-radius: var(--radius);
+}
+
+/* ---------- The activity log ---------- */
+
+.rd-activity {
+  grid-area: feed;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 20px 20px;
+}
+
+.rd-log {
+  padding: 12px 14px;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.75;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.rd-log ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rd-log li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 14px;
+  color: var(--text-2);
+}
+
+.rd-log time {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.rd-log span {
+  overflow-wrap: anywhere;
+}
+
+.rd-log .rd-nobreak {
+  white-space: nowrap;
+}
+
+.rd-log-down span {
+  color: var(--red);
+}
+
+.rd-log-add span {
+  color: var(--green);
+}
+
+.rd-prompt {
+  margin: 4px 0 0;
+  color: var(--green);
+}
+
+.rd-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 13px;
+  vertical-align: -2px;
+  background: var(--green);
+  animation: rd-blink 1.1s steps(1) infinite;
+}
+
+@keyframes rd-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .rd-scopehead,
+  .rd-scopebody {
+    padding: 16px 14px;
+  }
+  .rd-scopefoot {
+    padding: 12px 14px;
+  }
+  .rd-detail,
+  .rd-activity {
+    padding: 16px 14px;
+  }
+  .rd-h1 {
+    font-size: 25px;
+  }
+  .rd-tiles {
+    gap: 8px;
+  }
+  .rd-tile {
+    gap: 9px;
+    padding: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rd-sweep,
+  .rd-beam,
+  .rd-pulse,
+  .rd-cursor {
+    animation: none;
+  }
+  .rd-pulse {
+    opacity: 0.5;
+    transform: scale(1.8);
+  }
+  .rd-detail,
+  .rd-row,
+  .rd-tpbar span,
+  .rd-ringfill {
+    transition: none;
+  }
+}

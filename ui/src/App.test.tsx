@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import App from './App'
@@ -35,59 +35,65 @@ beforeEach(() => window.history.replaceState(null, '', '/'))
 afterEach(() => window.history.replaceState(null, '', '/'))
 
 const tab = (name: string) => screen.getByRole('tab', { name })
-const field = () => screen.queryByRole('textbox', { name: 'Download a file from its link' })
+const hero = () => screen.queryByRole('region', { name: 'Combined speed available' })
 
 test('the app shows its name and its two tabs', () => {
   render(<App />)
   expect(screen.getByRole('heading', { name: 'BARRAGE' })).toBeInTheDocument()
-  expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Links', 'Downloads'])
+  expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Download manager', 'Device radar'])
 })
 
-test('Links is the tab shown, unless the address names another', () => {
+test('the download manager is the tab shown, unless the address names another', () => {
   render(<App />)
-  expect(tab('Links')).toHaveAttribute('aria-selected', 'true')
-  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'false')
-  expect(screen.getByRole('region', { name: 'Wi-Fi' })).toBeInTheDocument()
+  expect(tab('Download manager')).toHaveAttribute('aria-selected', 'true')
+  expect(tab('Device radar')).toHaveAttribute('aria-selected', 'false')
+  expect(hero()).toBeInTheDocument()
 })
 
-test('the Downloads tab survives a reload', () => {
+test('the radar tab survives a reload', () => {
   render(<App />)
-  fireEvent.click(tab('Downloads'))
-  expect(window.location.hash).toBe('#downloads')
-  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'true')
-  expect(field()).toBeInTheDocument()
+  fireEvent.click(tab('Device radar'))
+  expect(window.location.hash).toBe('#radar')
+  expect(tab('Device radar')).toHaveAttribute('aria-selected', 'true')
+  expect(hero()).toBeNull()
 
   // A reload: the page starts again from nothing but its address.
   cleanup()
   render(<App />)
-  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'true')
-  expect(field()).toBeInTheDocument()
+  expect(tab('Device radar')).toHaveAttribute('aria-selected', 'true')
+  expect(hero()).toBeNull()
 
-  // Back on Links, the address is the plain one again.
-  fireEvent.click(tab('Links'))
+  // Back on the download manager, the address is the plain one again.
+  fireEvent.click(tab('Download manager'))
   expect(window.location.hash).toBe('')
   expect(window.location.pathname).toBe('/')
-  expect(tab('Links')).toHaveAttribute('aria-selected', 'true')
-  expect(field()).toBeNull()
+  expect(tab('Download manager')).toHaveAttribute('aria-selected', 'true')
+  expect(hero()).toBeInTheDocument()
 })
 
-test('an address changed by hand, or by Back, moves the tab', () => {
+test('an address changed by hand, or by Back, moves the tab; the old #links still opens the radar', () => {
   render(<App />)
   act(() => {
-    window.history.replaceState(null, '', '/#downloads')
+    window.history.replaceState(null, '', '/#radar')
     window.dispatchEvent(new HashChangeEvent('hashchange'))
   })
-  expect(tab('Downloads')).toHaveAttribute('aria-selected', 'true')
+  expect(tab('Device radar')).toHaveAttribute('aria-selected', 'true')
+
+  act(() => {
+    window.history.replaceState(null, '', '/')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+  })
+  expect(tab('Download manager')).toHaveAttribute('aria-selected', 'true')
 
   act(() => {
     window.history.replaceState(null, '', '/#links')
     window.dispatchEvent(new HashChangeEvent('hashchange'))
   })
-  expect(tab('Links')).toHaveAttribute('aria-selected', 'true')
+  expect(tab('Device radar')).toHaveAttribute('aria-selected', 'true')
 })
 
 test('the dashboard shows what the live connection holds', () => {
   render(<App />)
-  expect(screen.getByTestId('light')).toHaveTextContent('live')
-  expect(screen.getByRole('region', { name: 'Wi-Fi' })).toBeInTheDocument()
+  expect(screen.getByTestId('light')).toHaveAccessibleName('System: live')
+  expect(within(hero()!).getByTestId('total')).toHaveTextContent('57.6 Mbps')
 })

@@ -1,24 +1,24 @@
 import { useCallback, useEffect, useState } from 'react'
 
-/** The page's two views. */
-export type Tab = 'links' | 'downloads'
+/** The page's two views: the download manager, and the radar of the cables. */
+export type Tab = 'downloads' | 'links'
 
 /** The tabs, in order, and their names on screen. */
 export const TABS: readonly { tab: Tab; label: string }[] = [
-  { tab: 'links', label: 'Links' },
-  { tab: 'downloads', label: 'Downloads' },
+  { tab: 'downloads', label: 'Download manager' },
+  { tab: 'links', label: 'Device radar' },
 ]
 
-/** The tab an address names: `#downloads` is Downloads, anything else Links. */
+/** The tab an address names: `#radar` (or the old `#links`) is the radar, anything else the download manager. */
 export function tabFrom(hash: string): Tab {
-  return hash === '#downloads' ? 'downloads' : 'links'
+  return hash === '#radar' || hash === '#links' ? 'links' : 'downloads'
 }
 
 /**
- * The tab shown, kept in the address as `#downloads`, so a reload, a
- * bookmark or a typed address opens it. Choosing a tab replaces the address
- * rather than adding to the history: the tabs are two views of one page. An
- * address changed any other way, typed or by Back, moves the tab too.
+ * The tab shown, kept in the address as `#radar`, so a reload, a bookmark or
+ * a typed address opens it. Choosing a tab replaces the address rather than
+ * adding to the history: the tabs are two views of one page. An address
+ * changed any other way, typed or by Back, moves the tab too.
  */
 export function useTab(): [Tab, (tab: Tab) => void] {
   const [tab, setTab] = useState<Tab>(() => tabFrom(window.location.hash))
@@ -31,7 +31,7 @@ export function useTab(): [Tab, (tab: Tab) => void] {
 
   const choose = useCallback((next: Tab) => {
     const { pathname, search } = window.location
-    window.history.replaceState(window.history.state, '', next === 'downloads' ? '#downloads' : pathname + search)
+    window.history.replaceState(window.history.state, '', next === 'links' ? '#radar' : pathname + search)
     setTab(next)
   }, [])
 

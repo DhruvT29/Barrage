@@ -1,0 +1,222 @@
+/* The add-a-download window: a darkened, blurred page behind a thin
+   green-edged panel with two bright corner brackets. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--ink) 62%, transparent);
+  backdrop-filter: blur(7px) saturate(0.8);
+  -webkit-backdrop-filter: blur(7px) saturate(0.8);
+  animation: modal-fade 180ms ease-out;
+}
+
+.modal {
+  position: relative;
+  width: min(520px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  border: 1px solid var(--edge-strong);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  box-shadow:
+    0 24px 80px color-mix(in srgb, var(--ink) 70%, transparent),
+    0 0 40px color-mix(in srgb, var(--green) 10%, transparent);
+  animation: modal-rise 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.modal-corner {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-color: var(--green);
+  border-style: solid;
+  pointer-events: none;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--green) 70%, transparent));
+}
+
+.modal-corner.tl {
+  top: -1px;
+  left: -1px;
+  border-width: 2px 0 0 2px;
+}
+
+.modal-corner.br {
+  right: -1px;
+  bottom: -1px;
+  border-width: 0 2px 2px 0;
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 20px 0 22px;
+}
+
+.modal-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font: 700 18px/1.2 var(--display);
+  color: var(--text);
+}
+
+.modal-title .icon {
+  color: var(--green);
+}
+
+.modal-close {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  margin: -4px -4px 0 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    color 160ms ease,
+    border-color 160ms ease,
+    background-color 160ms ease;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  border-color: var(--edge);
+  background: var(--panel-hover);
+}
+
+.modal-body {
+  padding: 10px 22px 22px;
+}
+
+.modal-says {
+  margin: 0 0 24px;
+  font: 400 12px/1.6 var(--mono);
+  color: var(--green-deep);
+}
+
+.modal-label {
+  display: block;
+  margin-bottom: 10px;
+  font: 700 10px/1 var(--mono);
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.modal-field {
+  display: block;
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: 500 13px var(--mono);
+  outline: none;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.modal-field::placeholder {
+  color: var(--faint);
+}
+
+.modal-field:focus {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 12%, transparent), 0 0 14px color-mix(in srgb, var(--green) 18%, transparent);
+}
+
+.modal-field[aria-invalid='true'] {
+  border-color: color-mix(in srgb, var(--red) 70%, transparent);
+}
+
+.modal-hint {
+  margin: 9px 0 0;
+  font: 400 10.5px/1.5 var(--mono);
+  color: var(--dim);
+}
+
+.modal-refused {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  font: 500 11.5px/1.5 var(--mono);
+  color: var(--red);
+}
+
+.modal-refused::before {
+  content: 'Refused';
+  flex: none;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding: 16px 22px 18px;
+  border-top: 1px solid var(--edge);
+}
+
+.modal-go {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 40px;
+  padding: 0 24px;
+  border: 0;
+  border-radius: 3px;
+  background: var(--green);
+  color: var(--bg);
+  font: 700 11.5px/1 var(--mono);
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: 0 0 18px color-mix(in srgb, var(--green) 35%, transparent);
+  transition:
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+
+.modal-go:hover:not(:disabled) {
+  box-shadow: 0 0 26px color-mix(in srgb, var(--green) 60%, transparent);
+}
+
+.modal-go:disabled {
+  opacity: 0.4;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.modal-go[aria-busy='true'] {
+  cursor: progress;
+}
+
+@keyframes modal-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+}
