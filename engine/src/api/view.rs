@@ -907,10 +907,12 @@ mod tests {
             CableUse {
                 cable: "Ethernet 3".to_string(),
                 bytes: 7_000_000,
+                sent: 0,
             },
             CableUse {
                 cable: "Wi-Fi".to_string(),
                 bytes: 3_100_000,
+                sent: 0,
             },
         ];
         let json = serde_json::to_value(downloads_view(&[growing], &used)).unwrap();
@@ -1299,10 +1301,12 @@ mod tests {
             CableUse {
                 cable: "Wi-Fi".to_string(),
                 bytes: 1_326_100_000,
+                sent: 0,
             },
             CableUse {
                 cable: "Ethernet 2".to_string(),
                 bytes: 1_858_200_000,
+                sent: 0,
             },
         ]
     }

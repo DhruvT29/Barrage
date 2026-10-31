@@ -170,6 +170,7 @@ mod tests {
         CableUse {
             cable: cable.to_string(),
             bytes,
+            sent: 0,
         }
     }
 
