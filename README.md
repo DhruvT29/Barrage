@@ -6,18 +6,50 @@ A Multi Device Internet Pooling System for Torrent Download
 
 You need Rust (`cargo`) and Node with pnpm.
 
-One command, from the repository's root, starts the engine and the page
-together and opens the browser; Ctrl+C stops both:
+### Quick start: one command
+
+From the repository's root, in PowerShell:
 
 ```
-.\dev.ps1            # the engine, and the page with live reload (http://127.0.0.1:5173)
-.\dev.ps1 -App       # the page built and served by the engine, as it ships (http://127.0.0.1:7700)
-.\dev.ps1 -Preview   # the page alone with made-up data: no engine, no network
+.\dev.ps1
 ```
 
-`-Release` builds the engine optimised; `-Downloads DIR`, `-Log FILE` and
-`-NoOpen` are passed on as below. The first run installs the page's packages
-and compiles the engine. By hand, the same steps are:
+It builds and starts the engine (which is also the backend: the API and the
+live socket on port 7700), then the page with live reload, waits until each
+answers, and opens http://127.0.0.1:5173 in the browser. Edits under
+`ui/src` show at once.
+
+| Command | What runs | Opens |
+|---|---|---|
+| `.\dev.ps1` | The engine, and the page with live reload: for working on the page | http://127.0.0.1:5173 |
+| `.\dev.ps1 -App` | The page built and served by the engine itself, exactly as it ships | http://127.0.0.1:7700 |
+| `.\dev.ps1 -Preview` | The page alone, fed made-up data: no engine, nothing touches the network | http://127.0.0.1:5173/preview.html |
+
+Options, with any of the above:
+
+| Option | Does |
+|---|---|
+| `-Release` | Builds the engine optimised: slower to build, faster downloads |
+| `-Downloads DIR` | Where downloads go (the folder must exist); otherwise the Downloads folder |
+| `-Log FILE` | The engine records every change in FILE |
+| `-NoOpen` | Does not open the browser |
+
+- **Ctrl+C stops everything.** The engine is asked to stop first, so it
+  saves each download's progress and a cut-short download resumes later.
+  If either part stops on its own, the other is stopped too.
+- **The first run takes a few minutes:** it installs the page's packages and
+  compiles the engine. Later runs only rebuild what changed, and the
+  packages are installed again only when the lockfile changes.
+- **The engine uses real connections** from the moment it starts: a
+  tethered phone is speed-tested once (30 to 60 MB of its data). Use
+  `-Preview` to look at the page without that.
+- **A port already in use** (7700 or 5173) is reported, with what probably
+  holds it (another `.\dev.ps1`, `barrage` or `pnpm dev`), instead of
+  starting a second copy.
+
+### By hand
+
+The same steps without the script:
 
 ```
 pnpm --dir ui install
