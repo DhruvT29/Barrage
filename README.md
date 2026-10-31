@@ -27,13 +27,14 @@ terminal.
 The dashboard has two tabs. **Links** shows a card per connection (Wi-Fi, a
 USB-tethered phone, Ethernet) with its state, delay, measured speed and
 addresses, a "metered" mark when Windows calls the connection metered, how
-much BARRAGE has downloaded through it since it started, and a notice when two
+much BARRAGE has downloaded through it since it started (its speed tests
+included: 30 to 60 MB each time a phone is measured), and a notice when two
 connections reach the internet through the same one. **Downloads** takes a
 link to a file, which then comes down through every working connection at
 once; each download shows its progress, its speed and what each connection
 carried, and while it runs, each connection's share of the speed and its
 connections, with how many it is wanted to hold while that changes. A tethered
-phone's part comes out of its mobile data, and the phone counts about a tenth
+phone's part comes out of its mobile data, and the phone counts 10 to 15%
 more than the card shows: when a connection's part is handed to another, what
 was already on its way is thrown away unread, and on a phone's slower round
 trip that adds up. The faster a connection delivers,

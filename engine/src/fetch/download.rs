@@ -1,5 +1,5 @@
 //! One download's coordinator, the only owner of its state (PLAN.md section
-//! 3.5): which links take part, which bytes are done, which chunks are still
+//! 3.5): which links take part, which bytes are done, which parts are still
 //! to fetch. Workers keep only their own connection and report by message.
 //!
 //! HOW IT RUNS
@@ -14,8 +14,10 @@
 //! workers, and the coordinator gives each one a part of the file, a claim
 //! (`spans.rs`), which it asks for in one request. A worker with nothing to
 //! do takes the first part nobody has; when there is none, the claim with
-//! the most left is cut in two and it takes the back half, so a download
-//! sends a request per cut, not one per 4 MiB (PLAN.md phase 3 item 8).
+//! the most time left at its owner's speed is cut where the two would
+//! finish together, and it takes the back (halved, before any speed is
+//! known; `spans.rs`), so a download sends a request per cut, not one per
+//! 4 MiB (PLAN.md phase 3 item 8).
 //! Several with nothing to do, as when a link joins, are each given theirs
 //! before any asks. A worker that fails reports what it wrote, and the rest
 //! of its claim is given to the next one with nothing to do. Once every
@@ -71,7 +73,7 @@
 //! A link keeps the address its redirects led to. Many are signed and last
 //! minutes, so a `401`, `403`, `404` or `410` from one sends the link back to
 //! the URL given, to find the file again; the same file, it carries on
-//! through the fresh address. Once only until a chunk comes through again.
+//! through the fresh address. Once only until a piece comes through again.
 //!
 //! With no usable link it waits. When every usable link has given up, on a
 //! file it could not find or answers it could not use, and none is resting,
@@ -96,7 +98,7 @@
 //! stopped by the user leaves nothing behind: resuming starts it over under
 //! the same name.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
@@ -115,8 +117,8 @@ use super::name::{names_like, taken};
 use super::rate::Rate;
 use super::remote::{Refused, Remote, differs, find};
 use super::saved::{Saved, load, progress_path, save};
-use super::schedule::{Path, Want, allocate, paths, settle};
-use super::spans::{Claim, Floor, Hand, seat_rate, to_split};
+use super::schedule::{Path, Taker, Want, allocate, allowances, allowed_more, paths, settle_all};
+use super::spans::{Claim, Floor, Hand, cut_for, fastest_first, seat_rate};
 use super::used::{Counter, Usage};
 use super::worker::{Exit, Outcome, Report, Worker, stamp};
 use super::{
@@ -274,11 +276,11 @@ struct Member {
     /// Its next rest: `rest_first`, doubled by each rest in a row up to
     /// `rest_max`.
     backoff: Duration,
-    /// One connection is trying the link after a rest; its first chunk
+    /// One connection is trying the link after a rest; its first piece
     /// brings back the rest.
     trial: bool,
     /// Whether an address it was redirected to that answers it is gone is
-    /// found again: once, until a chunk comes through again.
+    /// found again: once, until a piece comes through again.
     may_find_again: bool,
     /// Bytes this link's workers wrote, counted by them.
     written: Arc<AtomicU64>,
@@ -304,14 +306,10 @@ struct Member {
     /// The note it sits out with, behind the cable that carries its internet
     /// connection (`paths`); none while it is not behind one.
     behind: Option<String>,
-    /// The most it might hold at the last retarget: 0 while it is not
-    /// taking part, 1 while it tries after a rest or holds its degraded
-    /// cable's one.
-    allowed: u32,
-    /// Held to none while its cable is degraded, another of its addresses
-    /// holding the cable's one: trusted, it is allowed more, as one held to
-    /// one is.
-    held: bool,
+    /// The most it might hold at the last retarget: none while it is not
+    /// taking part; 1 while it tries after a rest or holds its degraded
+    /// cable's one, 0 behind another address holding it.
+    allowed: Option<u32>,
     /// Allowed more than before, until then its weight is unknown, counted as
     /// the others' average, while its speed starts again from what it carries
     /// now.
@@ -320,6 +318,25 @@ struct Member {
     /// again, or its trial or ceiling ended): the next rebalance gives it all
     /// it is wanted at once, as a link joining is given.
     at_once: bool,
+}
+
+impl Member {
+    /// Allowed more than a moment ago (`schedule::allowed_more`) or taking a
+    /// path over: what it carried held to less, or before it sat out, says
+    /// nothing of what it carries now (when a server limits each
+    /// connection, a link held to one carries a quarter as much and would be
+    /// wanted too few to grow). Its speed starts again, and for a
+    /// `rebalance_every` its weight is unknown, the others' average: not its
+    /// speed test, one connection's figure, against what the others carry on
+    /// all of theirs. Its target is no guide either: it takes what it is
+    /// computed, as a link joining does, and the next rebalance gives it all
+    /// at once.
+    fn start_afresh(&mut self, now: Instant, rebalance_every: Duration) {
+        self.rate = Rate::default();
+        self.unweighed_until = Some(now + rebalance_every);
+        self.target = 0;
+        self.at_once = true;
+    }
 }
 
 /// The file once a link has found it.
@@ -422,6 +439,10 @@ impl Download {
                 self.publish();
             }
         }
+        // A download that failed has told its connections to stop; what they
+        // receive until they have counts as data used, so the last status
+        // waits for them, as one done or stopped does.
+        while self.workers.join_next().await.is_some() {}
         // A download that failed keeps what it had for the next attempt,
         // saved before it shows as ended, so adding it again at once finds it.
         let last = self.last_progress.take();
@@ -456,7 +477,7 @@ impl Download {
                 }
                 let (task, exit) = match ended {
                     Ok(done) => done,
-                    // A worker that panicked took its chunk with it, and the
+                    // A worker that panicked took its claim with it, and the
                     // download would wait for it for ever: it ends, its
                     // progress saved, rather than hang.
                     Err(e) if e.is_panic() => {
@@ -493,7 +514,7 @@ impl Download {
                 // better.
                 self.hand_out();
                 // A link trying again after a rest works once its connection
-                // receives bytes: the rest need not wait for a whole chunk.
+                // receives bytes: the rest need not wait for a whole claim.
                 let trying: Vec<LinkId> = self
                     .members
                     .iter()
@@ -648,6 +669,10 @@ impl Download {
                 member.trial = false;
                 member.target = 0;
                 member.ceiling = None;
+                // Back later, what it carried before is no guide: weighed by
+                // its speed test again until it has carried.
+                member.rate = Rate::default();
+                member.carrying_since = None;
                 left = true;
             }
         }
@@ -690,8 +715,7 @@ impl Download {
                         wanted: 0,
                         ceiling: None,
                         behind: None,
-                        allowed: 0,
-                        held: false,
+                        allowed: None,
                         unweighed_until: None,
                         at_once: false,
                     });
@@ -890,7 +914,7 @@ impl Download {
     }
 
     /// Start `link`'s workers, if it agrees about the file: as many as it
-    /// may hold, taking pieces off the pile, or the one fetching the whole
+    /// may hold, each given a claim, or the one fetching the whole
     /// file.
     fn take_part(&mut self, link: LinkId) {
         let Some(open) = &mut self.file else {
@@ -1024,53 +1048,33 @@ impl Download {
     fn retarget(&mut self) {
         let config = &self.job.config;
         let now = Instant::now();
-        // Back from down and not trusted yet: if it drops again, it takes one
-        // connection's part with it, not a full share. One for the cable, not
-        // one for each of its addresses, since they go down together: the
-        // first taking part holds it, the others none.
         let degraded = |id: LinkId| {
             self.links
                 .iter()
                 .any(|l| l.id == id && l.state == LinkState::Degraded)
         };
-        let mut holding_one: HashSet<&str> = HashSet::new();
-        let mut held: HashSet<LinkId> = HashSet::new();
-        let mut taking: HashMap<LinkId, u32> = HashMap::new();
-        for m in self
+        let takers: Vec<Taker> = self
             .members
             .iter()
             .filter(|m| m.present && m.resting.is_none() && (m.agrees || m.finding))
-        {
-            let most = match (degraded(m.id), most_of(m, config.most_per_link)) {
-                (false, most) => most,
-                (true, 0) => 0,
-                (true, _) if holding_one.insert(&m.name) => 1,
-                (true, _) => {
-                    held.insert(m.id);
-                    0
-                }
-            };
-            taking.insert(m.id, most);
-        }
-        // A link allowed more than a moment ago: what it carried held to less
-        // says nothing of what it carries now (when a server limits each
-        // connection, a link held to one carries a quarter as much and would
-        // be wanted too few to grow). Its speed starts again, and for a
-        // `rebalance_every` its weight is unknown, the others' average: not
-        // its speed test, one connection's figure, against what the others
-        // carry on all of theirs.
+            .map(|m| Taker {
+                id: m.id,
+                cable: &m.name,
+                degraded: degraded(m.id),
+                most: most_of(m, config.most_per_link),
+            })
+            .collect();
+        let taking: HashMap<LinkId, u32> = takers
+            .iter()
+            .map(|t| t.id)
+            .zip(allowances(&takers))
+            .collect();
         for member in &mut self.members {
-            let most = taking.get(&member.id).copied().unwrap_or(0);
-            if (member.allowed > 0 || member.held) && most > member.allowed {
-                member.rate = Rate::default();
-                member.unweighed_until = Some(now + config.rebalance_every);
-                member.at_once = true;
-                // Its target from held to less is no guide either: it takes
-                // what it is computed, as a link joining does, even one more.
-                member.target = 0;
+            let most = taking.get(&member.id).copied();
+            if allowed_more(member.allowed, most.unwrap_or(0)) {
+                member.start_afresh(now, config.rebalance_every);
             }
             member.allowed = most;
-            member.held = held.contains(&member.id);
         }
         // A link held to none cannot carry a path, so another cable on its
         // connection does.
@@ -1093,7 +1097,8 @@ impl Download {
             })
             .collect();
         let mut computed: HashMap<LinkId, u32> = HashMap::new();
-        for (path, share) in paths.iter().zip(allocate(config.connections, 1, &wants)) {
+        let shares = allocate(config.connections, 1, &wants);
+        for (path, share) in paths.iter().zip(shares) {
             // A path's connections, shared equally between its links.
             let each: Vec<Want> = path
                 .links
@@ -1105,10 +1110,22 @@ impl Download {
                 .collect();
             computed.extend(path.links.iter().copied().zip(allocate(share, 0, &each)));
         }
+        let settling: Vec<(LinkId, u32, u32)> = self
+            .members
+            .iter()
+            .filter_map(|m| computed.get(&m.id).map(|&n| (m.id, m.target, n)))
+            .collect();
+        let current: Vec<u32> = settling.iter().map(|&(_, now, _)| now).collect();
+        let next: Vec<u32> = settling.iter().map(|&(_, _, n)| n).collect();
+        let targets: HashMap<LinkId, u32> = settling
+            .iter()
+            .map(|&(id, ..)| id)
+            .zip(settle_all(&current, &next, config.connections))
+            .collect();
         for member in &mut self.members {
-            match (computed.get(&member.id), taking.get(&member.id)) {
-                (Some(&n), Some(&most)) => {
-                    member.target = settle(member.target, n);
+            match (targets.get(&member.id), taking.get(&member.id)) {
+                (Some(&target), Some(&most)) => {
+                    member.target = target;
                     member.wanted = member.target.min(most);
                 }
                 _ => member.wanted = 0,
@@ -1132,7 +1149,9 @@ impl Download {
                         if member.note.as_ref() == Some(&note) {
                             member.note = None;
                         }
-                        member.at_once = true;
+                        // It takes the path over: what it carried before it
+                        // sat out, decayed since, is no guide.
+                        member.start_afresh(now, config.rebalance_every);
                     }
                 }
             }
@@ -1194,8 +1213,12 @@ impl Download {
             .filter(|m| !self.seats.values().any(|s| s.link == m.id && s.retiring))
             .map(|m| (m.id, self.holding(m.id), m.wanted, m.at_once))
             .collect();
+        // Only the links that move now: one waiting on a retiring connection
+        // keeps its at once for when it can.
         for member in &mut self.members {
-            member.at_once = false;
+            if moves.iter().any(|(link, ..)| *link == member.id) {
+                member.at_once = false;
+            }
         }
         for (link, holding, wanted, at_once) in moves {
             if holding > wanted {
@@ -1274,32 +1297,62 @@ impl Download {
             let (link, connections) = taking.get(&seat.link).copied().unwrap_or((None, 0));
             seat_rate(seat.rate.bps(), link, connections)
         };
-        let mut idle: Vec<u64> = self
-            .seats
+        // A link works at most as many connections as it is wanted to hold:
+        // one holding more (it sits out now, or its share fell) leaves the
+        // rest idle for the rebalance to retire, rather than have them cut
+        // into others' claims meanwhile.
+        let mut may_start: HashMap<LinkId, u32> = self
+            .members
             .iter()
-            .filter(|(_, s)| s.idle && !s.retiring && taking.contains_key(&s.link))
-            .map(|(seat, _)| *seat)
+            .map(|m| {
+                let working = self
+                    .seats
+                    .values()
+                    .filter(|s| s.link == m.id && !s.idle && !s.retiring)
+                    .count() as u32;
+                (m.id, m.wanted.saturating_sub(working))
+            })
             .collect();
-        idle.sort_unstable();
-        for seat in idle {
-            let range = if unclaimed.is_empty() {
+        let mut idle: Vec<(u64, Option<u64>)> = Vec::new();
+        let mut seats: Vec<(&u64, &Seat)> = self.seats.iter().collect();
+        seats.sort_unstable_by_key(|(seat, _)| **seat);
+        for (seat, s) in seats {
+            if !s.idle || s.retiring || !taking.contains_key(&s.link) {
+                continue;
+            }
+            if let Some(left @ 1..) = may_start.get_mut(&s.link) {
+                *left -= 1;
+                idle.push((*seat, rate_of(s)));
+            }
+        }
+        fastest_first(&mut idle);
+        while !idle.is_empty() {
+            let (at, range) = if unclaimed.is_empty() {
                 let busy: Vec<(u64, Claim, Option<u64>)> = self
                     .seats
                     .iter()
                     .filter(|(_, s)| !s.idle && !s.retiring && taking.contains_key(&s.link))
                     .map(|(at, s)| (*at, *s.hand.claim.lock().unwrap(), rate_of(s)))
                     .collect();
-                let taker = rate_of(&self.seats[&seat]);
-                let Some(cut) = to_split(&busy, taker, floor).and_then(|cut| {
-                    let mut claim = self.seats[&cut.seat].hand.claim.lock().unwrap();
-                    claim.split(cut.keep)
-                }) else {
+                // No idle seat a cut is worth it for, or the claim moved on
+                // since it was read: the next report or tick looks again.
+                let Some((at, cut)) = cut_for(&busy, &idle, floor) else {
                     return;
                 };
-                cut
+                let Some(range) = self.seats[&cut.seat]
+                    .hand
+                    .claim
+                    .lock()
+                    .unwrap()
+                    .split(cut.keep)
+                else {
+                    return;
+                };
+                (at, range)
             } else {
-                unclaimed.remove(0)
+                (0, unclaimed.remove(0))
             };
+            let (seat, _) = idle.remove(at);
             let given = &self.seats[&seat];
             *given.hand.claim.lock().unwrap() = Claim::new(range);
             given.hand.ready.notify_one();
@@ -1443,7 +1496,7 @@ impl Download {
         }
     }
 
-    /// A chunk came through `link`. After a rest, that brings back the rest
+    /// A piece came through `link`. After a rest, that brings back the rest
     /// of its connections, all it is wanted to hold, its ceiling forgotten so
     /// that what a server allowed before it asked the link to wait is
     /// learned again; and its rests start short again.
@@ -1529,7 +1582,7 @@ impl Download {
     /// The address `link` was redirected to answered that it is gone, as a
     /// signed address does once it expires: find the file again from the URL
     /// given, and carry on through the fresh address if it is still the same
-    /// file. Once only until a chunk comes through again, so an address that
+    /// file. Once only until a piece comes through again, so an address that
     /// refuses straight after it was found again is not found over and over.
     /// An address the URL itself names is gone for good: the worker ends, as
     /// for any answer that cannot be used, and nothing takes its place, so its
@@ -1780,7 +1833,20 @@ impl Download {
                 link: m.id,
                 name: m.name.clone(),
                 bytes: m.written.load(Ordering::SeqCst),
-                bps: if moving { m.rate.bps().unwrap_or(0) } else { 0 },
+                // Its speed, or while that starts afresh (`start_afresh`),
+                // what its connections each carry, so the page does not
+                // show it stopped for the moment the scheduler forgets.
+                bps: if moving {
+                    m.rate.bps().unwrap_or_else(|| {
+                        self.seats
+                            .values()
+                            .filter(|s| s.link == m.id)
+                            .filter_map(|s| s.rate.bps())
+                            .sum()
+                    })
+                } else {
+                    0
+                },
                 connections: m.workers,
                 wanted: m.wanted,
                 note: m.note.clone(),

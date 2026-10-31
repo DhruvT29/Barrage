@@ -84,11 +84,11 @@ export function DownloadCard({ download: d }: { download: DownloadView }) {
   const progress = progressOf(d)
   const { action, sending, refused, press } = useAction(d.id, d.state)
   // A cable's note that repeats the download's own says nothing new, and a
-  // cable that carried nothing, holds nothing open and has nothing new to
-  // say is left out.
+  // cable that carried nothing, holds nothing open, is wanted none and has
+  // nothing new to say is left out.
   const rows = d.cables
     .map((c) => ({ ...c, notes: c.notes.filter((n) => n !== d.note) }))
-    .filter((c) => c.bytes > 0 || c.connections > 0 || c.notes.length > 0)
+    .filter((c) => c.bytes > 0 || c.connections > 0 || c.notes.length > 0 || (moving && c.wanted > 0))
 
   return (
     <section className={`panel dl ${d.state}`} aria-label={title}>
@@ -212,18 +212,18 @@ function Share({ cable: c, done, bps, moving }: { cable: CableShare; done: numbe
       <span className="share-speed" data-testid="cable-speed">
         {speed}
       </span>
-      <span className="share-detail" data-testid="cable-detail">
-        {carrying !== null && <span data-testid="cable-carrying">carrying {carrying}%</span>}
-        {carrying !== null && taking && ' · '}
-        <span data-testid="cable-connections">
-          {taking ? `${c.connections} connection${c.connections === 1 ? '' : 's'}` : ''}
+      {taking && (
+        <span className="share-detail" data-testid="cable-detail">
+          {carrying !== null && <span data-testid="cable-carrying">carrying {carrying}%</span>}
+          {carrying !== null && ' · '}
+          <span data-testid="cable-connections">{`${c.connections} connection${c.connections === 1 ? '' : 's'}`}</span>
+          {c.wanted !== c.connections && (
+            <>
+              , <b data-testid="cable-wants">wants {c.wanted}</b>
+            </>
+          )}
         </span>
-        {taking && c.wanted !== c.connections && (
-          <>
-            , <b data-testid="cable-wants">wants {c.wanted}</b>
-          </>
-        )}
-      </span>
+      )}
       {c.notes.map((n) => (
         <span className="share-note" data-testid="cable-note" key={n}>
           {n}

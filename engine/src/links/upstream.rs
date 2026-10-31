@@ -107,6 +107,7 @@ mod tests {
             down_bps: None,
             public_ip: public.map(|p| p.parse().unwrap()),
             metered: false,
+            tested: 0,
         }
     }
 

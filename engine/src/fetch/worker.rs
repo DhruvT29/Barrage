@@ -98,7 +98,7 @@ pub(crate) struct Worker {
     pub read_deadline: Duration,
 }
 
-/// What became of one chunk, or of the whole file.
+/// What became of one claim, or of the whole file.
 #[derive(Debug)]
 pub(crate) struct Report {
     pub link: LinkId,
@@ -140,7 +140,7 @@ pub(crate) enum Outcome {
     Disk(String),
 }
 
-/// Why a worker ended without a chunk to report.
+/// Why a worker ended without a claim to report.
 pub(crate) type Exit = Option<String>;
 
 /// Now, as a worker's `heard` holds it: milliseconds since `epoch`, plus one,
@@ -239,6 +239,7 @@ impl Worker {
             Wait::Stopped => return (0, Outcome::Stopped),
         };
         // One line a request, so a log shows how often a server was asked.
+        // tools/phase4-acceptance.ps1 counts these words and fields.
         tracing::debug!(
             link = self.link.as_u64(),
             seat = self.seat,
@@ -478,8 +479,8 @@ mod tests {
     fn a_piece_is_its_bytes_of_this_file() {
         let piece = |range: &str| end_of(206, &[("content-range", range)]);
         assert_eq!(piece("bytes 4000-7999/10000"), Ok(8000));
-        // Shorter than asked, or running on past the chunk, to the file's
-        // last byte: the worker writes only what the chunk needs.
+        // Shorter than asked, or running on past the claim, to the file's
+        // last byte: the worker writes only what the claim needs.
         assert_eq!(piece("bytes 4000-4999/10000"), Ok(5000));
         assert_eq!(piece("bytes 4000-9999/10000"), Ok(10000));
         // Starting elsewhere is other bytes.

@@ -2,9 +2,10 @@
 //!
 //! Each link's workers are given a long part of the file each, fetch it with
 //! one `Range` request through their own address, and write it at its place
-//! in the file. One with nothing left to do takes half of what another has
-//! left, so a faster link simply fetches more, with tens of requests per
-//! download rather than hundreds.
+//! in the file. One with nothing left to do takes the back of the part that
+//! would finish last, cut where the two would finish together (halved,
+//! before any speed is known), so a faster link simply fetches more, with
+//! tens of requests per download rather than hundreds.
 //!
 //! | module | role |
 //! |---|---|
@@ -161,7 +162,7 @@ pub struct DownloadConfig {
     /// How long one link may take to find the file, redirects and all.
     pub find_deadline: Duration,
     /// How often each link's speed is measured and the status published at
-    /// the least. What a download does between, a chunk written, a link
+    /// the least. What a download does between, a piece written, a link
     /// joining, a note, is published as it happens; the live socket merges
     /// what a slow page has not read yet.
     pub publish_every: Duration,
@@ -298,6 +299,11 @@ impl Downloads {
 
     pub fn with_config(table: LinkTable, dir: PathBuf, config: DownloadConfig) -> Self {
         let (status, _) = watch::channel(Vec::new());
+        let used = Arc::new(used::Usage::new());
+        // Outside a runtime there is no watcher either, so nothing to count.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(used::count_speed_tests(table.clone(), Arc::clone(&used)));
+        }
         Self {
             inner: Arc::new(Inner {
                 table,
@@ -307,7 +313,7 @@ impl Downloads {
                 status: Arc::new(status),
                 stopping: watch::channel(false).0,
                 controls: Mutex::new(HashMap::new()),
-                used: Arc::new(used::Usage::new()),
+                used,
             }),
         }
     }

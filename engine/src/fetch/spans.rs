@@ -180,6 +180,28 @@ pub(crate) fn to_split(
     best.map(|(seat, _, keep)| Cut { seat, keep })
 }
 
+/// The first of `takers` (seat, speed), in order, that a cut is worth
+/// handing to, with where it falls in `takers` and the cut. Whether a cut
+/// is worth it depends on the taker's speed, so one refused says nothing of
+/// the next.
+pub(crate) fn cut_for(
+    claims: &[(u64, Claim, Option<u64>)],
+    takers: &[(u64, Option<u64>)],
+    floor: Floor,
+) -> Option<(usize, Cut)> {
+    takers
+        .iter()
+        .enumerate()
+        .find_map(|(at, &(_, rate))| to_split(claims, rate, floor).map(|cut| (at, cut)))
+}
+
+/// Idle seats (seat, speed) in the order they are offered work: the
+/// fastest first, since a cut is worth most to it; one not measured last;
+/// the lower seat of equals.
+pub(crate) fn fastest_first(idle: &mut [(u64, Option<u64>)]) {
+    idle.sort_by_key(|&(seat, rate)| (std::cmp::Reverse(rate), seat));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +373,48 @@ mod tests {
                 seat: 1,
                 keep: 8 * MIB
             })
+        );
+    }
+
+    /// Review: one idle connection too slow to be worth a cut says nothing
+    /// of a faster one, which still gets it; none worth it, none cut.
+    #[test]
+    fn a_slow_taker_refused_does_not_stop_a_fast_one() {
+        let claims = [(1, claim(16 * MIB), Some(mib_s(16)))];
+        let takers = [(4, Some(mib_s(1))), (7, Some(mib_s(16)))];
+        assert_eq!(
+            cut_for(&claims, &takers, FLOOR),
+            Some((
+                1,
+                Cut {
+                    seat: 1,
+                    keep: 8 * MIB
+                }
+            ))
+        );
+        assert_eq!(cut_for(&claims, &takers[..1], FLOOR), None);
+        assert_eq!(cut_for(&claims, &[], FLOOR), None);
+    }
+
+    /// The fastest idle connection is offered a cut first, one not measured
+    /// last, the lower seat of equals.
+    #[test]
+    fn idle_connections_are_offered_cuts_fastest_first() {
+        let mut idle = vec![
+            (3, None),
+            (5, Some(mib_s(1))),
+            (2, Some(mib_s(8))),
+            (1, Some(mib_s(1))),
+        ];
+        fastest_first(&mut idle);
+        assert_eq!(
+            idle,
+            [
+                (2, Some(mib_s(8))),
+                (1, Some(mib_s(1))),
+                (5, Some(mib_s(1))),
+                (3, None)
+            ]
         );
     }
 }

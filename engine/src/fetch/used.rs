@@ -1,4 +1,5 @@
-//! The data each cable has received, every download together.
+//! The data each cable has received, every download together, and the
+//! cable's speed tests.
 //!
 //! What a metered tether costs is what came down it, so this counts every
 //! byte a connection received, whether or not it was written: what arrived
@@ -13,6 +14,28 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use super::CableUse;
+use crate::links::LinkId;
+use crate::links::watch::LinkTable;
+
+/// Add what each cable's speed tests pull (`Link::tested`) to its count as
+/// it grows, until the link watcher stops. A speed test comes out of a
+/// metered tether's data as a download does: 27 to 64 MB each time a phone
+/// is measured.
+pub(crate) async fn count_speed_tests(mut table: LinkTable, used: Arc<Usage>) {
+    let mut seen: std::collections::HashMap<LinkId, u64> = std::collections::HashMap::new();
+    loop {
+        for link in table.latest().iter() {
+            let before = seen.insert(link.id, link.tested).unwrap_or(0);
+            if link.tested > before {
+                used.cable(&link.name).add(link.tested - before);
+            }
+        }
+        used.publish();
+        if !table.changed().await {
+            return;
+        }
+    }
+}
 
 /// One cable's count.
 pub(crate) struct Counter {

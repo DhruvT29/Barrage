@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use barrage::links::probe::{Probe, ProbeVerdict};
 use barrage::links::watch::Network;
-use barrage::links::{Addr, Candidate, LinkEvent};
+use barrage::links::{Addr, Candidate, LinkEvent, Sample};
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{Instant, timeout};
 
@@ -45,6 +45,8 @@ pub struct Fake {
     failing_samples: HashSet<IpAddr>,
     /// How long each speed test takes. Zero answers at once.
     sample_time: Duration,
+    /// What each speed test pulls through its link; none unless a test asks.
+    sample_bytes: u64,
     sampling_now: AtomicUsize,
     /// The most speed tests that were ever running at the same moment.
     pub most_at_once: AtomicUsize,
@@ -154,6 +156,12 @@ impl Fake {
 
     pub fn sampled_through(&self) -> Vec<IpAddr> {
         self.sampled_through.lock().unwrap().clone()
+    }
+
+    /// Every speed test pulls `bytes` through its link.
+    pub fn sample_bytes(mut self, bytes: u64) -> Self {
+        self.sample_bytes = bytes;
+        self
     }
 
     pub fn slow_samples(mut self, each: Duration) -> Self {
@@ -268,10 +276,11 @@ impl Network for Fake {
         &self,
         addr: IpAddr,
         _budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send {
+    ) -> impl Future<Output = anyhow::Result<Sample>> + Send {
         self.samples.fetch_add(1, Ordering::SeqCst);
         self.sampled_through.lock().unwrap().push(addr);
         let fail = self.failing_samples.contains(&addr);
+        let bytes = self.sample_bytes;
         let (bps, takes) = match self.speeds.get(&addr) {
             Some(&bps) => (bps, self.sample_time),
             None => {
@@ -292,7 +301,7 @@ impl Network for Fake {
             if fail {
                 anyhow::bail!("scripted speed test failure");
             }
-            Ok(bps)
+            Ok(Sample { bps, bytes })
         }
     }
 

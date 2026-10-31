@@ -33,15 +33,55 @@
 //!    this filter disappears with no change to our code.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use anyhow::Context;
 use if_addrs::Interface;
 
 use super::model::{Addr, Candidate};
 
-/// Whether the log has said Windows would not give connection costs.
-static COSTS_REFUSED: AtomicBool = AtomicBool::new(false);
+/// The metered adapters as Windows last said, and whether it refused the
+/// last time it was asked.
+static COSTS: Mutex<Costs> = Mutex::new(Costs {
+    known: None,
+    refused: false,
+});
+
+/// What is known of the connections' costs across polls.
+#[derive(Debug, Default)]
+struct Costs {
+    known: Option<HashSet<String>>,
+    refused: bool,
+}
+
+impl Costs {
+    /// The metered adapters now, from Windows' answer: what it says, or when
+    /// it refuses, what it said last (nothing, if it never has). A refusal
+    /// says nothing about the links themselves, and forgetting them would
+    /// let a metered tether carry a shared connection. The log says when it
+    /// starts refusing and when it stops.
+    fn now(&mut self, answer: anyhow::Result<Vec<Profile>>) -> HashSet<String> {
+        match answer {
+            Ok(profiles) => {
+                if std::mem::take(&mut self.refused) {
+                    tracing::info!("Windows says which connections are metered again");
+                }
+                let metered = metered_adapters(&profiles);
+                self.known = Some(metered.clone());
+                metered
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut self.refused, true) {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "Windows would not say which connections are metered; keeping what it said last"
+                    );
+                }
+                self.known.clone().unwrap_or_default()
+            }
+        }
+    }
+}
 
 /// Every address on every interface, one `Candidate` per address.
 ///
@@ -51,20 +91,10 @@ static COSTS_REFUSED: AtomicBool = AtomicBool::new(false);
 /// lose one before anything had the chance to judge it.
 pub fn enumerate() -> anyhow::Result<Vec<Candidate>> {
     let interfaces = if_addrs::get_if_addrs().context("listing the OS network interfaces")?;
-    // Windows refusing says nothing about the links themselves: they are
-    // used as if unmetered, and the log says so once.
-    let metered = match profiles() {
-        Ok(profiles) => metered_adapters(&profiles),
-        Err(e) => {
-            if !COSTS_REFUSED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "Windows would not say which connections are metered; none is treated as metered"
-                );
-            }
-            HashSet::new()
-        }
-    };
+    let metered = COSTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .now(profiles());
     Ok(interfaces
         .into_iter()
         .filter_map(|i| to_candidate(i, &metered))
@@ -142,26 +172,37 @@ pub fn profiles() -> anyhow::Result<Vec<Profile>> {
     let all = NetworkInformation::GetConnectionProfiles().context("listing connection profiles")?;
     let mut profiles = Vec::new();
     for profile in &all {
-        if profile.GetNetworkConnectivityLevel()? == NetworkConnectivityLevel::None {
-            continue;
-        }
-        // A profile with no adapter, such as a VPN's, is no cable's.
-        let Ok(adapter) = profile.NetworkAdapter() else {
-            continue;
+        // One profile Windows will not describe, say a tether's as it goes,
+        // is skipped, not the whole list: the others' costs still hold.
+        let read = || -> windows::core::Result<Option<Profile>> {
+            if profile.GetNetworkConnectivityLevel()? == NetworkConnectivityLevel::None {
+                return Ok(None);
+            }
+            // A profile with no adapter, such as a VPN's, is no cable's.
+            let Ok(adapter) = profile.NetworkAdapter() else {
+                return Ok(None);
+            };
+            let cost = profile.GetConnectionCost()?;
+            Ok(Some(Profile {
+                adapter: format!("{:?}", adapter.NetworkAdapterId()?),
+                name: profile.ProfileName()?.to_string(),
+                cost: match cost.NetworkCostType()? {
+                    NetworkCostType::Unrestricted => Cost::Unrestricted,
+                    NetworkCostType::Fixed => Cost::Fixed,
+                    NetworkCostType::Variable => Cost::Variable,
+                    _ => Cost::Unknown,
+                },
+                roaming: cost.Roaming()?,
+                over_limit: cost.OverDataLimit()?,
+            }))
         };
-        let cost = profile.GetConnectionCost()?;
-        profiles.push(Profile {
-            adapter: format!("{:?}", adapter.NetworkAdapterId()?),
-            name: profile.ProfileName()?.to_string(),
-            cost: match cost.NetworkCostType()? {
-                NetworkCostType::Unrestricted => Cost::Unrestricted,
-                NetworkCostType::Fixed => Cost::Fixed,
-                NetworkCostType::Variable => Cost::Variable,
-                _ => Cost::Unknown,
-            },
-            roaming: cost.Roaming()?,
-            over_limit: cost.OverDataLimit()?,
-        });
+        match read() {
+            Ok(Some(found)) => profiles.push(found),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "a connection profile could not be read, skipped")
+            }
+        }
     }
     Ok(profiles)
 }
@@ -360,5 +401,27 @@ mod tests {
         };
         assert!(!to_candidate(wifi(), &metered).unwrap().metered);
         assert!(!to_candidate(wifi(), &none()).unwrap().metered);
+    }
+
+    /// Review: Windows refusing once must not make a metered tether look
+    /// unmetered: what it said last stands until it answers again.
+    #[test]
+    fn a_refusal_keeps_what_windows_said_last() {
+        let mut costs = Costs::default();
+        let refused = || Err(anyhow::anyhow!("refused"));
+        assert!(
+            costs.now(refused()).is_empty(),
+            "never answered: nothing known"
+        );
+        let tether = profile(WIFI_ADAPTER, "Phone", Cost::Fixed);
+        let first = costs.now(Ok(vec![tether]));
+        assert_eq!(first, HashSet::from([adapter_key(WIFI_ADAPTER)]));
+        assert_eq!(costs.now(refused()), first, "kept through a refusal");
+        assert!(costs.refused);
+        assert!(
+            costs.now(Ok(Vec::new())).is_empty(),
+            "a new answer replaces it"
+        );
+        assert!(!costs.refused);
     }
 }

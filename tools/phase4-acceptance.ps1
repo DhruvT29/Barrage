@@ -24,7 +24,8 @@
                its share at once. The download is stopped as soon as that
                shows, so the long file costs only what the row needs.
     Data used: for each cable that carried, the engine's count for the run
-    against what Windows' adapter received: at most a tenth less, never more.
+    (its speed tests included) against what Windows' adapter received: at
+    most 15% less, never more. Judged only with the adapter quiet.
 
     ONE ENGINE, A YES PER ROW. The engine starts once, with --log, so the
     tether's speed test is paid once. Before each row the script waits for
@@ -75,6 +76,9 @@ if (($Rows.Count -gt 0 -or $Rehearse) -and -not (Test-Path $Engine)) {
     throw "no engine at $Engine. Build it first, in engine: cargo build --release --bin barrage"
 }
 if (-not $Work) { $Work = Join-Path $env:TEMP "brg-phase4" }
+# A full path: .NET resolves a relative one against the process's folder,
+# which Windows PowerShell does not keep in step with the location.
+$Work = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Work)
 # A name only this script uses: emptied at each session.
 $downloads = Join-Path $Work "brg-phase4-downloads"
 $api = "http://127.0.0.1:$Port/api"
@@ -89,6 +93,8 @@ $script:TetherStart = 0.0
 # put down to its cable even after the link has gone.
 $script:LinkNames = @{}
 $script:Passed = [ordered]@{}
+# Rows with a check that could not be judged, and why.
+$script:Skipped = @{}
 
 # ---------------------------------------------------------------- helpers
 
@@ -184,22 +190,6 @@ function Measure-Requests([string]$Text) {
     return $by
 }
 
-# The engine's speed tests in a stretch of the log, bytes by cable: a cable
-# that comes back is measured again, through it, but that is no download's.
-# Each sample line is followed by the speed lines of the cable it measured.
-function Measure-SpeedTests([string]$Text) {
-    $by = @{}
-    $pending = $null
-    foreach ($line in ($Text -split "`n")) {
-        if ($line -match "throughput sample .*bytes=(\d+)") { $pending = [double]$Matches[1]; continue }
-        if ($null -ne $pending -and $line -match "barrage: (.+) \S+: speed ") {
-            $by[$Matches[1]] = [double]$by[$Matches[1]] + $pending
-            $pending = $null
-        }
-    }
-    return $by
-}
-
 # Wait until `Check` returns something, or the row's time runs out.
 function Wait-For([string]$What, [scriptblock]$Check, [int]$Seconds = $Minutes * 60) {
     $deadline = (Get-Date).AddSeconds($Seconds)
@@ -266,8 +256,10 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
         if ($d.state -in @("done", "failed", "stopped")) { break }
         if ($Each -and ((& $Each $d $table) -eq "stop")) {
             Stop-Download $id
+            # Captured here: inside the check, $What would be Wait-For's own.
+            $label = "$What stopping"
             $d = Wait-For "the download to stop" {
-                $now = Get-Download $id "$What stopping"
+                $now = Get-Download $id $label
                 if ($now.state -in @("stopped", "done", "failed")) { $now }
             } -Seconds 30
             break
@@ -282,13 +274,11 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
     Start-Sleep -Milliseconds 500
     $usedAfter = Get-EngineUsed
     $log = (Read-Log $logStart).Text
-    $tests = Measure-SpeedTests $log
     $use = @{}
     foreach ($c in $Cables) {
         $use[$c] = [pscustomobject]@{
             Engine  = [double]$usedAfter[$c] - [double]$usedBefore[$c]
-            Windows = (Get-AdapterReceived $c) - $received[$c] - [double]$tests[$c]
-            Tests   = [double]$tests[$c]
+            Windows = (Get-AdapterReceived $c) - $received[$c]
         }
     }
     $quietAfter = Get-Background $Cables
@@ -304,6 +294,14 @@ function Invoke-Download([string]$From, [string[]]$Cables, [string]$What, [scrip
     }
 }
 
+# A check that could not be judged: the row's summary says SKIP unless
+# another check failed.
+function Skip([string]$Row, [string]$Why) {
+    "  SKIP  $Why"
+    if (-not $script:Passed.Contains($Row)) { $script:Passed[$Row] = $true }
+    $script:Skipped[$Row] = $true
+}
+
 function Pass([string]$Row, [bool]$Ok, [string]$Why) {
     $word = "FAIL"
     if ($Ok) { $word = "PASS" }
@@ -313,23 +311,22 @@ function Pass([string]$Row, [bool]$Ok, [string]$Why) {
 }
 
 # The data used row, for each cable that carried in a run: the engine's count
-# at most 15% under what Windows' adapter received, less the engine's speed
-# tests, and never over it by more than a rounding. Not a tenth: on a phone
-# what was on its way when a part is handed on is thrown away unread, about
-# 0.2 MB a time, and read 87 to 88% live (the Wi-Fi 97%, its framing). Judged only when the adapter was quiet for the
-# 5 s before and after (under 0.1 MB each): Windows counts every program's
-# traffic, and a burst of another's makes the engine look short.
+# (its speed tests included) at most 15% under what Windows' adapter
+# received, and never over it by more than a rounding. Not a tenth: on a
+# phone what was on its way when a part is handed on is thrown away unread,
+# about 0.2 MB a time, and read 87 to 88% live (the Wi-Fi 97%, its framing).
+# Judged only when the adapter was quiet for the 5 s before and after (under
+# 0.1 MB each): Windows counts every program's traffic, and a burst of
+# another's makes the engine look short.
 function Show-Used([string]$Row, $Res) {
     foreach ($c in $Res.Use.Keys) {
         $u = $Res.Use[$c]
         if ($u.Engine -lt 1e6) { continue }
         $ratio = 0
         if ($u.Windows -gt 0) { $ratio = $u.Engine / $u.Windows }
-        $tests = ""
-        if ($u.Tests -gt 0) { $tests = ", less $(MB $u.Tests) MB of speed tests" }
-        $what = "data used, $($c): the engine $(MB $u.Engine) MB, Windows received $(MB $u.Windows) MB$tests ({0:P0})" -f $ratio
+        $what = "data used, $($c): the engine $(MB $u.Engine) MB, Windows received $(MB $u.Windows) MB ({0:P0})" -f $ratio
         if ($u.Before -ge 1e5 -or $u.After -ge 1e5) {
-            "  SKIP  $what; not judged: other programs received $(MB $u.Before) MB in the 5 s before, $(MB $u.After) MB after"
+            Skip $Row "$what; not judged: other programs received $(MB $u.Before) MB in the 5 s before, $(MB $u.After) MB after"
             continue
         }
         Pass $Row (($ratio -ge 0.85) -and ($ratio -le 1.02)) $what
@@ -362,7 +359,9 @@ function Invoke-Limited {
         Pass "Limited" ($bytes -gt 0) "$c carried part ($(MB $bytes) MB)"
         $asked = 0
         if ($res.Requests.ContainsKey($c)) { $asked = $res.Requests[$c].Asked }
-        Pass "Limited" ($asked -lt 100) "$c asked $asked times: tens, not hundreds"
+        # None counted means the log was not read, not a cable that asked
+        # nothing: it carried, so it asked.
+        Pass "Limited" ($asked -gt 0 -and $asked -lt 100) "$c asked $asked times: tens, not hundreds"
     }
     $rests = @($res.Notes | Where-Object { $_ -match "rests" })
     Pass "Limited" ($rests.Count -eq 0) "no cable rested ($($rests.Count) rest notes)"
@@ -388,8 +387,7 @@ function Invoke-Weights {
     $fast, $slow = $Wifi, $script:TetherName
     if ($by[$slow].Bps -gt $by[$fast].Bps) { $fast, $slow = $slow, $fast }
     if ($by[$fast].Bps -lt 1.2 * $by[$slow].Bps) {
-        "  SKIP  the two ran within a fifth of each other's speed: nothing to tell by"
-        $script:Passed["Weights"] = $false
+        Skip "Weights" "the two ran within a fifth of each other's speed: nothing to tell by"
     } else {
         Pass "Weights" ($by[$fast].Connections -gt $by[$slow].Connections) "the faster, $fast, held more connections"
     }
@@ -457,7 +455,7 @@ function Invoke-Shared {
 }
 
 function Invoke-Flap {
-    $script:Flap = [ordered]@{ Phase = "carry"; Off = $null; Degraded = $null; Up = $null; Share = $null; HeldDegraded = 0; Jump = $null; JumpWanted = $null }
+    $script:Flap = [ordered]@{ Phase = "carry"; Off = $null; Degraded = $null; Up = $null; Share = $null; HeldDegraded = 0; Jump = $null; JumpWanted = $null; Away = $null }
     "  waiting for the tether to carry, then the cue"
     $res = Invoke-Download $LongUrl @($Wifi, $script:TetherName) "flap" {
         param($d, $table)
@@ -487,10 +485,11 @@ function Invoke-Flap {
                 }
             }
             "back" {
+                $f.Away = ($now - $f.Off).TotalSeconds
                 if (@($links | Where-Object { $_.state -eq "up" }).Count -gt 0) {
                     $f.Up = $now
                     $f.Phase = "share"
-                    Write-Host "  the tether came back straight up, not degraded"
+                    Write-Host ("  the tether came back straight up, not degraded, after {0:N0} s away" -f $f.Away)
                 } elseif (@($links | Where-Object { $_.state -eq "degraded" }).Count -gt 0) {
                     $f.Degraded = $now
                     $f.Phase = "degraded"
@@ -498,11 +497,15 @@ function Invoke-Flap {
                 }
             }
             "degraded" {
-                if ($held -gt $f.HeldDegraded) { $f.HeldDegraded = $held }
                 if (@($links | Where-Object { $_.state -eq "up" }).Count -gt 0) {
                     $f.Up = $now
                     $f.Phase = "share"
                     Write-Host "  the tether is up again"
+                } elseif ($held -gt $f.HeldDegraded) {
+                    # Only a poll whose table shows it degraded, none of it
+                    # up: the status is read first, and its share may land
+                    # between that and the table.
+                    $f.HeldDegraded = $held
                 }
             }
             "share" {
@@ -518,6 +521,18 @@ function Invoke-Flap {
     }
     Show-Shares $res
     $f = $script:Flap
+    if ($f.Phase -in @("carry", "off", "back")) {
+        # The file ended (or the row ran out) before the tether was back.
+        Skip "Flap" ("not judged: the download was {0} after {1} s, before the tether was back" -f $res.Download.state, $res.Secs)
+        Show-Used "Flap" $res
+        return
+    }
+    if ($null -eq $f.Degraded -and $f.Away -gt 30) {
+        # Away longer than the cooldown, a cable comes back trusted.
+        Skip "Flap" ("not judged: the tether was away {0:N0} s, past the 30 s cooldown, so up is right" -f $f.Away)
+        Show-Used "Flap" $res
+        return
+    }
     Pass "Flap" ($null -ne $f.Degraded) "the tether came back degraded"
     if ($f.Degraded) {
         Pass "Flap" ($f.HeldDegraded -le 1) "it held at most one connection while degraded ($($f.HeldDegraded))"
@@ -525,6 +540,9 @@ function Invoke-Flap {
     if ($f.Degraded -and $f.Up) {
         $cool = ($f.Up - $f.Degraded).TotalSeconds
         Pass "Flap" ($cool -ge 25 -and $cool -le 40) ("up again {0:N1} s after it came back (the cooldown is 30 s)" -f $cool)
+    }
+    if ($f.Phase -eq "degraded") {
+        Skip "Flap" ("not judged: the download was {0} after {1} s, before the cooldown ended" -f $res.Download.state, $res.Secs)
     }
     if ($f.Up) {
         $at = $null
@@ -584,9 +602,10 @@ try {
         "  $($f[0])'s file: $([math]::Round($sizes[$f[0]], 1)) MB, ranges answered (asked through $Wifi only)"
     }
 
-    # The most each row can cost the phone, a tenth over the payload: a row's
-    # file all through the tether at worst; a network change, a speed test.
-    $margin = 1.1
+    # The most each row can cost the phone, a fifth over the payload (a phone
+    # pays 10 to 15% over what the engine reads): a row's file all through
+    # the tether at worst; a network change, a speed test.
+    $margin = 1.2
     $costs = [ordered]@{
         Start   = $SpeedTestMB
         Limited = $sizes["Limited"]
@@ -602,7 +621,7 @@ try {
     $total = [math]::Ceiling($total * $margin)
     if ($Rows.Count -eq 0) {
         ""
-        "== What each row can cost in mobile data, at most, a tenth over"
+        "== What each row can cost in mobile data, at most, a fifth over"
         foreach ($k in $costs.Keys) { "  {0,-8} {1,5} MB" -f $k, [math]::Ceiling($costs[$k] * $margin) }
         $all = $costs.Start
         foreach ($r in $Order) { $all += $costs[$r] }
@@ -633,6 +652,7 @@ try {
     foreach ($k in $script:Passed.Keys) {
         $word = "FAIL"
         if ($script:Passed[$k]) { $word = "PASS" }
+        if ($script:Passed[$k] -and $script:Skipped[$k]) { $word = "SKIP" }
         "  $word  $k"
     }
     "  mobile data this session, both ways: $(MB ((Get-AdapterBytes $script:TetherName) - $script:TetherStart)) MB"

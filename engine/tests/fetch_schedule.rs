@@ -404,6 +404,132 @@ async fn when_the_carrier_goes_the_other_cable_takes_over() {
     assert_eq!(first, Some(4));
 }
 
+/// Review: Ethernet 2 carries, sits out behind the Wi-Fi when it joins the
+/// same connection, and takes the path back when the Wi-Fi goes. What it
+/// carried before, decayed while it sat out, must not weigh it against
+/// Ethernet 3, a connection of its own: it starts afresh, an even share,
+/// not the one connection its faded speed would give it.
+#[tokio::test]
+async fn a_cable_taking_a_path_back_is_not_weighed_by_its_faded_speed() {
+    const THIRD: &str = "127.0.0.3";
+    let third = || cand_idx(3, "Ethernet 3", THIRD, true);
+    let (net, live) = Fake::live(vec![ethernet(), third()]);
+    let net = net
+        .speed(WIFI, 40_000_000)
+        .speed(ETHERNET, 5_000_000)
+        .speed(THIRD, 5_000_000)
+        .public(WIFI, &[Some(SHARED)])
+        .public(ETHERNET, &[Some(SHARED)])
+        .loopback_links();
+    let links = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(20))).unwrap();
+    let ready = |want: usize| {
+        let table = links.table().latest();
+        table
+            .iter()
+            .filter(|l| l.state.is_usable() && l.down_bps.is_some() && l.public_ip.is_some())
+            .count()
+            == want
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ready(2) {
+        assert!(tokio::time::Instant::now() < deadline, "never ready");
+        tokio::time::sleep(ms(20)).await;
+    }
+    const LENGTH: u64 = 32 * MIB;
+    let file = File::new(LENGTH).rate(256 * KIB);
+    let (_server, dir, downloads, id) = start_with("faded.bin", file, &links, quick()).await;
+    let history = record(&downloads, id);
+
+    let of = |s: &DownloadStatus| s.links.iter().find(|l| l.name == "Ethernet 2").cloned();
+    wait_for(&downloads, id, "Ethernet 2 carrying", |s| {
+        of(s).is_some_and(|e| e.bytes >= MIB)
+    })
+    .await;
+    live.set(vec![wifi(), ethernet(), third()]);
+    wait_for(&downloads, id, "Ethernet 2 sitting out", |s| {
+        of(s).is_some_and(|e| e.note.as_deref() == Some(BEHIND_WIFI))
+    })
+    .await;
+    wait_for(&downloads, id, "Ethernet 2's connections gone", |s| {
+        of(s).is_some_and(|e| e.connections == 0)
+    })
+    .await;
+    // Its speed fades: half-life 500 ms.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    live.set(vec![ethernet(), third()]);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("faded.bin"), LENGTH);
+    let history = history.await.unwrap();
+    let behind = history
+        .iter()
+        .position(|(_, s)| of(s).is_some_and(|e| e.note.as_deref() == Some(BEHIND_WIFI)))
+        .expect("it sat out");
+    let back = history[behind..]
+        .iter()
+        .filter_map(|(_, s)| of(s))
+        .map(|e| e.wanted)
+        .find(|&n| n > 0);
+    assert_eq!(back, Some(4), "eight shared evenly with Ethernet 3");
+}
+
+/// Review: the Ethernet carries alone, fast, until the Wi-Fi joins the same
+/// connection and it is told to sit out. Its connections retire one a
+/// rebalance (every 2 s), and meanwhile those that finish what they hold
+/// take nothing new: no part is asked through it after it is told.
+#[tokio::test]
+async fn a_cable_told_to_sit_out_takes_no_new_parts() {
+    let (net, live) = Fake::live(vec![ethernet()]);
+    let net = net
+        .speed(WIFI, 40_000_000)
+        .speed(ETHERNET, 5_000_000)
+        .public(WIFI, &[Some(SHARED)])
+        .public(ETHERNET, &[Some(SHARED)])
+        .loopback_links();
+    let links = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(20))).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !links
+        .table()
+        .latest()
+        .iter()
+        .any(|l| l.state.is_usable() && l.down_bps.is_some() && l.public_ip.is_some())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "never ready");
+        tokio::time::sleep(ms(20)).await;
+    }
+    const LENGTH: u64 = 40 * MIB;
+    let file = File::new(LENGTH).rate(MIB).rate_for(ETHERNET, 2 * MIB);
+    let (server, dir, downloads, id) = start_with("told.bin", file, &links, config()).await;
+    let of = |s: &DownloadStatus| s.links.iter().find(|l| l.name == "Ethernet 2").cloned();
+
+    wait_for(&downloads, id, "8 MiB down", |s| s.done >= 8 * MIB).await;
+    live.set(vec![wifi(), ethernet()]);
+    wait_for(&downloads, id, "the Ethernet told to sit out", |s| {
+        of(s).is_some_and(|e| e.note.as_deref() == Some(BEHIND_WIFI))
+    })
+    .await;
+    let told = std::time::Instant::now();
+    wait_for(&downloads, id, "the Ethernet's connections gone", |s| {
+        of(s).is_some_and(|e| e.connections == 0)
+    })
+    .await;
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("told.bin"), LENGTH);
+    let asked_after = server
+        .seen()
+        .iter()
+        .filter(|s| s.source == ip(ETHERNET) && !is_probe(s))
+        .filter(|s| s.started > told + ms(100))
+        .count();
+    assert_eq!(
+        asked_after, 0,
+        "parts asked through the Ethernet after it was told"
+    );
+}
+
 /// The server asks the Wi-Fi to wait 55 minutes: it sits the download out,
 /// and the Ethernet behind it carries the file rather than the download
 /// failing with nobody holding a connection.
@@ -614,6 +740,22 @@ async fn a_link_back_from_down_holds_one_connection_until_trusted() {
         .map(|l| l.connections)
         .collect();
     assert_eq!(after.iter().find(|&&n| n > 1), Some(&4), "{after:?}");
+    // Review: its speed starts afresh for the scheduler, but the page never
+    // shows it stopped while it holds connections.
+    let shown: Vec<u64> = history
+        .iter()
+        .filter(|(at, s)| *at > up && *at < up + ms(1000) && s.phase == Phase::Downloading)
+        .filter_map(|(_, s)| {
+            s.links
+                .iter()
+                .find(|l| l.name == "Ethernet 2" && l.connections > 0)
+        })
+        .map(|l| l.bps)
+        .collect();
+    assert!(
+        !shown.is_empty() && shown.iter().all(|&bps| bps > 0),
+        "{shown:?}"
+    );
     // And keeps it: what it carried held to one connection does not weigh it
     // once trusted. Both links are served alike a connection, so it is
     // wanted as many as the Wi-Fi again; on a loaded machine one link's
@@ -771,6 +913,66 @@ async fn a_cable_back_from_down_holds_one_connection_over_all_its_addresses() {
         .map(|&(c, _)| c)
         .collect();
     assert_eq!(after.iter().find(|&&n| n > 1), Some(&4), "{after:?}");
+}
+
+/// Review: every connection served alike, so what a link carries follows its
+/// count. The speed tests (100 and 40 Mbps) start the Ethernet at 5 of 16;
+/// by what each then carries it is computed 6, then 7, one more each time.
+/// With connections unused it takes them, rather than stay one short for
+/// good.
+#[tokio::test]
+async fn a_link_one_short_takes_a_free_connection() {
+    let net = two_links()
+        .speed(WIFI, 100_000_000)
+        .speed(ETHERNET, 40_000_000);
+    let links = speed_tested(net, 2).await;
+    let config = DownloadConfig {
+        connections: 16,
+        most_per_link: 8,
+        ..quick()
+    };
+    const LENGTH: u64 = 32 * MIB;
+    let file = File::new(LENGTH).rate(256 * KIB);
+    let (_server, dir, downloads, id) = start_with("one-short.bin", file, &links, config).await;
+    let history = record(&downloads, id);
+
+    let end = ended(&downloads, id).await;
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_same(&dir.read("one-short.bin"), LENGTH);
+    let history = history.await.unwrap();
+    // Judged in the first half, while every connection is busy: near the
+    // end, links finishing move the weights by more than one anyway.
+    let first_half: Vec<(tokio::time::Instant, DownloadStatus)> = history
+        .into_iter()
+        .filter(|(_, s)| s.done < LENGTH / 2)
+        .collect();
+    let wanted: Vec<u32> = shares(&first_half, "Ethernet 2")
+        .map(|l| l.wanted)
+        .collect();
+    assert_eq!(wanted.first(), Some(&5), "{wanted:?}");
+    assert!(
+        wanted.iter().any(|&n| n > 5),
+        "stayed one short: {wanted:?}"
+    );
+}
+
+/// Review (the user's choice): a cable's speed tests come out of its data
+/// too, so they count as used, with no download at all.
+#[tokio::test]
+async fn a_speed_test_counts_as_data_used() {
+    let net = two_links().sample_bytes(3 * MIB).loopback_links();
+    let links = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(20))).unwrap();
+    let dir = fetching::Folder::new("tested");
+    let downloads = Downloads::with_config(links.table(), dir.0.clone(), config());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while used_by(&downloads, "Wi-Fi") < 3 * MIB || used_by(&downloads, "Ethernet 2") < 3 * MIB {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "speed tests never counted: {:?}",
+            downloads.used().borrow()
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
 }
 
 /// What `cable` has received, every download together.

@@ -69,13 +69,21 @@ const _: () = assert!(
 );
 
 /// The download rate through the link that owns `addr`, in bits per second.
-pub async fn sample(addr: IpAddr, budget: Duration) -> anyhow::Result<u64> {
+/// What one speed test found: the link's rate, and the bytes it pulled,
+/// which come out of the link's data like any download's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    pub bps: u64,
+    pub bytes: u64,
+}
+
+pub async fn sample(addr: IpAddr, budget: Duration) -> anyhow::Result<Sample> {
     sample_url(addr, SAMPLE_URL, budget).await
 }
 
 /// [`sample`] against any URL. Public so tests can aim it at a server that
 /// misbehaves on purpose.
-pub async fn sample_url(addr: IpAddr, url: &str, budget: Duration) -> anyhow::Result<u64> {
+pub async fn sample_url(addr: IpAddr, url: &str, budget: Duration) -> anyhow::Result<Sample> {
     let asked = Instant::now();
     let deadline = asked + budget;
     let what = || format!("sampling {url} from {addr}");
@@ -132,5 +140,8 @@ pub async fn sample_url(addr: IpAddr, url: &str, budget: Duration) -> anyhow::Re
         "{}: no data arrived within {budget:?}",
         what()
     );
-    Ok((bytes as f64 * 8.0 / secs).round() as u64)
+    Ok(Sample {
+        bps: (bytes as f64 * 8.0 / secs).round() as u64,
+        bytes,
+    })
 }

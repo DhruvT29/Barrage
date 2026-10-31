@@ -409,6 +409,7 @@ mod tests {
             down_bps: None,
             public_ip: None,
             metered: false,
+            tested: 0,
         }
     }
 

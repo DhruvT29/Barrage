@@ -158,13 +158,71 @@ pub fn paths(links: &[Link], taking: impl Fn(LinkId) -> bool) -> Vec<Path> {
 /// A target moved only when the new one is two or more away, or the link
 /// has none yet: what a link carried decides its weight, and when a server
 /// limits each connection that feeds back, one connection lost becoming one
-/// fewer wanted for good.
-pub fn settle(current: u32, computed: u32) -> u32 {
-    if current == 0 || computed.abs_diff(current) >= 2 {
+/// fewer wanted for good. The same feedback would keep a link one short for
+/// good, so with `room` (connections the download is not using) it takes
+/// one more.
+pub fn settle(current: u32, computed: u32, room: bool) -> u32 {
+    if current == 0 || computed.abs_diff(current) >= 2 || (room && computed == current + 1) {
         computed
     } else {
         current
     }
+}
+
+/// Each link's new target, in order, from its `current` one and the one
+/// `computed`: [`settle`], with room while the targets so far leave some of
+/// the download's `connections` unused. A link that takes one more uses it
+/// up for those after; one that falls frees what it gave up.
+pub fn settle_all(current: &[u32], computed: &[u32], connections: u32) -> Vec<u32> {
+    let mut room = connections.saturating_sub(current.iter().sum());
+    current
+        .iter()
+        .zip(computed)
+        .map(|(&now, &n)| {
+            let target = settle(now, n, room > 0);
+            room = (room + now).saturating_sub(target);
+            target
+        })
+        .collect()
+}
+
+/// A link taking part in a download, as its allowance sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taker<'a> {
+    pub id: LinkId,
+    pub cable: &'a str,
+    pub degraded: bool,
+    /// The most it may hold otherwise (`most_per_link`, a ceiling, one on
+    /// trial after a rest).
+    pub most: u32,
+}
+
+/// The most each of `takers` may hold, in order. A degraded cable, back
+/// from down and not trusted yet, holds one connection over all its
+/// addresses, the first of them that may hold any: if it drops again it
+/// takes one connection's part with it, and its addresses go down
+/// together.
+pub fn allowances(takers: &[Taker]) -> Vec<u32> {
+    let mut holding_one: Vec<&str> = Vec::new();
+    takers
+        .iter()
+        .map(|t| match (t.degraded, t.most) {
+            (false, most) => most,
+            (true, 0) => 0,
+            (true, _) if !holding_one.contains(&t.cable) => {
+                holding_one.push(t.cable);
+                1
+            }
+            (true, _) => 0,
+        })
+        .collect()
+}
+
+/// Whether a link may hold more than at the last retarget, `before` being
+/// `None` when it was not taking part: what it carried held to less says
+/// nothing of what it carries now. A link joining keeps its speed test.
+pub fn allowed_more(before: Option<u32>, now: u32) -> bool {
+    before.is_some_and(|before| now > before)
 }
 
 #[cfg(test)]
@@ -235,6 +293,7 @@ mod tests {
             down_bps: None,
             public_ip: None,
             metered: false,
+            tested: 0,
         }
     }
 
@@ -472,11 +531,89 @@ mod tests {
 
     #[test]
     fn a_target_moves_by_two_or_falls() {
-        assert_eq!(settle(4, 3), 4, "one fewer is noise");
-        assert_eq!(settle(4, 5), 4, "one more too");
-        assert_eq!(settle(4, 2), 2);
-        assert_eq!(settle(2, 4), 4);
-        assert_eq!(settle(0, 3), 3, "a link with none yet takes it");
-        assert_eq!(settle(3, 0), 0);
+        assert_eq!(settle(4, 3, false), 4, "one fewer is noise");
+        assert_eq!(settle(4, 5, false), 4, "one more too");
+        assert_eq!(settle(4, 2, false), 2);
+        assert_eq!(settle(2, 4, false), 4);
+        assert_eq!(settle(0, 3, false), 3, "a link with none yet takes it");
+        assert_eq!(settle(3, 0, false), 0);
+    }
+
+    /// Review: a server limiting each connection makes what a link carries
+    /// follow its count, so a link one short would stay one short while
+    /// connections sit unused. With room it takes the one more; one fewer
+    /// is still noise.
+    /// The links' targets together: one more for a link one short only while
+    /// the targets before it leave connections unused, the room it takes
+    /// gone for those after.
+    #[test]
+    fn room_is_shared_out_in_order() {
+        assert_eq!(settle_all(&[8, 5], &[8, 6], 16), [8, 6], "3 unused");
+        assert_eq!(settle_all(&[8, 5], &[8, 6], 13), [8, 5], "none unused");
+        assert_eq!(
+            settle_all(&[5, 5, 5], &[6, 6, 6], 16),
+            [6, 5, 5],
+            "one unused, the first takes it"
+        );
+        assert_eq!(
+            settle_all(&[8, 5], &[6, 7], 13),
+            [6, 7],
+            "a fall makes room"
+        );
+        assert_eq!(settle_all(&[], &[], 16), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn with_connections_free_a_target_grows_by_one() {
+        assert_eq!(settle(5, 6, true), 6);
+        assert_eq!(settle(5, 4, true), 5, "one fewer is noise, room or not");
+        assert_eq!(settle(5, 8, true), 8);
+    }
+
+    fn taker(id: u64, cable: &'static str, degraded: bool, most: u32) -> Taker<'static> {
+        Taker {
+            id: LinkId::new(id),
+            cable,
+            degraded,
+            most,
+        }
+    }
+
+    /// A degraded cable holds one connection over all its addresses, the
+    /// first that may hold any; another cable, and one trusted, keep theirs.
+    #[test]
+    fn a_degraded_cable_holds_one_over_all_its_addresses() {
+        let got = allowances(&[
+            taker(1, "Wi-Fi", false, 8),
+            taker(2, "Ethernet 2", true, 8),
+            taker(3, "Ethernet 2", true, 8),
+            taker(4, "Ethernet 2", true, 8),
+            taker(5, "Ethernet 3", true, 8),
+        ]);
+        assert_eq!(got, [8, 1, 0, 0, 1]);
+        // One the server holds to none passes the one to the next.
+        let got = allowances(&[
+            taker(2, "Ethernet 2", true, 0),
+            taker(3, "Ethernet 2", true, 8),
+        ]);
+        assert_eq!(got, [0, 1]);
+        // One trusted beside one still degraded: the degraded one holds one.
+        let got = allowances(&[
+            taker(2, "Ethernet 2", false, 8),
+            taker(3, "Ethernet 2", true, 8),
+        ]);
+        assert_eq!(got, [8, 1]);
+    }
+
+    /// Allowed more than at the last retarget: held to less, or none behind
+    /// a degraded address of its cable. Not a link joining, which keeps its
+    /// speed test, nor one allowed the same or less.
+    #[test]
+    fn allowed_more_is_a_rise_while_taking_part() {
+        assert!(allowed_more(Some(0), 4), "held behind its cable's one");
+        assert!(allowed_more(Some(1), 4), "held to one");
+        assert!(!allowed_more(None, 4), "joining");
+        assert!(!allowed_more(Some(4), 4));
+        assert!(!allowed_more(Some(4), 2));
     }
 }

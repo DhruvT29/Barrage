@@ -156,7 +156,7 @@ pub trait Network: Send + Sync + 'static {
         &self,
         addr: IpAddr,
         budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send;
+    ) -> impl Future<Output = anyhow::Result<super::measure::Sample>> + Send;
 
     /// The address the internet sees traffic from `addr` arrive from.
     fn public_ip(
@@ -186,7 +186,7 @@ impl Network for SystemNetwork {
         &self,
         addr: IpAddr,
         budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send {
+    ) -> impl Future<Output = anyhow::Result<super::measure::Sample>> + Send {
         super::measure::sample(addr, budget)
     }
 
@@ -337,7 +337,9 @@ enum Report {
     Sampled {
         interface: String,
         job: u64,
-        result: anyhow::Result<u64>,
+        /// The address it ran through, whose data it used.
+        through: LinkId,
+        result: anyhow::Result<super::measure::Sample>,
     },
     LookedUp {
         id: LinkId,
@@ -427,7 +429,15 @@ impl<N: Network> Watcher<N> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = ticker.tick() => self.poll(),
+                _ = ticker.tick() => {
+                    // The OS calls block (Windows' connection costs take
+                    // about 30 ms), so they run off the async threads.
+                    let net = Arc::clone(&self.net);
+                    let listed = tokio::task::spawn_blocking(move || net.enumerate())
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("listing the interfaces failed: {e}")));
+                    self.poll(listed);
+                }
                 Some(done) = self.tasks.join_next() => match done {
                     Ok(report) => self.receive(report),
                     Err(e) => tracing::error!(error = %e, "a probe, speed test or lookup panicked"),
@@ -445,8 +455,8 @@ impl<N: Network> Watcher<N> {
         }
     }
 
-    fn poll(&mut self) {
-        let candidates = match self.net.enumerate() {
+    fn poll(&mut self, listed: anyhow::Result<Vec<Candidate>>) {
+        let candidates = match listed {
             Ok(all) => self.net.usable(&all),
             Err(e) => {
                 // Says nothing about the links themselves; keep what we know.
@@ -547,6 +557,7 @@ impl<N: Network> Watcher<N> {
                 down_bps: None,
                 public_ip: None,
                 metered: c.metered,
+                tested: 0,
             };
             let back = self.left.contains_key(&c.name);
             self.links.insert(
@@ -614,8 +625,17 @@ impl<N: Network> Watcher<N> {
             Report::Sampled {
                 interface,
                 job,
+                through,
                 result,
-            } => self.sampled(interface, job, result),
+            } => {
+                // Spent whatever becomes of the result: a stale test's
+                // bytes came down the cable too.
+                if let (Ok(sample), Some(e)) = (&result, self.links.get_mut(&through)) {
+                    e.link.tested += sample.bytes;
+                    self.changed = true;
+                }
+                self.sampled(interface, job, result.map(|sample| sample.bps));
+            }
             Report::LookedUp { id, job, result } => self.looked_up(id, job, result),
         }
     }
@@ -789,7 +809,7 @@ impl<N: Network> Watcher<N> {
         speed.tried.insert(id);
         let interface = e.link.name.clone();
         let addr = e.link.addr.ip();
-        self.start_sample(interface, job, addr, wait);
+        self.start_sample(interface, job, id, addr, wait);
         true
     }
 
@@ -856,7 +876,14 @@ impl<N: Network> Watcher<N> {
 
     /// Start a speed test through `addr` after `wait`. It counts as running
     /// while it waits, so nothing else starts meanwhile.
-    fn start_sample(&mut self, interface: String, job: u64, addr: IpAddr, wait: Duration) {
+    fn start_sample(
+        &mut self,
+        interface: String,
+        job: u64,
+        through: LinkId,
+        addr: IpAddr,
+        wait: Duration,
+    ) {
         let net = Arc::clone(&self.net);
         let budget = self.config.sample_budget;
         self.tasks.spawn(async move {
@@ -869,6 +896,7 @@ impl<N: Network> Watcher<N> {
             Report::Sampled {
                 interface,
                 job,
+                through,
                 result,
             }
         });

@@ -33,7 +33,8 @@ function cells(row: HTMLElement) {
     name: text('cable-name'),
     bytes: text('cable-bytes'),
     speed: text('cable-speed'),
-    connections: text('cable-connections'),
+    // No detail line while a cable takes no part: its connections read empty.
+    connections: within(row).queryByTestId('cable-connections')?.textContent ?? '',
     notes: within(row)
       .queryAllByTestId('cable-note')
       .map((n) => n.textContent),
@@ -398,7 +399,7 @@ test('fewer wanted than held shows too, and a cable holding none yet that is wan
       download={download({
         cables: [
           cable('Wi-Fi', { bytes: 1, bps: 1_000_000, connections: 4, wanted: 2 }),
-          cable('Ethernet 2', { bytes: 1, bps: 0, connections: 0, wanted: 3 }),
+          cable('Ethernet 2', { bytes: 0, bps: 0, connections: 0, wanted: 3 }),
         ],
       })}
     />,
@@ -418,6 +419,8 @@ test('no share of the speed and no wanted once a download is not downloading', (
       />,
     )
     expect(details(card()), state).toEqual([['Wi-Fi', null, null]])
+    // No empty detail line under the row either.
+    expect(within(card()).queryByTestId('cable-detail'), state).toBeNull()
     unmount()
   }
 })

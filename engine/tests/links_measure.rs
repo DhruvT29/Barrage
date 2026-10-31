@@ -18,8 +18,9 @@ use common::first_usable_local_addr;
 #[tokio::test]
 async fn sample_reports_a_positive_rate_on_a_working_link() {
     let addr = first_usable_local_addr();
-    let bps = sample(addr, Duration::from_secs(2)).await.unwrap();
-    assert!(bps > 0);
+    let got = sample(addr, Duration::from_secs(2)).await.unwrap();
+    assert!(got.bps > 0);
+    assert!(got.bytes > 0, "what it pulled, counted as data used");
 }
 
 #[tokio::test]
@@ -104,7 +105,7 @@ async fn a_short_fast_answer_is_rated_by_the_time_it_took() {
 
     let budget = Duration::from_secs(2);
     let started = Instant::now();
-    let bps = sample_url(addr, &url, budget).await.unwrap();
+    let bps = sample_url(addr, &url, budget).await.unwrap().bps;
 
     let if_divided_by_budget = (body as u64 * 8) / budget.as_secs();
     assert!(
@@ -131,7 +132,7 @@ async fn a_transfer_that_stalls_is_ended_by_the_budget_and_still_rated() {
 
     let budget = Duration::from_millis(800);
     let started = Instant::now();
-    let bps = sample_url(addr, &url, budget).await.unwrap();
+    let bps = sample_url(addr, &url, budget).await.unwrap().bps;
     let took = started.elapsed();
 
     assert!(bps > 0);
