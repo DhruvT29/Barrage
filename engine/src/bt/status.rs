@@ -62,6 +62,14 @@ pub struct TorrentCable {
     pub uploads: bool,
 }
 
+/// What the whole session does, apart from any one torrent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Swarm {
+    /// The cable carrying DHT, UDP trackers and uTP; `None` while no cable
+    /// works, when they stay on this machine.
+    pub udp_cable: Option<String>,
+}
+
 /// Why a torrent was not stopped or resumed, in the engine's words.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorrentControlError {

@@ -5,10 +5,13 @@
 pub mod choose;
 mod connect;
 mod counted;
+mod rebuild;
 pub mod source;
 mod status;
 mod torrents;
 
 pub use source::{Source, TorrentAddError};
-pub use status::{TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus};
+pub use status::{
+    Swarm, TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus,
+};
 pub use torrents::{TorrentConfig, Torrents};

@@ -3,8 +3,14 @@
 //! at once, before a magnet's metadata arrives, and its status published
 //! every tick from librqbit's state. A finished torrent is paused, and so is
 //! a stopped one: neither uploads (no seeding, the user's choice).
+//!
+//! The session's DHT, UDP tracker and uTP sockets are bound to the UDP
+//! cable (`choose::udp_cable`), and librqbit binds them only when a session
+//! starts: when the UDP cable changes, the session is rebuilt on the new
+//! one (`rebuild::due`) and every torrent given to it again in its phase.
+//! librqbit checks the files already on disk, so each keeps what it has.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,13 +21,22 @@ use librqbit::{
     ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
 use tokio::sync::watch;
+use tokio::time::Instant;
 
+use super::choose::udp_cable;
 use super::connect::Connector;
+use super::rebuild::due;
 use super::source::{Source, TorrentAddError, info_hash};
-use super::status::{TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus};
+use super::status::{
+    Swarm, TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus,
+};
 use crate::fetch::Usage;
 use crate::links::watch::LinkTable;
 use crate::transfer::TransferEngine;
+
+/// Where the UDP sockets bind while no cable works: nothing leaves this
+/// machine through Windows' choice of link.
+const NO_CABLE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// How the torrents run. Tests turn the network off and name their peers.
 #[derive(Debug, Clone)]
@@ -57,19 +72,41 @@ enum Wanted {
     Done,
 }
 
+/// What a torrent showed when its session was rebuilt, shown until the new
+/// session has checked its files, so its progress does not drop to nothing
+/// meanwhile.
+#[derive(Debug, Clone, Copy)]
+struct Kept {
+    length: Option<u64>,
+    done: u64,
+}
+
 struct Entry {
     id: TorrentId,
     info_hash: String,
+    /// What to give librqbit again after a rebuild: once its metadata is
+    /// known, the .torrent file's bytes, even for a magnet.
+    source: Source,
     /// The magnet's `dn`, until librqbit knows the name.
     name: Option<String>,
     /// Set once librqbit has the torrent (a magnet: once its metadata came).
     handle: Option<Arc<ManagedTorrent>>,
+    /// The session it was last given to; an answer from an older one is
+    /// ignored.
+    generation: u64,
+    kept: Option<Kept>,
     wanted: Wanted,
     failed: Option<String>,
 }
 
 struct Inner {
-    session: Arc<Session>,
+    session: Mutex<Arc<Session>>,
+    /// Counts the sessions, one more at each rebuild.
+    generation: AtomicU64,
+    /// The UDP cable and address the session is on, and when it was last
+    /// rebuilt.
+    udp: Mutex<Udp>,
+    swarm: watch::Sender<Swarm>,
     dir: PathBuf,
     config: TorrentConfig,
     status: watch::Sender<Vec<TorrentStatus>>,
@@ -77,10 +114,16 @@ struct Inner {
     next: AtomicU64,
     stopping: AtomicBool,
     table: LinkTable,
-    /// Opens and counts every peer connection.
+    /// Opens and counts every peer connection, for every session in turn.
     connector: Arc<Connector>,
     /// Data used, shared with the downloads.
     usage: Arc<Usage>,
+}
+
+#[derive(Default)]
+struct Udp {
+    on: Option<(String, IpAddr)>,
+    rebuilt: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -89,7 +132,7 @@ pub struct Torrents {
 }
 
 impl Torrents {
-    /// Start the session; torrents download into `dir`.
+    /// Start the session on the UDP cable; torrents download into `dir`.
     pub async fn start(
         table: LinkTable,
         dir: PathBuf,
@@ -97,14 +140,25 @@ impl Torrents {
         config: TorrentConfig,
     ) -> anyhow::Result<Self> {
         let connector = Arc::new(Connector::new(table.clone(), Arc::clone(&usage)));
+        let udp = udp_cable(&table.snapshot());
+        let ip = udp.as_ref().map_or(NO_CABLE, |(_, ip)| *ip);
         let session = Session::new_with_opts(
             dir.clone(),
-            session_options(Arc::clone(&connector), &config),
+            session_options(Arc::clone(&connector), &config, ip),
         )
         .await?;
         let torrents = Self {
             inner: Arc::new(Inner {
-                session,
+                session: Mutex::new(session),
+                generation: AtomicU64::new(0),
+                swarm: watch::channel(Swarm {
+                    udp_cable: udp.as_ref().map(|(cable, _)| cable.clone()),
+                })
+                .0,
+                udp: Mutex::new(Udp {
+                    on: udp,
+                    rebuilt: None,
+                }),
                 dir,
                 config,
                 status: watch::channel(Vec::new()).0,
@@ -129,16 +183,32 @@ impl Torrents {
                     return;
                 }
                 inner.publish().await;
+                inner.move_udp().await;
             }
         });
         Ok(torrents)
     }
+
+    /// The UDP cable, kept up to date.
+    pub fn swarm(&self) -> watch::Receiver<Swarm> {
+        self.inner.swarm.subscribe()
+    }
+
+    /// The addresses the session's DHT, UDP tracker and uTP sockets are
+    /// bound to.
+    pub fn udp_addrs(&self) -> Vec<SocketAddr> {
+        self.inner.session().udp_local_addrs()
+    }
 }
 
-/// librqbit's options: BARRAGE opens every peer connection; no local
-/// service discovery (it multicasts on every interface, not one cable); no
-/// persistence before phase 6.
-fn session_options(connector: Arc<Connector>, config: &TorrentConfig) -> SessionOptions {
+/// librqbit's options: BARRAGE opens every peer connection; UDP on `udp_ip`;
+/// no local service discovery (it multicasts on every interface, not one
+/// cable); no persistence before phase 6.
+fn session_options(
+    connector: Arc<Connector>,
+    config: &TorrentConfig,
+    udp_ip: IpAddr,
+) -> SessionOptions {
     let mut options = SessionOptions {
         connect: Some(ConnectionOptions {
             peer_connector: Some(connector),
@@ -149,6 +219,7 @@ fn session_options(connector: Arc<Connector>, config: &TorrentConfig) -> Session
             port: None,
             persistence: None,
         }),
+        udp_bind_ip: Some(udp_ip),
         disable_local_service_discovery: true,
         fastresume: false,
         persistence: None,
@@ -167,6 +238,10 @@ fn session_options(connector: Arc<Connector>, config: &TorrentConfig) -> Session
 }
 
 impl Inner {
+    fn session(&self) -> Arc<Session> {
+        Arc::clone(&self.session.lock().unwrap())
+    }
+
     fn entry<T>(&self, id: TorrentId, f: impl FnOnce(&mut Entry) -> T) -> Option<T> {
         self.list
             .lock()
@@ -174,6 +249,131 @@ impl Inner {
             .iter_mut()
             .find(|e| e.id == id)
             .map(f)
+    }
+
+    /// Give torrent `id` to the session of `generation`, in the background:
+    /// a magnet's metadata can take a while to arrive, and it is listed
+    /// already. `paused`: it is given stopped or done.
+    fn give(self: &Arc<Self>, id: TorrentId, source: Source, generation: u64, paused: bool) {
+        let session = self.session();
+        let giving = Arc::clone(self);
+        tokio::spawn(async move {
+            let add = match source {
+                Source::Magnet(link) => AddTorrent::from_url(link),
+                Source::File(bytes) => AddTorrent::from_bytes(bytes),
+            };
+            let options = AddTorrentOptions {
+                output_folder: Some(giving.dir.to_string_lossy().into_owned()),
+                overwrite: true,
+                paused,
+                initial_peers: (!giving.config.peers.is_empty())
+                    .then(|| giving.config.peers.clone()),
+                ..Default::default()
+            };
+            let added = session.add_torrent(add, Some(options)).await;
+            let current = |e: &Entry| e.generation == generation;
+            match added {
+                Ok(
+                    AddTorrentResponse::Added(_, handle)
+                    | AddTorrentResponse::AlreadyManaged(_, handle),
+                ) => {
+                    let wanted = giving.entry(id, |e| {
+                        current(e).then(|| {
+                            e.handle = Some(Arc::clone(&handle));
+                            e.wanted
+                        })
+                    });
+                    // Stopped or resumed while it was being given.
+                    match wanted.flatten() {
+                        Some(Wanted::Running) if paused => {
+                            let _ = session.unpause(&handle).await;
+                        }
+                        Some(Wanted::Stopped | Wanted::Done) if !paused => {
+                            let _ = session.pause(&handle).await;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(AddTorrentResponse::ListOnly(_)) => {
+                    giving.entry(id, |e| {
+                        if current(e) {
+                            e.failed = Some("librqbit only listed it".into());
+                        }
+                    });
+                }
+                Err(why) => {
+                    giving.entry(id, |e| {
+                        if current(e) {
+                            e.failed = Some(format!("{why:#}"));
+                        }
+                    });
+                }
+            }
+            giving.publish().await;
+        });
+    }
+
+    /// Rebuild the session on the UDP cable, if it has changed and the last
+    /// rebuild is long enough ago.
+    async fn move_udp(self: &Arc<Self>) {
+        let wanted = udp_cable(&self.table.snapshot());
+        let (cable, ip) = {
+            let mut udp = self.udp.lock().unwrap();
+            let now = Instant::now();
+            let current = udp.on.as_ref().map(|(cable, ip)| (cable.as_str(), *ip));
+            let asked = wanted.as_ref().map(|(cable, ip)| (cable.as_str(), *ip));
+            if !due(now, current, asked, udp.rebuilt) {
+                return;
+            }
+            udp.rebuilt = Some(now);
+            wanted.expect("due wants a cable")
+        };
+        let options = session_options(Arc::clone(&self.connector), &self.config, ip);
+        let session = match Session::new_with_opts(self.dir.clone(), options).await {
+            Ok(session) => session,
+            Err(why) => {
+                // Tried again after the gap; the old session carries on.
+                tracing::warn!("torrents: no session on {cable}: {why:#}");
+                return;
+            }
+        };
+        let old = std::mem::replace(&mut *self.session.lock().unwrap(), session);
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let again: Vec<(TorrentId, Source, bool)> = self
+            .list
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|e| e.failed.is_none())
+            .map(|e| {
+                if let Some(handle) = e.handle.take() {
+                    let stats = handle.stats();
+                    e.name = handle.name().or(e.name.take());
+                    e.kept = Some(Kept {
+                        length: Some(stats.total_bytes),
+                        done: stats.progress_bytes.max(e.kept.map_or(0, |k| k.done)),
+                    });
+                    if let Ok(bytes) = handle.with_metadata(|m| m.torrent_bytes.to_vec()) {
+                        e.source = Source::File(bytes);
+                    }
+                }
+                e.generation = generation;
+                (e.id, e.source.clone(), e.wanted != Wanted::Running)
+            })
+            .collect();
+        self.udp.lock().unwrap().on = Some((cable.clone(), ip));
+        self.swarm.send_replace(Swarm {
+            udp_cable: Some(cable),
+        });
+        old.stop().await;
+        if self.stopping.load(Ordering::SeqCst) {
+            // Shut down meanwhile, perhaps before this session was in place.
+            self.session().stop().await;
+            return;
+        }
+        for (id, source, paused) in again {
+            self.give(id, source, generation, paused);
+        }
     }
 
     /// librqbit's state for every torrent, as BARRAGE's status; a torrent
@@ -195,12 +395,19 @@ impl Inner {
                             finished.push(Arc::clone(handle));
                         }
                     }
+                    let checked = entry.handle.as_ref().is_some_and(|h| {
+                        !matches!(h.stats().state, TorrentStatsState::Initializing { .. })
+                    });
+                    if checked {
+                        entry.kept = None;
+                    }
                     status
                 })
                 .collect()
         };
+        let session = self.session();
         for handle in finished {
-            let _ = self.session.pause(&handle).await;
+            let _ = session.pause(&handle).await;
         }
         self.status.send_if_modified(|shown| {
             if *shown == statuses {
@@ -212,15 +419,26 @@ impl Inner {
     }
 }
 
+/// The phase of a torrent its session is not running, from what the user
+/// asked.
+fn phase_asked(wanted: Wanted) -> TorrentPhase {
+    match wanted {
+        Wanted::Running => TorrentPhase::Downloading,
+        Wanted::Stopped => TorrentPhase::Stopped,
+        Wanted::Done => TorrentPhase::Done,
+    }
+}
+
 /// One torrent's status, from librqbit's stats and what the user asked.
 fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
+    let kept = entry.kept;
     let mut status = TorrentStatus {
         id: entry.id,
         name: entry.name.clone(),
         info_hash: entry.info_hash.clone(),
         phase: TorrentPhase::Finding,
-        length: None,
-        done: 0,
+        length: kept.and_then(|k| k.length),
+        done: kept.map_or(0, |k| k.done),
         down_bps: 0,
         up_bps: 0,
         peers: 0,
@@ -232,7 +450,10 @@ fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
         return status;
     }
     let Some(handle) = &entry.handle else {
-        if entry.wanted == Wanted::Stopped {
+        if kept.is_some() {
+            // Being given to a rebuilt session.
+            status.phase = phase_asked(entry.wanted);
+        } else if entry.wanted == Wanted::Stopped {
             status.phase = TorrentPhase::Stopped;
         }
         return status;
@@ -240,17 +461,15 @@ fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
     let stats = handle.stats();
     status.name = handle.name().or(status.name);
     status.length = Some(stats.total_bytes);
-    status.done = stats.progress_bytes;
+    status.done = stats.progress_bytes.max(status.done);
     if let Some(error) = stats.error {
         status.phase = TorrentPhase::Failed;
         status.note = Some(error);
         return status;
     }
     status.phase = match entry.wanted {
-        Wanted::Stopped => TorrentPhase::Stopped,
-        Wanted::Done => TorrentPhase::Done,
         Wanted::Running if stats.finished => TorrentPhase::Done,
-        Wanted::Running => TorrentPhase::Downloading,
+        wanted => phase_asked(wanted),
     };
     if let (TorrentStatsState::Live, Some(live)) = (&stats.state, &stats.live) {
         status.peers = live.snapshot.peer_stats.live;
@@ -275,7 +494,7 @@ impl TransferEngine for Torrents {
             return Err(TorrentAddError::Stopped);
         }
         let hash = info_hash(&source)?;
-        let id = {
+        let (id, generation) = {
             let mut list = inner.list.lock().unwrap();
             if let Some(same) = list.iter().find(|e| e.info_hash == hash) {
                 return Err(TorrentAddError::AlreadyAdded(same.id));
@@ -285,54 +504,23 @@ impl TransferEngine for Torrents {
                 Source::Magnet(link) => librqbit::Magnet::parse(link).ok().and_then(|m| m.name),
                 Source::File(_) => None,
             };
+            // Read under the list's lock, as a rebuild sets it, so this
+            // torrent is either given by the rebuild or meant for its session.
+            let generation = inner.generation.load(Ordering::SeqCst);
             list.push(Entry {
                 id,
                 info_hash: hash,
+                source: source.clone(),
                 name,
                 handle: None,
+                generation,
+                kept: None,
                 wanted: Wanted::Running,
                 failed: None,
             });
-            id
+            (id, generation)
         };
-
-        // A magnet's metadata can take a while to arrive, so librqbit is
-        // given the torrent in the background; it is listed already.
-        let adding = Arc::clone(inner);
-        tokio::spawn(async move {
-            let add = match source {
-                Source::Magnet(link) => AddTorrent::from_url(link),
-                Source::File(bytes) => AddTorrent::from_bytes(bytes),
-            };
-            let options = AddTorrentOptions {
-                output_folder: Some(adding.dir.to_string_lossy().into_owned()),
-                overwrite: true,
-                initial_peers: (!adding.config.peers.is_empty())
-                    .then(|| adding.config.peers.clone()),
-                ..Default::default()
-            };
-            match adding.session.add_torrent(add, Some(options)).await {
-                Ok(
-                    AddTorrentResponse::Added(_, handle)
-                    | AddTorrentResponse::AlreadyManaged(_, handle),
-                ) => {
-                    let stopped = adding.entry(id, |e| {
-                        e.handle = Some(Arc::clone(&handle));
-                        e.wanted == Wanted::Stopped
-                    });
-                    if stopped == Some(true) {
-                        let _ = adding.session.pause(&handle).await;
-                    }
-                }
-                Ok(AddTorrentResponse::ListOnly(_)) => {
-                    adding.entry(id, |e| e.failed = Some("librqbit only listed it".into()));
-                }
-                Err(e) => {
-                    adding.entry(id, |entry| entry.failed = Some(format!("{e:#}")));
-                }
-            }
-            adding.publish().await;
-        });
+        inner.give(id, source, generation, false);
         inner.publish().await;
         Ok(id)
     }
@@ -353,7 +541,7 @@ impl TransferEngine for Torrents {
             })
             .ok_or(TorrentControlError::NoSuchTorrent)??;
         if let Some(handle) = handle {
-            let _ = inner.session.pause(&handle).await;
+            let _ = inner.session().pause(&handle).await;
         }
         inner.publish().await;
         Ok(())
@@ -371,7 +559,7 @@ impl TransferEngine for Torrents {
             })
             .ok_or(TorrentControlError::NoSuchTorrent)??;
         if let Some(handle) = handle {
-            let _ = inner.session.unpause(&handle).await;
+            let _ = inner.session().unpause(&handle).await;
         }
         inner.publish().await;
         Ok(())
@@ -379,6 +567,6 @@ impl TransferEngine for Torrents {
 
     async fn shutdown(&self) {
         self.inner.stopping.store(true, Ordering::SeqCst);
-        self.inner.session.stop().await;
+        self.inner.session().stop().await;
     }
 }
