@@ -1215,14 +1215,14 @@ mod tests {
     }
 
     /// A download in every state, on the sample's cables: one downloading
-    /// over Wi-Fi and both of Ethernet 2's addresses while Ethernet 3 sits
-    /// out with its note, one failed with the note its link gave, and one
-    /// stopped halfway.
+    /// over Wi-Fi and both of Ethernet 2's addresses while Ethernet 3, on
+    /// the Wi-Fi's connection, sits out with the engine's note, one failed
+    /// with the note its link gave, and one stopped halfway.
     fn contract_downloads() -> Vec<DownloadStatus> {
         let gone = "https://example.com/files/gone.zip";
         let not_found = format!("finding {gone} through 192.0.2.10: {gone} answered 404 Not Found");
-        let other = "sits out: the server gave this cable another version of the file \
-                     (\"7b1d\", not \"a3f0\")";
+        let behind = "sits out: it reaches the internet through the same connection as Wi-Fi, \
+                      so using both gains nothing";
         let mut downloading = download(
             1,
             Phase::Downloading,
@@ -1234,7 +1234,7 @@ mod tests {
                 },
                 share(2, "Ethernet 2", 905_000_000, 61_000_000, 4, None),
                 share(3, "Ethernet 2", 412_000_000, 27_500_000, 4, None),
-                share(4, "Ethernet 3", 0, 0, 0, Some(other)),
+                share(4, "Ethernet 3", 0, 0, 0, Some(behind)),
             ],
         );
         downloading.url = "https://example.com/files/ubuntu.iso".to_string();

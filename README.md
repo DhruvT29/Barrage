@@ -26,26 +26,29 @@ terminal.
 
 The dashboard has two tabs. **Links** shows a card per connection (Wi-Fi, a
 USB-tethered phone, Ethernet) with its state, delay, measured speed and
-addresses, and a notice when two connections reach the internet through the
-same one. **Downloads** takes a link to a file, which then comes down through
-every working connection at once; each download shows its progress, its speed
-and what each connection carried. A tethered phone's part comes out of its
-mobile data. The faster a connection delivers, the more of a download's
-connections it holds. Two cables that reach the internet through the same
-connection count as one: one carries and the other sits out, and a cable
-Windows calls metered is the one that sits out. A connection that drops and
-comes back holds a single connection until it has kept working for 30
-seconds. Stop on a download saves what it has; Resume, or adding its link
-again, carries on from there. Downloaded files carry the mark Windows gives a
-browser's downloads, so SmartScreen and Office treat them as from the
-internet. Across the top, both tabs show the combined speed available, or
-while anything downloads the live download speed; beside them, every change as
-it happens. Ctrl+C stops `barrage`; the open page says "disconnected,
-retrying", keeps what it last showed, and comes back by itself when `barrage`
-runs again (`--no-open` avoids a second tab). A download cut short, by Ctrl+C
-or by `barrage` being closed or crashing, picks up where it was when its link
-is added again, as long as the server's file is still the same version; its
-progress is kept beside it in `<name>.part.json`.
+addresses, a "metered" mark when Windows calls the connection metered, how
+much BARRAGE has downloaded through it since it started, and a notice when two
+connections reach the internet through the same one. **Downloads** takes a
+link to a file, which then comes down through every working connection at
+once; each download shows its progress, its speed and what each connection
+carried, and while it runs, each connection's share of the speed and its
+connections, with how many it is wanted to hold while that changes. A tethered
+phone's part comes out of its mobile data. The faster a connection delivers,
+the more of a download's connections it holds. Two cables that reach the
+internet through the same connection count as one: one carries and the other
+sits out, and a cable Windows calls metered is the one that sits out. A
+connection that drops and comes back holds a single connection until it has
+kept working for 30 seconds. Stop on a download saves what it has; Resume, or
+adding its link again, carries on from there. Downloaded files carry the mark
+Windows gives a browser's downloads, so SmartScreen and Office treat them as
+from the internet. Across the top, both tabs show the combined speed
+available, or while anything downloads the live download speed; beside them,
+every change as it happens. Ctrl+C stops `barrage`; the open page says
+"disconnected, retrying", keeps what it last showed, and comes back by itself
+when `barrage` runs again (`--no-open` avoids a second tab). A download cut
+short, by Ctrl+C or by `barrage` being closed or crashing, picks up where it
+was when its link is added again, as long as the server's file is still the
+same version; its progress is kept beside it in `<name>.part.json`.
 
 Working on the page: run `barrage`, then `pnpm --dir ui dev`, which serves the
 page with live reload and passes `/api` to the engine. `pnpm --dir ui test`

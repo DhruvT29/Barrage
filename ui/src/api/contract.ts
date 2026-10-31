@@ -217,7 +217,7 @@ export const messages = [
               "connections": 0,
               "wanted": 0,
               "notes": [
-                "sits out: the server gave this cable another version of the file (\"7b1d\", not \"a3f0\")"
+                "sits out: it reaches the internet through the same connection as Wi-Fi, so using both gains nothing"
               ]
             }
           ]

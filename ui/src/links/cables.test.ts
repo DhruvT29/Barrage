@@ -160,3 +160,31 @@ test('names are joined as brg-links joins them', () => {
   expect(joinNames(['Wi-Fi', 'Ethernet 2'])).toBe('Wi-Fi and Ethernet 2')
   expect(joinNames(['Wi-Fi', 'Ethernet 2', 'Ethernet 3'])).toBe('Wi-Fi, Ethernet 2 and Ethernet 3')
 })
+
+test("a cable is metered when Windows says any of its addresses' connection is", () => {
+  const t = table([
+    link('Wi-Fi', '192.0.2.10'),
+    link('Ethernet 3', '198.51.100.30'),
+    link('Ethernet 3', '2001:db8::30', { metered: true }),
+  ])
+  expect(cables(t).map((c) => [c.name, c.metered])).toEqual([
+    ['Wi-Fi', false],
+    ['Ethernet 3', true],
+  ])
+})
+
+test('each cable carries the data BARRAGE has used through it, 0 when none', () => {
+  const t = table([link('Wi-Fi', '192.0.2.10'), link('Ethernet 2', '198.51.100.20'), link('Ethernet 3', '198.51.100.30')])
+  const used = [
+    { cable: 'Ethernet 2', bytes: 1_858_200_000 },
+    { cable: 'Wi-Fi', bytes: 1_326_100_000 },
+    // A cable that carried and has since gone has no card.
+    { cable: 'Ethernet 9', bytes: 5 },
+  ]
+  expect(cables(t, used).map((c) => [c.name, c.used])).toEqual([
+    ['Wi-Fi', 1_326_100_000],
+    ['Ethernet 2', 1_858_200_000],
+    ['Ethernet 3', 0],
+  ])
+  expect(cables(t).map((c) => c.used)).toEqual([0, 0, 0])
+})
