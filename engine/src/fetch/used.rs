@@ -63,8 +63,6 @@ impl Counter {
     }
 
     /// `n` more bytes left through the cable.
-    // The torrents call it from phase 5 Task 7; until then only the tests.
-    #[allow(dead_code)]
     pub fn add_sent(&self, n: u64) {
         if n > 0 {
             self.sent.fetch_add(n, Ordering::SeqCst);

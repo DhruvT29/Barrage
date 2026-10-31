@@ -4,6 +4,7 @@
 
 pub mod choose;
 mod connect;
+mod counted;
 pub mod source;
 mod status;
 mod torrents;

@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use super::connect::Connector;
 use super::source::{Source, TorrentAddError, info_hash};
-use super::status::{TorrentControlError, TorrentId, TorrentPhase, TorrentStatus};
+use super::status::{TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus};
 use crate::fetch::Usage;
 use crate::links::watch::LinkTable;
 use crate::transfer::TransferEngine;
@@ -76,9 +76,11 @@ struct Inner {
     list: Mutex<Vec<Entry>>,
     next: AtomicU64,
     stopping: AtomicBool,
-    /// Data used, shared with the downloads; the torrents add to it from
-    /// Task 7.
-    _usage: Arc<Usage>,
+    table: LinkTable,
+    /// Opens and counts every peer connection.
+    connector: Arc<Connector>,
+    /// Data used, shared with the downloads.
+    usage: Arc<Usage>,
 }
 
 #[derive(Clone)]
@@ -94,7 +96,12 @@ impl Torrents {
         usage: Arc<Usage>,
         config: TorrentConfig,
     ) -> anyhow::Result<Self> {
-        let session = Session::new_with_opts(dir.clone(), session_options(&table, &config)).await?;
+        let connector = Arc::new(Connector::new(table.clone(), Arc::clone(&usage)));
+        let session = Session::new_with_opts(
+            dir.clone(),
+            session_options(Arc::clone(&connector), &config),
+        )
+        .await?;
         let torrents = Self {
             inner: Arc::new(Inner {
                 session,
@@ -104,7 +111,9 @@ impl Torrents {
                 list: Mutex::new(Vec::new()),
                 next: AtomicU64::new(0),
                 stopping: AtomicBool::new(false),
-                _usage: usage,
+                table,
+                connector,
+                usage,
             }),
         };
         let ticking = Arc::downgrade(&torrents.inner);
@@ -129,10 +138,10 @@ impl Torrents {
 /// librqbit's options: BARRAGE opens every peer connection; no local
 /// service discovery (it multicasts on every interface, not one cable); no
 /// persistence before phase 6.
-fn session_options(table: &LinkTable, config: &TorrentConfig) -> SessionOptions {
+fn session_options(connector: Arc<Connector>, config: &TorrentConfig) -> SessionOptions {
     let mut options = SessionOptions {
         connect: Some(ConnectionOptions {
-            peer_connector: Some(Arc::new(Connector::new(table.clone()))),
+            peer_connector: Some(connector),
             ..Default::default()
         }),
         dht: Some(DhtSessionConfig {
@@ -170,12 +179,16 @@ impl Inner {
     /// librqbit's state for every torrent, as BARRAGE's status; a torrent
     /// that has just finished is paused here.
     async fn publish(&self) {
+        let links = self.table.snapshot();
+        self.connector.refresh(&links);
+        self.usage.publish();
         let mut finished = Vec::new();
         let statuses: Vec<TorrentStatus> = {
             let mut list = self.list.lock().unwrap();
             list.iter_mut()
                 .map(|entry| {
-                    let status = status_of(entry);
+                    let status =
+                        status_of(entry, self.connector.cables_of(&entry.info_hash, &links));
                     if entry.wanted == Wanted::Running && status.phase == TorrentPhase::Done {
                         entry.wanted = Wanted::Done;
                         if let Some(handle) = &entry.handle {
@@ -200,7 +213,7 @@ impl Inner {
 }
 
 /// One torrent's status, from librqbit's stats and what the user asked.
-fn status_of(entry: &Entry) -> TorrentStatus {
+fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
     let mut status = TorrentStatus {
         id: entry.id,
         name: entry.name.clone(),
@@ -212,7 +225,7 @@ fn status_of(entry: &Entry) -> TorrentStatus {
         up_bps: 0,
         peers: 0,
         note: entry.failed.clone(),
-        cables: Vec::new(),
+        cables,
     };
     if entry.failed.is_some() {
         status.phase = TorrentPhase::Failed;

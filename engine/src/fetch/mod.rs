@@ -26,12 +26,12 @@ mod disk;
 mod download;
 pub mod name;
 pub mod ranges;
-mod rate;
+pub(crate) mod rate;
 pub mod remote;
 mod saved;
 pub(crate) mod schedule;
 mod spans;
-mod used;
+pub(crate) mod used;
 mod worker;
 
 use std::collections::HashMap;
