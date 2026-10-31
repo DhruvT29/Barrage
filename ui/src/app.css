@@ -201,6 +201,50 @@ body {
   border-width: 0 2px;
 }
 
+/* Metered: a word and a mark beside the state. Not a state's colour: it is
+   what the connection costs, not whether it works. */
+.metered {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 7px 0 5px;
+  margin-left: 4px;
+  border: 1px solid rgba(233, 255, 240, 0.4);
+  border-radius: 9px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+.metered svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+}
+
+/* A cable's speed, and beside it the data BARRAGE has used through it. */
+.speedline {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-top: 6px;
+}
+.speedline .figure {
+  margin-top: 0;
+}
+.used {
+  font-size: 12.5px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.used b {
+  font-weight: 500;
+  color: var(--text);
+}
+
 .figure {
   margin-top: 6px;
   font-family: var(--display);
@@ -704,8 +748,9 @@ body {
   white-space: nowrap;
 }
 
-/* A row per cable: its share of the bytes, its bytes, its speed, its
-   connections, and under them its notes in the engine's words. */
+/* A row per cable: its share of the bytes, its bytes, its speed; under
+   them, while it downloads, its share of the speed and its connections,
+   then its notes in the engine's words. */
 .shares {
   list-style: none;
   padding: 0;
@@ -714,8 +759,8 @@ body {
 }
 .shares li {
   display: grid;
-  grid-template-columns: 100px minmax(60px, 1fr) 72px 84px 104px;
-  grid-template-areas: 'name bar bytes speed conns';
+  grid-template-columns: 100px minmax(60px, 1fr) 72px 84px;
+  grid-template-areas: 'name bar bytes speed';
   align-items: center;
   gap: 2px 12px;
   padding: 5px 0;
@@ -747,9 +792,13 @@ body {
   text-align: right;
   color: var(--green);
 }
-.share-conns {
-  grid-area: conns;
+.share-detail {
+  grid-column: 2 / -1;
   color: var(--dim);
+}
+.share-detail b {
+  font-weight: 500;
+  color: var(--text);
 }
 .share-note {
   grid-column: 2 / -1;
@@ -766,16 +815,13 @@ body {
     grid-template-columns: minmax(0, 1fr) auto auto;
     grid-template-areas:
       'name bytes speed'
-      'bar bar bar'
-      'conns conns conns';
+      'bar bar bar';
     gap: 3px 14px;
     padding: 6px 0;
   }
+  .share-detail,
   .share-note {
     grid-column: 1 / -1;
-  }
-  .share-conns:empty {
-    display: none;
   }
 }
 

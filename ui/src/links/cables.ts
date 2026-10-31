@@ -1,6 +1,6 @@
 // The link table as the cards show it: one card per cable, and the figures
 // written exactly as `brg-links` writes them (engine/src/links/render.rs).
-import type { LinkState, LinkView, TableView } from '../api/types'
+import type { LinkState, LinkView, TableView, UseView } from '../api/types'
 
 /** One interface, with every address on it. */
 export type Cable = {
@@ -15,6 +15,10 @@ export type Cable = {
   downBps: number | null
   /** The other cables that reach the internet through the same connection, directly or through another cable. */
   sharedWith: string[]
+  /** Whether Windows says the connection any of its addresses is on is metered. */
+  metered: boolean
+  /** Bytes BARRAGE has downloaded through it since the engine started, written or not; 0 until it carries. */
+  used: number
 }
 
 /** The states that carry data, as the engine's `LinkState::is_usable`. */
@@ -23,8 +27,12 @@ const USABLE: LinkState[] = ['up', 'degraded']
 /** Best first. Only for a cable's own addresses, never to rank cables. */
 const BEST: LinkState[] = ['up', 'degraded', 'portal', 'probing', 'down']
 
-/** The cables, in the order each first appeared. No ranking by type. */
-export function cables(table: TableView): Cable[] {
+/**
+ * The cables, in the order each first appeared. No ranking by type. `used`
+ * is the downloads' data used by cable; a cable it does not name has used
+ * nothing.
+ */
+export function cables(table: TableView, used: UseView[] = []): Cable[] {
   const names: string[] = []
   for (const link of table.links) {
     if (!names.includes(link.name)) names.push(link.name)
@@ -48,6 +56,8 @@ export function cables(table: TableView): Cable[] {
       rttMs: best.rtt_ms,
       downBps: speedFrom?.down_bps ?? null,
       sharedWith,
+      metered: links.some((l) => l.metered),
+      used: used.find((u) => u.cable === name)?.bytes ?? 0,
     }
   })
 }

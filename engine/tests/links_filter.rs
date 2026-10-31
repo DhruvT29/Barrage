@@ -17,6 +17,7 @@ fn cand(name: &str, ip: &str, up: bool) -> Candidate {
         name: name.to_string(),
         addr: Addr::from(ip.parse::<IpAddr>().expect("test address should parse")),
         up,
+        metered: false,
     }
 }
 

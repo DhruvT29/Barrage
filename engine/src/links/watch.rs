@@ -25,9 +25,10 @@
 //! EVENTS
 //!
 //! An event is sent when a link's state changes to a judged state (`Up`,
-//! `Portal`, `Down`, and later `Degraded`). A link that disappears is reported
-//! `Down`, unless it was already `Down` or never judged, since then nobody was
-//! relying on it.
+//! `Degraded`, `Portal`, `Down`). A link that disappears is reported `Down`,
+//! unless it was already `Down` or never judged, since then nobody was
+//! relying on it; for the same reason a link whose first probes fail is shown
+//! `Down` but sends no event (BRG-16).
 //!
 //! An event goes out only after the table showing it has been published, so
 //! whoever hears `Up(id)` and looks the link up finds it `Up`. The other order
@@ -52,6 +53,19 @@
 //! 10 s, or make phase 3 drop one mid-download. Once a link is `Down` it is
 //! probed at the normal pace again, so a dead link costs one probe per
 //! `reprobe`, not one a second.
+//!
+//! DEGRADED: A RECOVERED LINK IS NOT TRUSTED AT ONCE
+//!
+//! A link answering again after `Down` is `Degraded` until its probes have
+//! kept answering for [`WatchConfig::cooldown`], then `Up` (PLAN.md 3.5). It
+//! is probed again when the cooldown ends, so it is trusted then. One failed
+//! probe while degraded starts the cooldown again; two in a row make it
+//! `Down`, as for any link. A cable unplugged and plugged back in within its
+//! cooldown, as a tether is when tethering is turned off and on, comes back
+//! as new links, `Degraded` on their first answer. A link seen for the first
+//! time, and a portal logged into, go straight to `Up`. Degraded is usable:
+//! it keeps its speed and public address, and a download gives it one
+//! connection, so a link that drops again costs little.
 //!
 //! SPEED: ONCE PER INTERFACE, SHARED BY ITS ADDRESSES
 //!
@@ -142,7 +156,7 @@ pub trait Network: Send + Sync + 'static {
         &self,
         addr: IpAddr,
         budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send;
+    ) -> impl Future<Output = anyhow::Result<super::measure::Sample>> + Send;
 
     /// The address the internet sees traffic from `addr` arrive from.
     fn public_ip(
@@ -172,7 +186,7 @@ impl Network for SystemNetwork {
         &self,
         addr: IpAddr,
         budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send {
+    ) -> impl Future<Output = anyhow::Result<super::measure::Sample>> + Send {
         super::measure::sample(addr, budget)
     }
 
@@ -210,6 +224,9 @@ pub struct WatchConfig {
     /// networks is taken for its addresses still arriving rather than a new
     /// network. A plugged-in phone's IPv6 addresses follow its IPv4 one.
     pub settle: Duration,
+    /// How long a link back from `Down` stays `Degraded`, its probes
+    /// answering, before it is trusted as `Up` again.
+    pub cooldown: Duration,
 }
 
 impl WatchConfig {
@@ -222,6 +239,7 @@ impl WatchConfig {
             retry: Duration::from_secs(1),
             sample_budget: Duration::from_secs(5),
             settle: Duration::from_secs(10),
+            cooldown: Duration::from_secs(30),
         }
     }
 }
@@ -251,6 +269,12 @@ pub const EVENT_CAPACITY: usize = 256;
 pub struct LinkTable(watch::Receiver<Vec<Link>>);
 
 impl LinkTable {
+    /// A table that follows `links`, for a test that sets them itself.
+    #[cfg(test)]
+    pub(crate) fn of(links: watch::Receiver<Vec<Link>>) -> Self {
+        Self(links)
+    }
+
     /// The links as of the watcher's last change, in the order they appeared.
     /// Copies out and returns at once; it never waits on the watcher.
     pub fn snapshot(&self) -> Vec<Link> {
@@ -293,6 +317,7 @@ pub fn spawn_watcher<N: Network>(
         links: BTreeMap::new(),
         speeds: HashMap::new(),
         networks: HashMap::new(),
+        left: HashMap::new(),
         next_id: 1,
         next_job: 1,
         events,
@@ -312,7 +337,9 @@ enum Report {
     Sampled {
         interface: String,
         job: u64,
-        result: anyhow::Result<u64>,
+        /// The address it ran through, whose data it used.
+        through: LinkId,
+        result: anyhow::Result<super::measure::Sample>,
     },
     LookedUp {
         id: LinkId,
@@ -330,6 +357,13 @@ struct Entry {
     /// The public address lookup whose answer is wanted, if one is running.
     lookup: Option<u64>,
     lookup_attempts: u8,
+    /// While `Degraded`: when its cooldown ends and it is trusted as `Up`,
+    /// if its probes keep answering until then.
+    trusted_at: Option<Instant>,
+    /// A new link on an interface that left within its cooldown, as a
+    /// tether does when tethering is turned off and on: its first answer
+    /// makes it `Degraded`, not `Up`.
+    back: bool,
 }
 
 /// One interface's speed test, shared by all its addresses.
@@ -370,6 +404,9 @@ struct Watcher<N> {
     /// Per interface name, when it was first seen and its IPv6 networks
     /// (/64 prefixes) as last seen.
     networks: HashMap<String, (Instant, BTreeSet<u64>)>,
+    /// Per interface name, when it left the interface list with a judged
+    /// link on it (not a portal), for as long as its cooldown runs.
+    left: HashMap<String, Instant>,
     next_id: u64,
     /// Numbers every speed test and lookup, so a late answer to one that no
     /// longer matters can be recognised and dropped.
@@ -392,7 +429,15 @@ impl<N: Network> Watcher<N> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = ticker.tick() => self.poll(),
+                _ = ticker.tick() => {
+                    // The OS calls block (Windows' connection costs take
+                    // about 30 ms), so they run off the async threads.
+                    let net = Arc::clone(&self.net);
+                    let listed = tokio::task::spawn_blocking(move || net.enumerate())
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("listing the interfaces failed: {e}")));
+                    self.poll(listed);
+                }
                 Some(done) = self.tasks.join_next() => match done {
                     Ok(report) => self.receive(report),
                     Err(e) => tracing::error!(error = %e, "a probe, speed test or lookup panicked"),
@@ -410,8 +455,8 @@ impl<N: Network> Watcher<N> {
         }
     }
 
-    fn poll(&mut self) {
-        let candidates = match self.net.enumerate() {
+    fn poll(&mut self, listed: anyhow::Result<Vec<Candidate>>) {
+        let candidates = match listed {
             Ok(all) => self.net.usable(&all),
             Err(e) => {
                 // Says nothing about the links themselves; keep what we know.
@@ -426,6 +471,7 @@ impl<N: Network> Watcher<N> {
             .filter(|(_, e)| !candidates.iter().any(|c| is_same_link(c, &e.link)))
             .map(|(id, _)| *id)
             .collect();
+        let now = Instant::now();
         for id in gone {
             if let Some(entry) = self.links.remove(&id) {
                 if matches!(
@@ -434,9 +480,23 @@ impl<N: Network> Watcher<N> {
                 ) {
                     self.emit(LinkEvent::Down(id));
                 }
+                // The interface itself gone, not one of its addresses
+                // changed: a new address on a present interface is a new
+                // network, not a cable coming back.
+                let name = &entry.link.name;
+                let judged = matches!(
+                    entry.link.state,
+                    LinkState::Up | LinkState::Degraded | LinkState::Down
+                );
+                if judged && !candidates.iter().any(|c| &c.name == name) {
+                    self.left.insert(name.clone(), now);
+                }
                 self.changed = true;
             }
         }
+        let cooldown = self.config.cooldown;
+        self.left
+            .retain(|_, since| now.duration_since(*since) < cooldown);
         // An interface whose every address has gone forgets its speed, so a
         // new network on the same interface is tested afresh. This runs
         // before newcomers are added, so a network swap seen within a single
@@ -478,7 +538,12 @@ impl<N: Network> Watcher<N> {
         }
 
         for c in &candidates {
-            if self.links.values().any(|e| is_same_link(c, &e.link)) {
+            if let Some(e) = self.links.values_mut().find(|e| is_same_link(c, &e.link)) {
+                // Set as metered, or no longer: the same link, changed.
+                if e.link.metered != c.metered {
+                    e.link.metered = c.metered;
+                    self.changed = true;
+                }
                 continue;
             }
             let id = LinkId::new(self.next_id);
@@ -491,9 +556,10 @@ impl<N: Network> Watcher<N> {
                 rtt: None,
                 down_bps: None,
                 public_ip: None,
-                // No task reads the Windows network cost type yet.
-                metered: false,
+                metered: c.metered,
+                tested: 0,
             };
+            let back = self.left.contains_key(&c.name);
             self.links.insert(
                 id,
                 Entry {
@@ -503,6 +569,8 @@ impl<N: Network> Watcher<N> {
                     failures: 0,
                     lookup: None,
                     lookup_attempts: 0,
+                    trusted_at: None,
+                    back,
                 },
             );
             self.changed = true;
@@ -557,13 +625,23 @@ impl<N: Network> Watcher<N> {
             Report::Sampled {
                 interface,
                 job,
+                through,
                 result,
-            } => self.sampled(interface, job, result),
+            } => {
+                // Spent whatever becomes of the result: a stale test's
+                // bytes came down the cable too.
+                if let (Ok(sample), Some(e)) = (&result, self.links.get_mut(&through)) {
+                    e.link.tested += sample.bytes;
+                    self.changed = true;
+                }
+                self.sampled(interface, job, result.map(|sample| sample.bps));
+            }
             Report::LookedUp { id, job, result } => self.looked_up(id, job, result),
         }
     }
 
     fn probed(&mut self, id: LinkId, result: anyhow::Result<Probe>) {
+        let cooldown = self.config.cooldown;
         // Gone since the probe started: a stale answer about a link that no
         // longer exists, possibly about an address now held by another.
         let Some(e) = self.links.get_mut(&id) else {
@@ -571,10 +649,11 @@ impl<N: Network> Watcher<N> {
         };
         e.probing = false;
         let now = Instant::now();
+        let before = e.link.state;
 
         let answered = match result {
             Ok(p) => match p.verdict {
-                ProbeVerdict::Working => Some((LinkState::Up, p.rtt)),
+                ProbeVerdict::Working => Some((working(e, now, cooldown), p.rtt)),
                 ProbeVerdict::Portal => Some((LinkState::Portal, p.rtt)),
                 ProbeVerdict::Broken => {
                     tracing::debug!(link = %e.link.name, "probe answered, but not as the internet does");
@@ -594,35 +673,53 @@ impl<N: Network> Watcher<N> {
             None => {
                 e.failures = e.failures.saturating_add(1);
                 if e.failures < FAILURES_FOR_DOWN {
-                    // Not yet: try again soon and change nothing meanwhile.
+                    // Not yet: try again soon and change nothing meanwhile,
+                    // but a degraded link's cooldown starts again.
                     e.next_probe = now + self.config.retry;
+                    if e.link.state == LinkState::Degraded {
+                        e.trusted_at = Some(now + cooldown);
+                    }
                     return;
                 }
                 (LinkState::Down, None)
             }
         };
-        e.next_probe = now + self.config.reprobe;
+        if state != LinkState::Degraded {
+            e.trusted_at = None;
+        }
+        e.back = false;
+        // A degraded link is probed again when its cooldown ends, so it is
+        // trusted then rather than at the next reprobe after.
+        e.next_probe = match e.trusted_at {
+            Some(trusted) => (now + self.config.reprobe).min(trusted),
+            None => now + self.config.reprobe,
+        };
         e.link.rtt = rtt;
         self.changed = true;
 
-        let changed_state = e.link.state != state;
+        let changed_state = before != state;
         e.link.state = state;
-        if state != LinkState::Up {
+        if !state.is_usable() {
             // A speed and a public address describe a working link, and a
             // dead one showing them would count capacity that is not there.
             // The speed stays with the cable and comes back with the link;
             // the public address is looked up again.
             //
-            // Only Up keeps them, here and in `sampled`, `measure_if_wanted`,
-            // `look_up_if_wanted` and `looked_up`. Nothing sets Degraded yet;
-            // the phase that does must let it keep them too, since it is
-            // usable (`LinkState::is_usable`) and the cards and the combined
-            // speed already count a degraded cable's figure.
+            // Up and Degraded keep them, here and in `sampled`,
+            // `measure_if_wanted`, `look_up_if_wanted` and `looked_up`: a
+            // degraded link is usable (`LinkState::is_usable`), and the cards
+            // and the combined speed count its figure.
             e.link.down_bps = None;
             e.link.public_ip = None;
         }
 
-        if changed_state && let Some(event) = event_for(state, id) {
+        // A link never seen usable going down tells nobody anything (BRG-16),
+        // as a link that disappears unjudged sends nothing.
+        let unseen = before == LinkState::Probing && state == LinkState::Down;
+        if changed_state
+            && !unseen
+            && let Some(event) = event_for(state, id)
+        {
             self.emit(event);
         }
         self.measure_if_wanted(id, Duration::ZERO);
@@ -648,7 +745,7 @@ impl<N: Network> Watcher<N> {
             Ok(bps) => {
                 speed.bps = Some(bps);
                 for e in self.links.values_mut() {
-                    if e.link.name == interface && e.link.state == LinkState::Up {
+                    if e.link.name == interface && e.link.state.is_usable() {
                         e.link.down_bps = Some(bps);
                     }
                 }
@@ -684,14 +781,14 @@ impl<N: Network> Watcher<N> {
         }
     }
 
-    /// Give an up link its interface's speed, or start the interface's test
-    /// through it, after `wait`, if none is known and none is running.
+    /// Give a usable link its interface's speed, or start the interface's
+    /// test through it, after `wait`, if none is known and none is running.
     /// Returns whether a test started.
     fn measure_if_wanted(&mut self, id: LinkId, wait: Duration) -> bool {
         let Some(e) = self.links.get_mut(&id) else {
             return false;
         };
-        if e.link.state != LinkState::Up {
+        if !e.link.state.is_usable() {
             return false;
         }
         let speed = self.speeds.entry(e.link.name.clone()).or_default();
@@ -712,17 +809,17 @@ impl<N: Network> Watcher<N> {
         speed.tried.insert(id);
         let interface = e.link.name.clone();
         let addr = e.link.addr.ip();
-        self.start_sample(interface, job, addr, wait);
+        self.start_sample(interface, job, id, addr, wait);
         true
     }
 
-    /// Look up an up link's public address, unless it is known, being looked
-    /// up, or has failed too often.
+    /// Look up a usable link's public address, unless it is known, being
+    /// looked up, or has failed too often.
     fn look_up_if_wanted(&mut self, id: LinkId) {
         let Some(e) = self.links.get_mut(&id) else {
             return;
         };
-        if e.link.state != LinkState::Up
+        if !e.link.state.is_usable()
             || e.link.public_ip.is_some()
             || e.lookup.is_some()
             || e.lookup_attempts >= MAX_LOOKUP_ATTEMPTS
@@ -749,7 +846,7 @@ impl<N: Network> Watcher<N> {
         match result {
             // Asked while the link worked, answered after it stopped: kept
             // off a dead link, and looked up again if it recovers.
-            Ok(_) if e.link.state != LinkState::Up => {}
+            Ok(_) if !e.link.state.is_usable() => {}
             Ok(public) => {
                 e.link.public_ip = Some(public);
                 // The tries are for a lookup that keeps failing; a link that
@@ -779,7 +876,14 @@ impl<N: Network> Watcher<N> {
 
     /// Start a speed test through `addr` after `wait`. It counts as running
     /// while it waits, so nothing else starts meanwhile.
-    fn start_sample(&mut self, interface: String, job: u64, addr: IpAddr, wait: Duration) {
+    fn start_sample(
+        &mut self,
+        interface: String,
+        job: u64,
+        through: LinkId,
+        addr: IpAddr,
+        wait: Duration,
+    ) {
         let net = Arc::clone(&self.net);
         let budget = self.config.sample_budget;
         self.tasks.spawn(async move {
@@ -792,6 +896,7 @@ impl<N: Network> Watcher<N> {
             Report::Sampled {
                 interface,
                 job,
+                through,
                 result,
             }
         });
@@ -828,6 +933,24 @@ fn ipv6_networks(candidates: &[Candidate]) -> HashMap<String, BTreeSet<u64>> {
         }
     }
     networks
+}
+
+/// What a working probe answer makes `e`: `Degraded`, its cooldown starting,
+/// when it is back from `Down` (or a new link of an interface back within
+/// its cooldown); still `Degraded` until its cooldown ends; else `Up`. A new
+/// link, and a portal logged into, go straight to `Up`.
+fn working(e: &mut Entry, now: Instant, cooldown: Duration) -> LinkState {
+    let back = e.link.state == LinkState::Down || (e.link.state == LinkState::Probing && e.back);
+    if back {
+        e.trusted_at = Some(now + cooldown);
+        return LinkState::Degraded;
+    }
+    match e.trusted_at {
+        Some(trusted) if e.link.state == LinkState::Degraded && now < trusted => {
+            LinkState::Degraded
+        }
+        _ => LinkState::Up,
+    }
 }
 
 fn is_same_link(candidate: &Candidate, link: &Link) -> bool {

@@ -1,3 +1,4 @@
+import { formatBytes } from '../downloads/format'
 import { type Cable, joinNames, mbps, publicText, rtt } from './cables'
 
 /**
@@ -6,7 +7,9 @@ import { type Cable, joinNames, mbps, publicText, rtt } from './cables'
  * the internet sees it as.
  *
  * The state is a colour, a shape (both from the `cable <state>` classes) and
- * the engine's own word, always written out.
+ * the engine's own word, always written out. A metered cable says so beside
+ * it, in a word and a mark, never colour alone; once the cable has carried,
+ * the data BARRAGE has used through it is beside its speed.
  */
 export function LinkCard({ cable, fastestBps }: { cable: Cable; fastestBps: number | null }) {
   const share = cable.downBps !== null && fastestBps ? cable.downBps / fastestBps : 0
@@ -22,16 +25,32 @@ export function LinkCard({ cable, fastestBps }: { cable: Cable; fastestBps: numb
           <span data-testid="state">
             {cable.rttMs === null ? cable.state : `${cable.state}, ${rtt(cable.rttMs)}`}
           </span>
+          {cable.metered && (
+            <span className="metered" data-testid="metered" title="Windows says this connection is metered">
+              <svg viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M1.5 9a4.5 4.5 0 1 1 9 0" />
+                <path d="M6 9 8.2 5.6" />
+              </svg>
+              metered
+            </span>
+          )}
         </span>
       </div>
 
-      <div className={unit ? 'figure' : 'figure unknown'} data-testid="speed">
-        {figure}
-        {unit && (
-          <>
-            {' '}
-            <small>{unit}</small>
-          </>
+      <div className="speedline">
+        <div className={unit ? 'figure' : 'figure unknown'} data-testid="speed">
+          {figure}
+          {unit && (
+            <>
+              {' '}
+              <small>{unit}</small>
+            </>
+          )}
+        </div>
+        {cable.used > 0 && (
+          <div className="used" data-testid="used">
+            used <b>{formatBytes(cable.used)}</b>
+          </div>
         )}
       </div>
 

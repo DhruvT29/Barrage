@@ -18,6 +18,7 @@ function link(name: string, address: string, fields: Partial<LinkView> = {}): Li
     rtt_ms: 40,
     down_bps: null,
     public_ip: null,
+    metered: false,
     ...fields,
   }
 }
@@ -62,6 +63,7 @@ const LIVE: DownloadsView = {
     ],
   },
   list: [download(1, 'done'), download(2, 'downloading')],
+  used: [],
 }
 
 const hero = () => screen.getByRole('region', { name: 'Combined speed available' })
@@ -194,6 +196,7 @@ test('with nothing downloading, the hero is the combined speed available, as bef
   const ended: DownloadsView = {
     live: { bps: 0, parts: [] },
     list: [download(1, 'done'), download(2, 'failed'), download(3, 'waiting'), download(4, 'starting')],
+    used: [],
   }
   show('live', table([wifi(), eth2()], { combined: TWO }), [], { downloads: ended })
 
@@ -206,6 +209,7 @@ test('a download that stalls keeps the hero on it, at 0.0 Mbps', () => {
   const stalled: DownloadsView = {
     live: { bps: 0, parts: [] },
     list: [download(1, 'downloading'), download(2, 'downloading')],
+    used: [],
   }
   show('live', table([wifi()], { combined: TWO }), [], { downloads: stalled })
 

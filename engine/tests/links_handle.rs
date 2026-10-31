@@ -47,9 +47,19 @@ async fn usable_excludes_portal_down_and_unprobed_links() {
     let h = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(50))).unwrap();
     let mut rx = h.subscribe();
 
-    // Up, Portal and Down, in whatever order; "Slow" stays Probing.
-    for _ in 0..3 {
+    // Up and Portal, in whatever order; "Dead", never usable, is shown down
+    // without an event (BRG-16); "Slow" stays Probing.
+    for _ in 0..2 {
         next(&mut rx).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !h
+        .snapshot()
+        .iter()
+        .any(|l| l.name == "Dead" && l.state == LinkState::Down)
+    {
+        assert!(tokio::time::Instant::now() < deadline, "{:?}", h.snapshot());
+        tokio::time::sleep(ms(10)).await;
     }
     let names: Vec<_> = h.usable().into_iter().map(|l| l.name).collect();
     assert_eq!(names, ["Wi-Fi"]);

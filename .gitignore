@@ -5,6 +5,8 @@
 *.token
 .env
 .env.*
+# which local folders an assistant may read: this machine's, not the project's
+ACCESS.md
 
 # ---- Rust ----
 /engine/target/
@@ -42,4 +44,5 @@ desktop.ini
 #---- independent folders ----
 /jira
 /plans
+/designs
 

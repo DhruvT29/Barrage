@@ -1,29 +1,37 @@
 //! Downloads: one file fetched through every working link at once.
 //!
-//! Each link's workers pull the next chunk from a shared pile, fetch it with
-//! a `Range` request through their own address, and write it at its place in
-//! the file, so a faster link simply fetches more.
+//! Each link's workers are given a long part of the file each, fetch it with
+//! one `Range` request through their own address, and write it at its place
+//! in the file. One with nothing left to do takes the back of the part that
+//! would finish last, cut where the two would finish together (halved,
+//! before any speed is known), so a faster link simply fetches more, with
+//! tens of requests per download rather than hundreds.
 //!
 //! | module | role |
 //! |---|---|
 //! | `ranges` | [`Ranges`]: the bytes done (pure) |
-//! | `chunk` | [`plan`]: the chunks still to fetch (pure) |
+//! | `spans` | one connection's part of the file, and where to cut one (pure) |
+//! | `rate` | a speed that follows a change in seconds (pure) |
+//! | `schedule` | paths, and how many connections each link holds (pure) |
 //! | `name` | [`file_name`], [`free_name`]: safe names, never one taken |
 //! | `remote` | [`find`]: what one link sees at the URL; [`retry_after`] |
 //! | `disk` | the `.part`: full size at once, written at offsets, named last; the Downloads folder |
 //! | `saved` | the progress beside the `.part`, so the next engine resumes it |
-//! | `worker` | one connection: a chunk, its bytes, a report |
+//! | `worker` | one connection: its part, its bytes, a report |
 //! | `download` | one download's coordinator, the owner of its state |
 //!
 //! [`Downloads`] starts a coordinator per URL and gathers their status.
 
-pub mod chunk;
 mod disk;
 mod download;
 pub mod name;
 pub mod ranges;
+mod rate;
 pub mod remote;
 mod saved;
+mod schedule;
+mod spans;
+mod used;
 mod worker;
 
 use std::collections::HashMap;
@@ -40,11 +48,10 @@ use tokio::task::JoinHandle;
 use crate::links::LinkId;
 use crate::links::watch::LinkTable;
 
-pub use chunk::plan;
 pub use disk::downloads_folder;
 pub use name::{file_name, free_name};
 pub use ranges::Ranges;
-pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Remote, Validator, find, retry_after};
+pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Refused, Remote, Validator, find, retry_after};
 
 /// Every download the engine runs, and what each is doing. Cheap to clone:
 /// the clones share the downloads.
@@ -64,6 +71,8 @@ struct Inner {
     stopping: watch::Sender<bool>,
     /// What stopping and resuming each download needs, by id.
     controls: Mutex<HashMap<DownloadId, Control>>,
+    /// What each cable has received, every download together.
+    used: Arc<used::Usage>,
 }
 
 /// One download's way to be stopped, and started again.
@@ -141,19 +150,25 @@ impl std::error::Error for ControlError {}
 /// How downloads run. Tests shrink the times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadConfig {
-    /// Connections each link opens for one download.
-    pub workers_per_link: u32,
+    /// The most connections one download holds over every link, shared out
+    /// by what each delivers (schedule.rs).
+    pub connections: u32,
+    /// The most one link holds for one download.
+    pub most_per_link: u32,
+    /// How often each link's connections move one toward its share.
+    pub rebalance_every: Duration,
     /// How long a connection may go without data before it is given up.
     pub read_deadline: Duration,
     /// How long one link may take to find the file, redirects and all.
     pub find_deadline: Duration,
     /// How often each link's speed is measured and the status published at
-    /// the least. What a download does between, a chunk written, a link
+    /// the least. What a download does between, a piece written, a link
     /// joining, a note, is published as it happens; the live socket merges
     /// what a slow page has not read yet.
     pub publish_every: Duration,
-    /// The span a speed is measured over.
-    pub speed_window: Duration,
+    /// How quickly a measured speed follows a change: half of it within
+    /// this long (rate.rs).
+    pub speed_half_life: Duration,
     /// How long a fresh connection waits to take the place of one that
     /// failed while the rest of its link kept working.
     pub retry_connection: Duration,
@@ -167,23 +182,35 @@ pub struct DownloadConfig {
     /// How often a download's progress is saved beside its `.part`, so an
     /// engine that is killed loses no more than this much of it.
     pub save_every: Duration,
+    /// Before a connection's speed is known, the least a cut leaves each
+    /// side: a part with less than twice this left is not cut for another.
+    /// Every cut costs a request, and throws away what is on its way past it.
+    pub min_split: u64,
+    /// Once speeds are known, how much sooner a cut must bring a part's end:
+    /// a slow link's last part is cut whatever its size, and one about to
+    /// finish is left alone.
+    pub min_split_time: Duration,
 }
 
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            workers_per_link: 4,
+            connections: 16,
+            most_per_link: 8,
+            rebalance_every: Duration::from_secs(2),
             read_deadline: Duration::from_secs(8),
             // Several round trips per hop, and the tether's reached 934 ms.
             find_deadline: Duration::from_secs(20),
             publish_every: Duration::from_millis(250),
-            speed_window: Duration::from_secs(2),
+            speed_half_life: Duration::from_millis(1500),
             retry_connection: Duration::from_secs(1),
             rest_first: Duration::from_secs(5),
             rest_max: Duration::from_secs(60),
             // Cloudflare answered Retry-After: 3311 in phase 2.
             max_retry_after: Duration::from_secs(60),
             save_every: Duration::from_secs(1),
+            min_split: 512 << 10,
+            min_split_time: Duration::from_millis(500),
         }
     }
 }
@@ -238,6 +265,14 @@ pub struct DownloadStatus {
     pub note: Option<String>,
 }
 
+/// The data one cable has received for the engine's downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CableUse {
+    /// The cable's name.
+    pub cable: String,
+    pub bytes: u64,
+}
+
 /// One link's part in a download. A link that has gone keeps its share, so
 /// what it carried still shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,10 +282,13 @@ pub struct LinkShare {
     pub name: String,
     /// Bytes this link wrote to the file.
     pub bytes: u64,
-    /// Its speed over the last speed window, 0 unless downloading.
+    /// Its speed in this download (rate.rs), 0 unless downloading.
     pub bps: u64,
     /// Its connections open for this download right now.
     pub connections: u32,
+    /// The connections the download wants it to hold, by what it delivers
+    /// (schedule.rs): `connections` moves toward this one at a time.
+    pub wanted: u32,
     pub note: Option<String>,
 }
 
@@ -261,6 +299,11 @@ impl Downloads {
 
     pub fn with_config(table: LinkTable, dir: PathBuf, config: DownloadConfig) -> Self {
         let (status, _) = watch::channel(Vec::new());
+        let used = Arc::new(used::Usage::new());
+        // Outside a runtime there is no watcher either, so nothing to count.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(used::count_speed_tests(table.clone(), Arc::clone(&used)));
+        }
         Self {
             inner: Arc::new(Inner {
                 table,
@@ -270,6 +313,7 @@ impl Downloads {
                 status: Arc::new(status),
                 stopping: watch::channel(false).0,
                 controls: Mutex::new(HashMap::new()),
+                used,
             }),
         }
     }
@@ -341,6 +385,7 @@ impl Downloads {
             dir: self.inner.dir.clone(),
             config: self.inner.config.clone(),
             status: self.inner.status.clone(),
+            used: self.inner.used.clone(),
             stopping: self.inner.stopping.subscribe(),
             stop: asked,
         }));
@@ -357,6 +402,13 @@ impl Downloads {
     /// Every download's status, updated as they run.
     pub fn status(&self) -> watch::Receiver<Vec<DownloadStatus>> {
         self.inner.status.subscribe()
+    }
+
+    /// What each cable has received for every download since the engine
+    /// started, written or not, in the order cables first carried; updated
+    /// as each download publishes.
+    pub fn used(&self) -> watch::Receiver<Vec<CableUse>> {
+        self.inner.used.subscribe()
     }
 
     /// Stop download `id`: its connections stop and report what they wrote,

@@ -19,7 +19,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 40,
           "down_bps": 57600000,
-          "public_ip": "203.0.113.7"
+          "public_ip": "203.0.113.7",
+          "metered": false
         },
         {
           "id": 2,
@@ -29,7 +30,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 120,
           "down_bps": 141000000,
-          "public_ip": "203.0.113.50"
+          "public_ip": "203.0.113.50",
+          "metered": false
         },
         {
           "id": 4,
@@ -39,7 +41,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 48,
           "down_bps": null,
-          "public_ip": "203.0.113.7"
+          "public_ip": "203.0.113.7",
+          "metered": true
         },
         {
           "id": 5,
@@ -49,7 +52,8 @@ export const messages = [
           "state": "degraded",
           "rtt_ms": 300,
           "down_bps": 9400000,
-          "public_ip": "198.51.100.40"
+          "public_ip": "198.51.100.40",
+          "metered": false
         },
         {
           "id": 6,
@@ -59,7 +63,8 @@ export const messages = [
           "state": "portal",
           "rtt_ms": 60,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         },
         {
           "id": 7,
@@ -69,7 +74,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": null,
           "down_bps": null,
-          "public_ip": "203.0.113.90"
+          "public_ip": "203.0.113.90",
+          "metered": false
         },
         {
           "id": 8,
@@ -79,7 +85,8 @@ export const messages = [
           "state": "portal",
           "rtt_ms": 80,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         },
         {
           "id": 9,
@@ -89,7 +96,8 @@ export const messages = [
           "state": "probing",
           "rtt_ms": null,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         },
         {
           "id": 10,
@@ -99,7 +107,8 @@ export const messages = [
           "state": "down",
           "rtt_ms": null,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         }
       ],
       "shared": [
@@ -190,6 +199,7 @@ export const messages = [
               "bytes": 1210000000,
               "bps": 38400000,
               "connections": 4,
+              "wanted": 6,
               "notes": []
             },
             {
@@ -197,6 +207,7 @@ export const messages = [
               "bytes": 1317000000,
               "bps": 88500000,
               "connections": 8,
+              "wanted": 8,
               "notes": []
             },
             {
@@ -204,8 +215,9 @@ export const messages = [
               "bytes": 0,
               "bps": 0,
               "connections": 0,
+              "wanted": 0,
               "notes": [
-                "sits out: the server gave this cable another version of the file (\"7b1d\", not \"a3f0\")"
+                "sits out: it reaches the internet through the same connection as Wi-Fi, so using both gains nothing"
               ]
             }
           ]
@@ -225,6 +237,7 @@ export const messages = [
               "bytes": 2400000,
               "bps": 0,
               "connections": 0,
+              "wanted": 0,
               "notes": []
             }
           ]
@@ -244,6 +257,7 @@ export const messages = [
               "bytes": 0,
               "bps": 0,
               "connections": 0,
+              "wanted": 0,
               "notes": [
                 "finding https://example.com/files/gone.zip through 192.0.2.10: https://example.com/files/gone.zip answered 404 Not Found"
               ]
@@ -287,6 +301,7 @@ export const messages = [
               "bytes": 112500000,
               "bps": 0,
               "connections": 0,
+              "wanted": 0,
               "notes": []
             },
             {
@@ -294,9 +309,20 @@ export const messages = [
               "bytes": 538600000,
               "bps": 0,
               "connections": 0,
+              "wanted": 0,
               "notes": []
             }
           ]
+        }
+      ],
+      "used": [
+        {
+          "cable": "Wi-Fi",
+          "bytes": 1326100000
+        },
+        {
+          "cable": "Ethernet 2",
+          "bytes": 1858200000
         }
       ]
     }
@@ -313,7 +339,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 40,
           "down_bps": 57600000,
-          "public_ip": "203.0.113.7"
+          "public_ip": "203.0.113.7",
+          "metered": false
         },
         {
           "id": 2,
@@ -323,7 +350,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 120,
           "down_bps": 141000000,
-          "public_ip": "203.0.113.50"
+          "public_ip": "203.0.113.50",
+          "metered": false
         },
         {
           "id": 3,
@@ -333,7 +361,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 95,
           "down_bps": 141000000,
-          "public_ip": "2001:db8::20"
+          "public_ip": "2001:db8::20",
+          "metered": false
         },
         {
           "id": 4,
@@ -343,7 +372,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": 48,
           "down_bps": 41000000,
-          "public_ip": "203.0.113.7"
+          "public_ip": "203.0.113.7",
+          "metered": true
         },
         {
           "id": 5,
@@ -353,7 +383,8 @@ export const messages = [
           "state": "degraded",
           "rtt_ms": 300,
           "down_bps": 9400000,
-          "public_ip": "198.51.100.40"
+          "public_ip": "198.51.100.40",
+          "metered": false
         },
         {
           "id": 6,
@@ -363,7 +394,8 @@ export const messages = [
           "state": "portal",
           "rtt_ms": 60,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         },
         {
           "id": 7,
@@ -373,7 +405,8 @@ export const messages = [
           "state": "up",
           "rtt_ms": null,
           "down_bps": null,
-          "public_ip": "203.0.113.90"
+          "public_ip": "203.0.113.90",
+          "metered": false
         },
         {
           "id": 8,
@@ -383,7 +416,8 @@ export const messages = [
           "state": "portal",
           "rtt_ms": 80,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         },
         {
           "id": 9,
@@ -393,7 +427,8 @@ export const messages = [
           "state": "probing",
           "rtt_ms": null,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         },
         {
           "id": 10,
@@ -403,7 +438,8 @@ export const messages = [
           "state": "down",
           "rtt_ms": null,
           "down_bps": null,
-          "public_ip": null
+          "public_ip": null,
+          "metered": false
         }
       ],
       "shared": [

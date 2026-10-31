@@ -155,3 +155,52 @@ test('the contract file renders on the Downloads tab too', () => {
     }
   }
 })
+
+// The page draws these from phase 4 on; the sample must keep sending one of
+// each, or the page's handling of them is never tried against the engine.
+test('the contract carries a metered cable, a cable wanting more than it holds, and the data used', () => {
+  const tables = messages.flatMap((m) => (m.type === 'downloads' ? [] : [m.table]))
+  expect(tables.some((t) => t.links.some((l) => l.metered))).toBe(true)
+  const { list, used } = lastDownloads(messages)
+  expect(list.some((d) => d.cables.some((c) => c.wanted > c.connections))).toBe(true)
+  // Each cable that wrote has received at least what it wrote, once.
+  expect(used.length).toBe(new Set(used.map((u) => u.cable)).size)
+  for (const u of used) {
+    const wrote = list.flatMap((d) => d.cables).filter((c) => c.name === u.cable)
+    expect(u.bytes).toBeGreaterThanOrEqual(wrote.reduce((sum, c) => sum + c.bytes, 0))
+  }
+})
+
+test("the contract's cards show the metered mark, the data used, and each cable's share and wanted", () => {
+  const socket = new EngineSocket()
+  const open = () => socket as unknown as WebSocket
+  const { unmount } = render(<Page open={open} tab="links" />)
+  for (const message of messages) socket.send(JSON.stringify(message))
+  const last = messages[messages.length - 1]
+  if (last.type !== 'change') throw new Error('the contract ends with a change')
+  const { used, list } = lastDownloads(messages)
+
+  for (const name of cableNames(last.table.links)) {
+    const card = within(screen.getByRole('region', { name }))
+    const metered = last.table.links.some((l) => l.name === name && l.metered)
+    expect(card.queryByTestId('metered') !== null, `${name} metered`).toBe(metered)
+    const bytes = used.find((u) => u.cable === name)?.bytes ?? 0
+    if (bytes > 0) expect(card.getByTestId('used')).toHaveTextContent(`used ${formatBytes(bytes)}`)
+    else expect(card.queryByTestId('used'), `${name} used`).toBeNull()
+  }
+  unmount()
+
+  render(<Page open={open} tab="downloads" />)
+  for (const message of messages) socket.send(JSON.stringify(message))
+  for (const d of list.filter((d) => d.state === 'downloading')) {
+    const card = within(screen.getByRole('region', { name: d.name ?? d.url }))
+    for (const c of d.cables.filter((c) => c.connections > 0)) {
+      const row = card.getAllByTestId('cable').find((r) => within(r).getByTestId('cable-name').textContent === c.name)!
+      expect(within(row).getByTestId('cable-carrying')).toHaveTextContent(
+        `carrying ${Math.floor((c.bps * 100) / d.bps)}%`,
+      )
+      if (c.wanted !== c.connections) expect(within(row).getByTestId('cable-wants')).toHaveTextContent(`wants ${c.wanted}`)
+      else expect(within(row).queryByTestId('cable-wants')).toBeNull()
+    }
+  }
+})

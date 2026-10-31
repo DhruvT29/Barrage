@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use barrage::links::probe::{Probe, ProbeVerdict};
 use barrage::links::watch::Network;
-use barrage::links::{Addr, Candidate, LinkEvent};
+use barrage::links::{Addr, Candidate, LinkEvent, Sample};
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{Instant, timeout};
 
@@ -45,12 +45,16 @@ pub struct Fake {
     failing_samples: HashSet<IpAddr>,
     /// How long each speed test takes. Zero answers at once.
     sample_time: Duration,
+    /// What each speed test pulls through its link; none unless a test asks.
+    sample_bytes: u64,
     sampling_now: AtomicUsize,
     /// The most speed tests that were ever running at the same moment.
     pub most_at_once: AtomicUsize,
     /// Scripted speed test results and how long each takes, in order; the
     /// last repeats. Empty means `SAMPLED_BPS` after `sample_time`.
     sample_answers: Mutex<VecDeque<(u64, Duration)>>,
+    /// Speed test results by address, ahead of `sample_answers`.
+    speeds: HashMap<IpAddr, u64>,
     /// Public addresses per local address, in order; the last repeats. An
     /// address with none scripted reports itself, so no two links share.
     publics: Mutex<HashMap<IpAddr, VecDeque<Option<IpAddr>>>>,
@@ -154,8 +158,20 @@ impl Fake {
         self.sampled_through.lock().unwrap().clone()
     }
 
+    /// Every speed test pulls `bytes` through its link.
+    pub fn sample_bytes(mut self, bytes: u64) -> Self {
+        self.sample_bytes = bytes;
+        self
+    }
+
     pub fn slow_samples(mut self, each: Duration) -> Self {
         self.sample_time = each;
+        self
+    }
+
+    /// Every speed test through `ip` measures `bps`, after `sample_time`.
+    pub fn speed(mut self, ip: &str, bps: u64) -> Self {
+        self.speeds.insert(ip.parse().unwrap(), bps);
         self
     }
 
@@ -260,16 +276,20 @@ impl Network for Fake {
         &self,
         addr: IpAddr,
         _budget: Duration,
-    ) -> impl Future<Output = anyhow::Result<u64>> + Send {
+    ) -> impl Future<Output = anyhow::Result<Sample>> + Send {
         self.samples.fetch_add(1, Ordering::SeqCst);
         self.sampled_through.lock().unwrap().push(addr);
         let fail = self.failing_samples.contains(&addr);
-        let (bps, takes) = {
-            let mut answers = self.sample_answers.lock().unwrap();
-            match answers.len() {
-                0 => (SAMPLED_BPS, self.sample_time),
-                1 => *answers.front().unwrap(),
-                _ => answers.pop_front().unwrap(),
+        let bytes = self.sample_bytes;
+        let (bps, takes) = match self.speeds.get(&addr) {
+            Some(&bps) => (bps, self.sample_time),
+            None => {
+                let mut answers = self.sample_answers.lock().unwrap();
+                match answers.len() {
+                    0 => (SAMPLED_BPS, self.sample_time),
+                    1 => *answers.front().unwrap(),
+                    _ => answers.pop_front().unwrap(),
+                }
             }
         };
         async move {
@@ -281,7 +301,7 @@ impl Network for Fake {
             if fail {
                 anyhow::bail!("scripted speed test failure");
             }
-            Ok(bps)
+            Ok(Sample { bps, bytes })
         }
     }
 
@@ -315,6 +335,7 @@ pub fn cand_idx(os_index: u32, name: &str, ip: &str, up: bool) -> Candidate {
         name: name.to_string(),
         addr: Addr::from(ip.parse::<IpAddr>().unwrap()),
         up,
+        metered: false,
     }
 }
 

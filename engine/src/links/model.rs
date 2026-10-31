@@ -96,6 +96,9 @@ pub struct Candidate {
     /// Whether the OS reports the interface as up. Necessary but nowhere near
     /// sufficient.
     pub up: bool,
+    /// Whether Windows says the connection the interface is on now is
+    /// metered: its connection profile's cost (`enumerate`).
+    pub metered: bool,
 }
 
 /// What we currently believe about a link.
@@ -152,6 +155,9 @@ pub struct Link {
     /// 2.5 GB of mobile data in six test runs, which is the whole argument for
     /// carrying this flag from the start.
     pub metered: bool,
+    /// The bytes the speed tests run through this address have pulled,
+    /// since it appeared: data used, though no download's.
+    pub tested: u64,
 }
 
 /// A change in the link table, emitted by the watcher.

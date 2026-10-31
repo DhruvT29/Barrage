@@ -270,7 +270,10 @@ fn controlled(id: DownloadId, done: Result<(), ControlError>) -> Response {
 }
 
 async fn list_downloads(State(downloads): State<Downloads>) -> Json<DownloadsView> {
-    Json(downloads_view(&downloads.status().borrow()))
+    Json(downloads_view(
+        &downloads.status().borrow(),
+        &downloads.used().borrow(),
+    ))
 }
 
 fn guarded(router: Router) -> Router {

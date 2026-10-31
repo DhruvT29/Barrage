@@ -87,6 +87,7 @@ async fn a_portal_that_is_logged_into_becomes_up_on_a_later_probe() {
     assert_eq!(next(&mut rx).await, LinkEvent::Up(id));
 }
 
+/// It is shown as down, but sends no `Down`: nobody saw it usable (BRG-16).
 #[tokio::test]
 async fn a_link_that_fails_its_probe_is_down_and_never_up() {
     let net = Fake::scripted(vec![vec![cand("Dead", "192.0.2.40", true)]])
@@ -95,8 +96,11 @@ async fn a_link_that_fails_its_probe_is_down_and_never_up() {
     config.retry = ms(100);
     let (_h, mut rx, table) = spawn_watcher(Arc::new(net), config);
 
-    assert!(matches!(next(&mut rx).await, LinkEvent::Down(_)));
-    assert_eq!(table.snapshot()[0].state, LinkState::Down);
+    wait_for("Down", || {
+        (table.snapshot().first()?.state == LinkState::Down).then_some(())
+    })
+    .await;
+    assert!(drain_for(&mut rx, ms(200)).await.is_empty());
 }
 
 /// Review Focus 3, at the level of the loop. A probe that never answers must
@@ -116,10 +120,13 @@ async fn a_hanging_probe_holds_up_nothing_and_is_given_up_on() {
         matches!(next(&mut rx).await, LinkEvent::Up(_)),
         "B was held up"
     );
-    assert!(
-        matches!(next(&mut rx).await, LinkEvent::Down(_)),
-        "A never timed out"
-    );
+    // A, never judged, is shown down without a `Down` (BRG-16).
+    wait_for("A to time out", || {
+        let links = table.snapshot();
+        let stuck = links.iter().find(|l| l.name == "Stuck")?;
+        (stuck.state == LinkState::Down).then_some(())
+    })
+    .await;
     let states: Vec<_> = table
         .snapshot()
         .iter()
@@ -195,9 +202,12 @@ async fn a_dead_link_is_probed_at_the_normal_pace_once_confirmed() {
     let mut config = WatchConfig::every(ms(50));
     config.retry = ms(50);
     config.reprobe = ms(500);
-    let (_h, mut rx, _t) = spawn_watcher(net.clone(), config);
+    let (_h, _rx, table) = spawn_watcher(net.clone(), config);
 
-    assert!(matches!(next(&mut rx).await, LinkEvent::Down(_)));
+    wait_for("Down", || {
+        (table.snapshot().first()?.state == LinkState::Down).then_some(())
+    })
+    .await;
     tokio::time::sleep(ms(1200)).await;
     // Two to confirm, then one per 500 ms. Retrying every 50 ms would be ~26.
     let probes = net.probes.load(Ordering::SeqCst);
@@ -439,6 +449,53 @@ async fn a_reused_os_index_does_not_inherit_the_old_links_measurements() {
     )
     .await;
     assert_eq!(after.name, "Dock Ethernet");
+}
+
+/// Windows saying a link's connection is metered changes that link in
+/// place: the same id, no Down or Up, and the table shows it.
+#[tokio::test]
+async fn a_link_turning_metered_keeps_its_id() {
+    let plain = cand("Ethernet 3", "192.0.2.40", true);
+    let metered = Candidate {
+        metered: true,
+        ..plain.clone()
+    };
+    let mut steps = vec![vec![plain]; 5];
+    steps.push(vec![metered]);
+    let net = Arc::new(Fake::scripted(steps));
+    let (_h, mut rx, table) = spawn_watcher(net, WatchConfig::every(ms(20)));
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    let link = wait_for("the link to show as metered", || {
+        table.snapshot().into_iter().find(|l| l.metered)
+    })
+    .await;
+    assert_eq!(link.id, id);
+    assert_eq!(link.state, LinkState::Up);
+    assert_eq!(table.snapshot().len(), 1);
+    assert_eq!(drain_for(&mut rx, ms(200)).await, []);
+}
+
+/// A link on a metered connection when it first appears is metered from
+/// its first table: one poll only, so no later poll can correct it.
+#[tokio::test]
+async fn a_link_metered_from_the_start_shows_it_at_once() {
+    let metered = Candidate {
+        metered: true,
+        ..cand("Ethernet 3", "192.0.2.40", true)
+    };
+    let net = Arc::new(Fake::scripted(vec![vec![metered]]));
+    let (_h, mut rx, table) = spawn_watcher(net, WatchConfig::every(Duration::from_secs(10)));
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    let links = table.snapshot();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].id, id);
+    assert!(links[0].metered, "{links:?}");
 }
 
 fn ip(s: &str) -> IpAddr {
@@ -710,7 +767,8 @@ async fn a_link_that_stops_working_shows_no_speed_or_public_address() {
         (LinkState::Down, None, None)
     );
 
-    assert_eq!(next(&mut rx).await, LinkEvent::Up(id));
+    // Back from down: degraded, and usable, so its figures return.
+    assert_eq!(next(&mut rx).await, LinkEvent::Degraded(id));
     let back = wait_for("the figures to return", || {
         let link = table.snapshot().remove(0);
         (link.down_bps.is_some() && link.public_ip.is_some()).then_some(link)
@@ -798,4 +856,199 @@ async fn a_public_lookup_from_before_a_switch_is_not_applied() {
     })
     .await;
     assert_eq!(public, ip("198.51.100.99"));
+}
+
+/// Probed every 50 ms, a failure retried after 50 ms, trusted after 300 ms
+/// of answering.
+fn cooling() -> WatchConfig {
+    WatchConfig {
+        reprobe: ms(50),
+        retry: ms(50),
+        cooldown: ms(300),
+        ..WatchConfig::every(ms(20))
+    }
+}
+
+/// PLAN.md 3.5: a recovered link is not trusted at once.
+#[tokio::test]
+async fn a_link_back_from_down_is_degraded_until_its_cooldown_ends() {
+    use ProbeVerdict::{Broken, Working};
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .verdicts("192.0.2.10", &[Working, Broken, Broken, Working]);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), cooling());
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(id));
+    assert_eq!(next(&mut rx).await, LinkEvent::Degraded(id));
+    let degraded = Instant::now();
+    assert_eq!(table.snapshot()[0].state, LinkState::Degraded);
+    assert_eq!(next(&mut rx).await, LinkEvent::Up(id));
+    let waited = degraded.elapsed();
+    assert!(waited >= ms(250), "trusted after {waited:?}");
+    assert_eq!(table.snapshot()[0].state, LinkState::Up);
+}
+
+/// One failure while degraded (100 ms in) is not two in a row, so the link
+/// stays degraded, but its cooldown starts again: up no sooner than 300 ms
+/// after the failure, not 300 ms after it came back.
+#[tokio::test]
+async fn a_failed_probe_during_the_cooldown_starts_it_again() {
+    use ProbeVerdict::{Broken, Working};
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]]).verdicts(
+        "192.0.2.10",
+        &[Working, Broken, Broken, Working, Working, Broken, Working],
+    );
+    let (_h, mut rx, _t) = spawn_watcher(Arc::new(net), cooling());
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(id));
+    assert_eq!(next(&mut rx).await, LinkEvent::Degraded(id));
+    let degraded = Instant::now();
+    assert_eq!(next(&mut rx).await, LinkEvent::Up(id));
+    let waited = degraded.elapsed();
+    assert!(waited >= ms(380), "trusted after {waited:?}");
+}
+
+/// Kept, not dropped and fetched again at each probe: the address is looked
+/// up once when the link first works and once when it is back from down.
+#[tokio::test]
+async fn a_degraded_link_keeps_its_speed_and_public_address() {
+    use ProbeVerdict::{Broken, Working};
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .verdicts(
+            "192.0.2.10",
+            &[Working, Broken, Broken, Working, Broken, Working],
+        )
+        .public("192.0.2.10", &[Some("203.0.113.7")]);
+    let config = WatchConfig {
+        cooldown: Duration::from_secs(10),
+        ..cooling()
+    };
+    let net = Arc::new(net);
+    let (_h, mut rx, table) = spawn_watcher(net.clone(), config);
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(id));
+    assert_eq!(next(&mut rx).await, LinkEvent::Degraded(id));
+    let figures = || {
+        let link = table.snapshot().into_iter().next()?;
+        (link.state == LinkState::Degraded && link.down_bps.is_some() && link.public_ip.is_some())
+            .then_some(link)
+    };
+    let link = wait_for("a degraded link with its figures", figures).await;
+    assert_eq!(link.down_bps, Some(SAMPLED_BPS));
+    assert_eq!(link.public_ip, Some(ip("203.0.113.7")));
+    // Through the one failure while degraded, and the probes after.
+    tokio::time::sleep(ms(300)).await;
+    assert!(figures().is_some(), "{:?}", table.snapshot());
+    assert_eq!(net.lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(samples(&net), 1, "the cable was tested again");
+}
+
+#[tokio::test]
+async fn a_new_link_and_a_portal_logged_into_go_straight_up() {
+    use ProbeVerdict::{Portal, Working};
+    let net = Fake::scripted(vec![vec![
+        cand("Wi-Fi", "192.0.2.10", true),
+        cand("Hotel", "192.0.2.30", true),
+    ]])
+    .verdicts("192.0.2.30", &[Portal, Working]);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), cooling());
+
+    let seen = drain_for(&mut rx, ms(400)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e, LinkEvent::Degraded(_))),
+        "{seen:?}"
+    );
+    let ups = seen
+        .iter()
+        .filter(|e| matches!(e, LinkEvent::Up(_)))
+        .count();
+    assert_eq!(ups, 2, "{seen:?}");
+    assert!(table.snapshot().iter().all(|l| l.state == LinkState::Up));
+}
+
+/// BRG-16: a link that never answered was never usable, so nobody is told it
+/// went down, just as a link that disappears unjudged sends nothing.
+#[tokio::test]
+async fn a_link_that_never_worked_sends_no_down() {
+    let net = Fake::scripted(vec![vec![cand("Dead", "192.0.2.40", true)]])
+        .verdicts("192.0.2.40", &[ProbeVerdict::Broken]);
+    let (_h, mut rx, table) = spawn_watcher(Arc::new(net), cooling());
+
+    let seen = drain_for(&mut rx, ms(400)).await;
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(table.snapshot()[0].state, LinkState::Down);
+}
+
+/// Tethering turned off and on: the interface leaves and comes back within
+/// its cooldown, as a new link, and is not trusted at once either.
+#[tokio::test]
+async fn a_cable_back_within_its_cooldown_is_degraded() {
+    let on = vec![cand("Ethernet 2", "192.0.2.20", true)];
+    let net = Fake::scripted(vec![on.clone(), on.clone(), on.clone(), vec![], on]);
+    let (_h, mut rx, _t) = spawn_watcher(Arc::new(net), cooling());
+
+    let LinkEvent::Up(first) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(first));
+    let LinkEvent::Degraded(back) = next(&mut rx).await else {
+        panic!("expected Degraded on its return");
+    };
+    assert_ne!(back, first);
+    assert_eq!(next(&mut rx).await, LinkEvent::Up(back));
+}
+
+/// Back after longer than its cooldown: a cable plugged in again, trusted at
+/// once as a new one is.
+#[tokio::test]
+async fn a_cable_back_after_its_cooldown_goes_straight_up() {
+    let on = vec![cand("Ethernet 2", "192.0.2.20", true)];
+    let mut steps = vec![on.clone(); 3];
+    steps.extend(vec![vec![]; 25]);
+    steps.push(on);
+    let net = Fake::scripted(steps);
+    let config = WatchConfig {
+        cooldown: ms(100),
+        ..cooling()
+    };
+    let (_h, mut rx, _t) = spawn_watcher(Arc::new(net), config);
+
+    let LinkEvent::Up(first) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(first));
+    let back = next(&mut rx).await;
+    assert!(matches!(back, LinkEvent::Up(id) if id != first), "{back:?}");
+}
+
+/// A degraded link is probed again when its cooldown ends, so it is trusted
+/// then, not at the next reprobe after it (1 s here).
+#[tokio::test]
+async fn a_degraded_link_is_trusted_when_its_cooldown_ends() {
+    use ProbeVerdict::{Broken, Working};
+    let net = Fake::scripted(vec![vec![cand("Wi-Fi", "192.0.2.10", true)]])
+        .verdicts("192.0.2.10", &[Working, Broken, Broken, Working]);
+    let config = WatchConfig {
+        reprobe: Duration::from_secs(1),
+        ..cooling()
+    };
+    let (_h, mut rx, _t) = spawn_watcher(Arc::new(net), config);
+
+    let LinkEvent::Up(id) = next(&mut rx).await else {
+        panic!("expected Up first");
+    };
+    assert_eq!(next(&mut rx).await, LinkEvent::Down(id));
+    assert_eq!(next(&mut rx).await, LinkEvent::Degraded(id));
+    let degraded = Instant::now();
+    assert_eq!(next(&mut rx).await, LinkEvent::Up(id));
+    let waited = degraded.elapsed();
+    assert!(waited < ms(800), "trusted after {waited:?}");
 }

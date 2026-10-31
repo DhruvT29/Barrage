@@ -5,7 +5,8 @@ import type { CableShare, DownloadState, DownloadView } from '../api/types'
 import { DownloadCard } from './DownloadCard'
 
 function cable(name: string, fields: Partial<CableShare> = {}): CableShare {
-  return { name, bytes: 0, bps: 0, connections: 0, notes: [], ...fields }
+  // Wanting what it holds, unless the test says otherwise.
+  return { name, bytes: 0, bps: 0, connections: 0, notes: [], ...fields, wanted: fields.wanted ?? fields.connections ?? 0 }
 }
 
 function download(fields: Partial<DownloadView> = {}): DownloadView {
@@ -32,7 +33,8 @@ function cells(row: HTMLElement) {
     name: text('cable-name'),
     bytes: text('cable-bytes'),
     speed: text('cable-speed'),
-    connections: text('cable-connections'),
+    // No detail line while a cable takes no part: its connections read empty.
+    connections: within(row).queryByTestId('cable-connections')?.textContent ?? '',
     notes: within(row)
       .queryAllByTestId('cable-note')
       .map((n) => n.textContent),
@@ -353,4 +355,72 @@ test('a stopped download keeps what it got on screen, with the note, and no spee
     { name: 'Wi-Fi', bytes: '300.0 MB', speed: '', connections: '', notes: [] },
     { name: 'Ethernet 2', bytes: '900.0 MB', speed: '', connections: '', notes: [] },
   ])
+})
+
+/** The second line of each cable's row, by cable. */
+function details(c: HTMLElement) {
+  return within(c)
+    .getAllByTestId('cable')
+    .map((row) => [
+      within(row).getByTestId('cable-name').textContent,
+      within(row).queryByTestId('cable-carrying')?.textContent ?? null,
+      within(row).queryByTestId('cable-wants')?.textContent ?? null,
+    ])
+}
+
+test("while downloading, each cable's share of the speed, rounded down, and what it is wanted when that differs", () => {
+  render(
+    <DownloadCard
+      download={download({
+        bps: 126_900_000,
+        cables: [
+          cable('Wi-Fi', { bytes: 1_210_000_000, bps: 38_400_000, connections: 4, wanted: 6 }),
+          // 69.74%: rounded down, 69.
+          cable('Ethernet 2', { bytes: 1_317_000_000, bps: 88_500_000, connections: 8, wanted: 8 }),
+          cable('Ethernet 3', { notes: [SITS_OUT] }),
+        ],
+      })}
+    />,
+  )
+  expect(details(card())).toEqual([
+    ['Wi-Fi', 'carrying 30%', 'wants 6'],
+    ['Ethernet 2', 'carrying 69%', null],
+    ['Ethernet 3', null, null],
+  ])
+  // The connections read as before, the wanted after them.
+  const wifi = within(card()).getAllByTestId('cable')[0]
+  expect(within(wifi).getByTestId('cable-connections')).toHaveTextContent(/^4 connections$/)
+  expect(within(wifi).getByTestId('cable-detail')).toHaveTextContent(/^carrying 30% · 4 connections, wants 6$/)
+})
+
+test('fewer wanted than held shows too, and a cable holding none yet that is wanted some', () => {
+  render(
+    <DownloadCard
+      download={download({
+        cables: [
+          cable('Wi-Fi', { bytes: 1, bps: 1_000_000, connections: 4, wanted: 2 }),
+          cable('Ethernet 2', { bytes: 0, bps: 0, connections: 0, wanted: 3 }),
+        ],
+      })}
+    />,
+  )
+  expect(details(card()).map((d) => d[2])).toEqual(['wants 2', 'wants 3'])
+})
+
+test('no share of the speed and no wanted once a download is not downloading', () => {
+  for (const state of ['done', 'stopped', 'failed', 'waiting', 'starting'] as const) {
+    const { unmount } = render(
+      <DownloadCard
+        download={download({
+          state,
+          bps: 0,
+          cables: [cable('Wi-Fi', { bytes: 300_000_000, bps: 0, connections: 0, wanted: 4 })],
+        })}
+      />,
+    )
+    expect(details(card()), state).toEqual([['Wi-Fi', null, null]])
+    // No empty detail line under the row either.
+    expect(within(card()).queryByTestId('cable-detail'), state).toBeNull()
+    unmount()
+  }
 })

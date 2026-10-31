@@ -48,7 +48,7 @@ fn downloads_in(table: &LinkTable, dir: &Path) -> Downloads {
         read_deadline: Duration::from_secs(5),
         find_deadline: Duration::from_secs(5),
         publish_every: ms(20),
-        speed_window: ms(200),
+        speed_half_life: ms(500),
         ..DownloadConfig::default()
     };
     Downloads::with_config(table.clone(), dir.to_path_buf(), config)
@@ -171,7 +171,7 @@ async fn live_sends_the_table_then_the_downloads_then_each_change() {
     assert_eq!(table["table"]["links"], json!([]));
     assert_eq!(
         downloads["downloads"],
-        json!({ "live": { "bps": 0, "parts": [] }, "list": [] })
+        json!({ "live": { "bps": 0, "parts": [] }, "list": [], "used": [] })
     );
 
     let change = frame(&mut socket).await;
@@ -752,6 +752,11 @@ async fn a_posted_url_is_listed_and_streamed() {
         content(0..SONG)
     );
 
+    // What the cable received, written or not: at least the file.
+    let used = &done["downloads"]["used"];
+    assert_eq!(used[0]["cable"], "Wi-Fi", "{used}");
+    assert!(used[0]["bytes"].as_u64() >= Some(SONG), "{used}");
+
     // Once done, the same URL starts again, as a second copy.
     assert_eq!(
         post(addr, json!({ "url": url })).await,
@@ -1128,4 +1133,34 @@ async fn a_download_that_does_not_move_sends_nothing_new() {
     .await;
     let next = timeout(ms(500), socket.next()).await;
     assert!(next.is_err(), "sent though nothing changed: {next:?}");
+}
+
+/// The data used reaches a page that is open while it grows, and the list
+/// carries it too.
+#[tokio::test]
+async fn the_data_used_reaches_an_open_page() {
+    let files = Server::start().await;
+    files.at("/song.flac", Answer::File(File::new(SONG).rate(1 << 20)));
+    let h = wifi_to_the_file_server();
+    let dir = Folder::new("used");
+    let addr = serve_with(h.table(), downloads_in(&h.table(), &dir.0)).await;
+    let mut socket = connect(addr).await;
+    let (_, before) = opening(&mut socket).await;
+    assert_eq!(before["downloads"]["used"], json!([]));
+
+    let url = files.url("/song.flac").to_string();
+    assert_eq!(post(addr, json!({ "url": url })).await.0, 201);
+    let part = frame_where(&mut socket, "part of the song used", |f| {
+        let bytes = f["downloads"]["used"][0]["bytes"].as_u64().unwrap_or(0);
+        bytes > 0 && bytes < SONG
+    })
+    .await;
+    assert_eq!(part["downloads"]["used"][0]["cable"], "Wi-Fi");
+    frame_where(&mut socket, "the whole song used", |f| {
+        f["downloads"]["used"][0]["bytes"].as_u64() >= Some(SONG)
+    })
+    .await;
+    let list = listed(addr).await;
+    assert_eq!(list["used"][0]["cable"], "Wi-Fi", "{list}");
+    assert!(list["used"][0]["bytes"].as_u64() >= Some(SONG), "{list}");
 }

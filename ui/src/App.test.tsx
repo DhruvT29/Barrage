@@ -18,6 +18,7 @@ vi.mock('./api/useLive', () => ({
           rtt_ms: 40,
           down_bps: 57_600_000,
           public_ip: '203.0.113.7',
+          metered: false,
         },
       ],
       shared: [],
@@ -25,7 +26,7 @@ vi.mock('./api/useLive', () => ({
       combined: { bps: 57_600_000, parts: [{ name: 'Wi-Fi', bps: 57_600_000, shared_with: [] }], not_counted: [] },
     },
     feed: [],
-    downloads: { live: { bps: 0, parts: [] }, list: [] },
+    downloads: { live: { bps: 0, parts: [] }, list: [], used: [] },
   }),
 }))
 

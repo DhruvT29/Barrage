@@ -15,6 +15,7 @@ function link(address: string, fields: Partial<LinkView> = {}): LinkView {
     rtt_ms: 40,
     down_bps: 57_600_000,
     public_ip: '203.0.113.7',
+    metered: false,
     ...fields,
   }
 }
@@ -27,6 +28,8 @@ function cable(fields: Partial<Cable> = {}): Cable {
     rttMs: 40,
     downBps: 57_600_000,
     sharedWith: [],
+    metered: false,
+    used: 0,
     ...fields,
   }
 }
@@ -131,4 +134,30 @@ test('a cable on its own says nothing about sharing', () => {
   render(<LinkCard cable={cable()} fastestBps={57_600_000} />)
   expect(within(card()).queryByTestId('shared')).toBeNull()
   expect(card().textContent).not.toMatch(/shared/)
+})
+
+test('a metered cable says so beside its state, in words and a mark', () => {
+  render(<LinkCard cable={cable({ metered: true })} fastestBps={57_600_000} />)
+  const metered = within(card()).getByTestId('metered')
+  expect(metered).toHaveTextContent(/^metered$/)
+  expect(metered.querySelector('svg')).not.toBeNull()
+  // Beside the state, not somewhere else on the card.
+  expect(metered.closest('.state')).toBe(within(card()).getByTestId('state').closest('.state'))
+})
+
+test('a cable Windows does not call metered has no mark and no word', () => {
+  render(<LinkCard cable={cable()} fastestBps={57_600_000} />)
+  expect(within(card()).queryByTestId('metered')).toBeNull()
+  expect(card().textContent).not.toMatch(/metered/)
+})
+
+test('the data used shows once the cable has carried, in the page\'s sizes', () => {
+  render(<LinkCard cable={cable({ used: 1_326_100_000 })} fastestBps={57_600_000} />)
+  expect(within(card()).getByTestId('used')).toHaveTextContent(/^used 1\.3 GB$/)
+})
+
+test('a cable that has carried nothing shows no data used', () => {
+  render(<LinkCard cable={cable({ used: 0 })} fastestBps={57_600_000} />)
+  expect(within(card()).queryByTestId('used')).toBeNull()
+  expect(card().textContent).not.toMatch(/used/)
 })

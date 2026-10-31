@@ -1,5 +1,5 @@
 import type { FeedLine, Status } from '../api/useLive'
-import type { DownloadsView, TableView } from '../api/types'
+import type { DownloadsView, TableView, UseView } from '../api/types'
 import { Downloads } from '../downloads/Downloads'
 import { TABS, type Tab } from '../tabs'
 import { ActivityFeed } from './ActivityFeed'
@@ -52,7 +52,9 @@ export function Dashboard({
         {tab === 'downloads' ? (
           <Downloads downloads={downloads} />
         ) : (
-          <main className="links">{table ? <Links table={table} /> : <Waiting status={status} />}</main>
+          <main className="links">
+            {table ? <Links table={table} used={downloads?.used ?? []} /> : <Waiting status={status} />}
+          </main>
         )}
         <ActivityFeed feed={feed} />
       </div>
@@ -60,8 +62,8 @@ export function Dashboard({
   )
 }
 
-function Links({ table }: { table: TableView }) {
-  const all = cables(table)
+function Links({ table, used }: { table: TableView; used: UseView[] }) {
+  const all = cables(table, used)
   if (all.length === 0) {
     return (
       <p className="quiet wide">

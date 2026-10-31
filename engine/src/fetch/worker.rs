@@ -1,21 +1,28 @@
-//! One connection of one link: take a chunk from the pile, fetch it with a
-//! `Range` request, write it at its place in the file, and say how it went.
+//! One connection of one link: wait for the coordinator to give it a part of
+//! the file, fetch all of it with one `Range` request, write it at its place
+//! in the file, and say how it went.
 //!
 //! A worker keeps only its own client and the counter its link's workers
-//! share. Everything else belongs to the download's coordinator, which hears
-//! from it by message (PLAN.md section 3.5).
+//! share. Its claim on the file (`spans.rs`) is the one thing it shares with
+//! the download's coordinator, which hands claims out and may cut one short
+//! for another connection; everything else the coordinator hears by message
+//! (PLAN.md section 3.5).
 //!
 //! ONLY THE BYTES ASKED FOR, OF THE VERSION ASKED FOR
 //!
 //! Every piece is asked for with `If-Range` and the link's validator, so a
 //! server whose file has changed answers with the whole new file (200)
 //! rather than a piece of it. A piece must be a 206 for the file's own
-//! length, starting where the chunk starts. Past the chunk's end nothing is
-//! written, however long the answer runs. An answer that ends short,
-//! cleanly or not, leaves its bytes written and the rest of the chunk for
-//! the pile, so no byte is asked for twice. A 200, or another length, means
-//! the file is no longer the one being fetched: the download stops rather
-//! than stitch two versions together.
+//! length, starting where the claim's unwritten part starts. Past the
+//! claim's end nothing is written, however long the answer runs, and the end
+//! is read again before each write, since a cut moves it: the worker then
+//! stops there and drops the answer. Each write is reserved on the claim
+//! first, so a cut never takes bytes on their way to the file. An answer
+//! that ends cleanly but short leaves its bytes written and asks again for
+//! the rest; one that breaks leaves the rest for the coordinator to hand
+//! out, so no byte is asked for twice. A 200, or another length, means the
+//! file is no longer the one being fetched: the download stops rather than
+//! stitch two versions together.
 //!
 //! A server that sends no pieces gets one worker that fetches the whole
 //! file with a plain `GET`, from the first byte to the last.
@@ -42,8 +49,8 @@
 use std::fs::File;
 use std::net::IpAddr;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use reqwest::header::{CONTENT_RANGE, IF_RANGE, RANGE, RETRY_AFTER};
@@ -53,6 +60,8 @@ use tokio::time::Instant;
 
 use super::disk::write_all_at;
 use super::remote::{Validator, content_range, retry_after};
+use super::spans::Hand;
+use super::used::Counter;
 use super::wait_words;
 use crate::links::{LinkId, bind};
 
@@ -68,9 +77,10 @@ pub(crate) struct Worker {
     pub heard: Arc<AtomicU64>,
     /// What `heard` is measured from.
     pub epoch: Instant,
-    /// What this worker has written of the chunk it is on, from the chunk's
-    /// start, so progress saved between its reports has it too.
-    pub doing: Arc<Mutex<Option<Range<u64>>>>,
+    /// This worker's claim on the file, which the coordinator hands out and
+    /// may cut; what it has written of it is there too, so progress saved
+    /// between its reports has it.
+    pub hand: Arc<Hand>,
     /// The link's address. The worker binds its own client to it.
     pub local: IpAddr,
     /// The file as this link found it, after its redirects.
@@ -81,12 +91,14 @@ pub(crate) struct Worker {
     pub reports: mpsc::UnboundedSender<Report>,
     /// Bytes this link's workers have written to the file.
     pub written: Arc<AtomicU64>,
+    /// What its cable has received, written or not, every download together.
+    pub used: Arc<Counter>,
     /// Becomes true when the link must stop.
     pub stop: watch::Receiver<bool>,
     pub read_deadline: Duration,
 }
 
-/// What became of one chunk, or of the whole file.
+/// What became of one claim, or of the whole file.
 #[derive(Debug)]
 pub(crate) struct Report {
     pub link: LinkId,
@@ -128,7 +140,7 @@ pub(crate) enum Outcome {
     Disk(String),
 }
 
-/// Why a worker ended without a chunk to report.
+/// Why a worker ended without a claim to report.
 pub(crate) type Exit = Option<String>;
 
 /// Now, as a worker's `heard` holds it: milliseconds since `epoch`, plus one,
@@ -144,8 +156,9 @@ enum Wait<T> {
 }
 
 impl Worker {
-    /// Take chunks of a file `length` bytes long from `pile` until it closes.
-    pub(crate) async fn run(mut self, pile: flume::Receiver<Range<u64>>, length: u64) -> Exit {
+    /// Fetch the parts of a file `length` bytes long the coordinator gives
+    /// this worker, until it is told to stop.
+    pub(crate) async fn run(mut self, length: u64) -> Exit {
         // Its own client: never shared, so no connection is reused by
         // another worker, let alone another link (PLAN.md item 9).
         let client = match bind::client(self.local, self.url.as_str()).await {
@@ -153,18 +166,35 @@ impl Worker {
             Err(e) => return Some(format!("{e:#}")),
         };
         loop {
-            let range = tokio::select! {
-                next = pile.recv_async() => match next {
-                    Ok(range) => range,
-                    // The pile is closed: the download is over.
-                    Err(_) => return None,
-                },
-                () = stopped(&mut self.stop) => return None,
-            };
+            // Told to stop while it waited: nothing to report.
+            let range = self.next().await?;
             let (written, outcome) = self.piece(&client, &range, length).await;
             let carry_on = matches!(outcome, Outcome::Done | Outcome::Short);
             if !self.report(range, written, outcome) || !carry_on {
                 return None;
+            }
+        }
+    }
+
+    /// What to ask for next: what its claim has not written yet, once the
+    /// coordinator has given it one. `None` once the link is told to stop,
+    /// or this connection to retire.
+    async fn next(&mut self) -> Option<Range<u64>> {
+        let hand = self.hand.clone();
+        loop {
+            if hand.retire.load(Ordering::SeqCst) {
+                return None;
+            }
+            let left = {
+                let claim = hand.claim.lock().unwrap();
+                (!claim.is_done()).then_some(claim.reserved..claim.end)
+            };
+            if left.is_some() {
+                return left;
+            }
+            tokio::select! {
+                () = hand.ready.notified() => {}
+                () = stopped(&mut self.stop) => return None,
             }
         }
     }
@@ -192,12 +222,13 @@ impl Worker {
         self.reports.send(report).is_ok()
     }
 
-    /// Fetch `range` of a file `length` bytes long and write what arrives of
-    /// it: how many bytes from its start were written, and how it ended.
+    /// Fetch `range` of a file `length` bytes long, the rest of its claim,
+    /// and write what arrives of it up to the claim's end, wherever a cut
+    /// has moved it: how many bytes from its start were written, and how it
+    /// ended.
     async fn piece(&mut self, client: &Client, range: &Range<u64>, length: u64) -> (u64, Outcome) {
-        *self.doing.lock().unwrap() = Some(range.start..range.start);
         let asked = format!("bytes={}-{}", range.start, range.end - 1);
-        let mut request = client.get(self.url.clone()).header(RANGE, asked);
+        let mut request = client.get(self.url.clone()).header(RANGE, &asked);
         if let Some(validator) = &self.validator {
             request = request.header(IF_RANGE, validator.value());
         }
@@ -207,17 +238,24 @@ impl Worker {
             Wait::TimedOut => return (0, self.no_answer()),
             Wait::Stopped => return (0, Outcome::Stopped),
         };
+        // One line a request, so a log shows how often a server was asked.
+        // tools/phase4-acceptance.ps1 counts these words and fields.
+        tracing::debug!(
+            link = self.link.as_u64(),
+            seat = self.seat,
+            range = %asked,
+            status = %response.status(),
+            "asked for a part of the file"
+        );
         let validated = self.validator.is_some();
         let answer_end = match answer_end(&response, range, length, validated) {
             Ok(end) => end,
             Err(outcome) => return (0, outcome),
         };
-        let (written, ended) = self
-            .copy(response, range.start, answer_end.min(range.end))
-            .await;
+        let (written, ended) = self.copy(response, range.start, answer_end).await;
         let outcome = match ended {
             Some(outcome) => outcome,
-            None if written == range.end - range.start => Outcome::Done,
+            None if self.hand.claim.lock().unwrap().is_done() => Outcome::Done,
             None if written > 0 => Outcome::Short,
             None => Outcome::Failed("the answer ended before any of the piece arrived".into()),
         };
@@ -249,14 +287,16 @@ impl Worker {
         (written, outcome)
     }
 
-    /// Write the answer's bytes at `from` onward, up to `stop_at`: how many
-    /// were written, and the outcome if anything but the answer's end or
-    /// `stop_at` ended it.
+    /// Write the answer's bytes at `from` onward, up to `answer_end` or the
+    /// claim's end, whichever comes first, read again as each piece arrives
+    /// since a cut moves it: how many were written, and the outcome if
+    /// anything but reaching one of those ends, or the answer's own, ended
+    /// it.
     async fn copy(
         &mut self,
         mut response: Response,
         from: u64,
-        stop_at: u64,
+        answer_end: u64,
     ) -> (u64, Option<Outcome>) {
         let mut at = from;
         let mut gathered: Vec<u8> = Vec::with_capacity(WRITE_PIECE);
@@ -264,6 +304,12 @@ impl Worker {
             let piece = match self.within(response.chunk()).await {
                 Wait::Got(Ok(Some(piece))) => {
                     self.heard.store(stamp(self.epoch), Ordering::SeqCst);
+                    self.hand
+                        .got
+                        .fetch_add(piece.len() as u64, Ordering::SeqCst);
+                    // Counted as it arrives: what lies past a cut or the
+                    // claim's end is dropped below, but came down the cable.
+                    self.used.add(piece.len() as u64);
                     piece
                 }
                 Wait::Got(Ok(None)) => break None,
@@ -273,43 +319,47 @@ impl Worker {
                 Wait::TimedOut => break Some(self.no_answer()),
                 Wait::Stopped => break Some(Outcome::Stopped),
             };
-            let left = (stop_at - at) as usize - gathered.len();
-            gathered.extend_from_slice(&piece[..piece.len().min(left)]);
-            let full = gathered.len() == (stop_at - at) as usize;
+            let stop_at = self.hand.claim.lock().unwrap().end.min(answer_end);
+            let left = stop_at.saturating_sub(at + gathered.len() as u64);
+            gathered.extend_from_slice(&piece[..piece.len().min(left as usize)]);
+            let full = at + gathered.len() as u64 >= stop_at;
             if gathered.len() >= WRITE_PIECE || full {
-                match self.write(at, &mut gathered).await {
-                    Ok(n) => {
-                        at += n;
-                        *self.doing.lock().unwrap() = Some(from..at);
-                    }
+                match self.write(&mut gathered).await {
+                    Ok(n) => at += n,
                     Err(why) => return (at - from, Some(Outcome::Disk(why))),
                 }
             }
-            if full {
+            // Its claim's end, or the answer's: whatever the server sends
+            // past it is dropped with the answer.
+            if full || self.hand.claim.lock().unwrap().is_done() {
                 break None;
             }
         };
         // Whatever arrived is the file's, however the answer ended.
         if !gathered.is_empty() {
-            match self.write(at, &mut gathered).await {
-                Ok(n) => {
-                    at += n;
-                    *self.doing.lock().unwrap() = Some(from..at);
-                }
+            match self.write(&mut gathered).await {
+                Ok(n) => at += n,
                 Err(why) => return (at - from, Some(Outcome::Disk(why))),
             }
         }
         (at - from, ended)
     }
 
-    /// Write `gathered` at `at` and count it for the link: the bytes written.
-    async fn write(&self, at: u64, gathered: &mut Vec<u8>) -> Result<u64, String> {
-        let data = std::mem::replace(gathered, Vec::with_capacity(WRITE_PIECE));
-        let n = data.len() as u64;
+    /// Write `gathered` where the claim's unwritten part begins, and count it
+    /// for the claim and the link: the bytes written. Reserved on the claim
+    /// first, so no cut takes them; a cut that came first leaves fewer to
+    /// write, and the rest is dropped.
+    async fn write(&self, gathered: &mut Vec<u8>) -> Result<u64, String> {
+        let mut data = std::mem::replace(gathered, Vec::with_capacity(WRITE_PIECE));
+        let range = self.hand.claim.lock().unwrap().reserve(data.len() as u64);
+        let n = range.end - range.start;
+        data.truncate(n as usize);
         let file = self.file.clone();
-        let wrote = tokio::task::spawn_blocking(move || write_all_at(&file, &data, at)).await;
+        let wrote =
+            tokio::task::spawn_blocking(move || write_all_at(&file, &data, range.start)).await;
         match wrote {
             Ok(Ok(())) => {
+                self.hand.claim.lock().unwrap().wrote(n);
                 self.written.fetch_add(n, Ordering::SeqCst);
                 Ok(n)
             }
@@ -429,8 +479,8 @@ mod tests {
     fn a_piece_is_its_bytes_of_this_file() {
         let piece = |range: &str| end_of(206, &[("content-range", range)]);
         assert_eq!(piece("bytes 4000-7999/10000"), Ok(8000));
-        // Shorter than asked, or running on past the chunk, to the file's
-        // last byte: the worker writes only what the chunk needs.
+        // Shorter than asked, or running on past the claim, to the file's
+        // last byte: the worker writes only what the claim needs.
         assert_eq!(piece("bytes 4000-4999/10000"), Ok(5000));
         assert_eq!(piece("bytes 4000-9999/10000"), Ok(10000));
         // Starting elsewhere is other bytes.

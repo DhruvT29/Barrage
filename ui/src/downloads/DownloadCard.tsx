@@ -84,11 +84,11 @@ export function DownloadCard({ download: d }: { download: DownloadView }) {
   const progress = progressOf(d)
   const { action, sending, refused, press } = useAction(d.id, d.state)
   // A cable's note that repeats the download's own says nothing new, and a
-  // cable that carried nothing, holds nothing open and has nothing new to
-  // say is left out.
+  // cable that carried nothing, holds nothing open, is wanted none and has
+  // nothing new to say is left out.
   const rows = d.cables
     .map((c) => ({ ...c, notes: c.notes.filter((n) => n !== d.note) }))
-    .filter((c) => c.bytes > 0 || c.connections > 0 || c.notes.length > 0)
+    .filter((c) => c.bytes > 0 || c.connections > 0 || c.notes.length > 0 || (moving && c.wanted > 0))
 
   return (
     <section className={`panel dl ${d.state}`} aria-label={title}>
@@ -141,7 +141,7 @@ export function DownloadCard({ download: d }: { download: DownloadView }) {
       {rows.length > 0 && (
         <ul className="shares" aria-label="Cables">
           {rows.map((c) => (
-            <Share key={c.name} cable={c} done={d.done} moving={moving} />
+            <Share key={c.name} cable={c} done={d.done} bps={d.bps} moving={moving} />
           ))}
         </ul>
       )}
@@ -185,12 +185,18 @@ function Speed({ bps }: { bps: number }) {
   )
 }
 
-/** One cable's part: its share of the bytes so far, and while it downloads its speed and connections. */
-function Share({ cable: c, done, moving }: { cable: CableShare; done: number; moving: boolean }) {
+/**
+ * One cable's part: its share of the bytes so far, and while it downloads
+ * its speed, its share of the download's speed and its connections, with
+ * what the download wants it to hold when that differs.
+ */
+function Share({ cable: c, done, bps, moving }: { cable: CableShare; done: number; bps: number; moving: boolean }) {
   const share = done > 0 ? Math.min(100, (c.bytes * 100) / done) : 0
   const out = c.bytes === 0 && c.connections === 0
   // A cable with nothing open and nothing measured has no speed to give.
   const speed = !moving ? '' : c.connections > 0 || c.bps > 0 ? mbps(c.bps) : '-'
+  const taking = moving && (c.connections > 0 || c.wanted > 0)
+  const carrying = taking && bps > 0 ? Math.floor((c.bps * 100) / bps) : null
 
   return (
     <li className={out ? 'out' : undefined} data-testid="cable">
@@ -206,9 +212,18 @@ function Share({ cable: c, done, moving }: { cable: CableShare; done: number; mo
       <span className="share-speed" data-testid="cable-speed">
         {speed}
       </span>
-      <span className="share-conns" data-testid="cable-connections">
-        {moving && c.connections > 0 ? `${c.connections} connection${c.connections === 1 ? '' : 's'}` : ''}
-      </span>
+      {taking && (
+        <span className="share-detail" data-testid="cable-detail">
+          {carrying !== null && <span data-testid="cable-carrying">carrying {carrying}%</span>}
+          {carrying !== null && ' · '}
+          <span data-testid="cable-connections">{`${c.connections} connection${c.connections === 1 ? '' : 's'}`}</span>
+          {c.wanted !== c.connections && (
+            <>
+              , <b data-testid="cable-wants">wants {c.wanted}</b>
+            </>
+          )}
+        </span>
+      )}
       {c.notes.map((n) => (
         <span className="share-note" data-testid="cable-note" key={n}>
           {n}
