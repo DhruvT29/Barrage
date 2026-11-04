@@ -348,7 +348,7 @@ export const messages = [
         },
         {
           "id": 2,
-          "name": "debian-13.iso",
+          "name": "linux-mint-22.iso",
           "info_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "phase": "downloading",
           "length": 700000000,
@@ -378,7 +378,7 @@ export const messages = [
         },
         {
           "id": 3,
-          "name": "debian-13.iso",
+          "name": "fedora-41.iso",
           "info_hash": "cccccccccccccccccccccccccccccccccccccccc",
           "phase": "done",
           "length": 700000000,
@@ -391,7 +391,7 @@ export const messages = [
         },
         {
           "id": 4,
-          "name": "debian-13.iso",
+          "name": "open-movie.mkv",
           "info_hash": "dddddddddddddddddddddddddddddddddddddddd",
           "phase": "stopped",
           "length": 700000000,
@@ -404,7 +404,7 @@ export const messages = [
         },
         {
           "id": 5,
-          "name": "debian-13.iso",
+          "name": "archive.tar",
           "info_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
           "phase": "failed",
           "length": 700000000,

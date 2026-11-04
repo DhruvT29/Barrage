@@ -7,10 +7,19 @@ export type Asked = { ok: true } | { refused: string }
  * all do. The body is `{}` as JSON, which a form on another site cannot
  * send; the engine's refusals (404, 409) are passed on as they are.
  */
-export async function controlDownload(id: number, action: 'stop' | 'resume'): Promise<Asked> {
+export function controlDownload(id: number, action: 'stop' | 'resume'): Promise<Asked> {
+  return control(`/api/downloads/${id}/${action}`)
+}
+
+/** The same for torrent `id`. */
+export function controlTorrent(id: number, action: 'stop' | 'resume'): Promise<Asked> {
+  return control(`/api/torrents/${id}/${action}`)
+}
+
+async function control(address: string): Promise<Asked> {
   let answer: Response
   try {
-    answer = await fetch(`/api/downloads/${id}/${action}`, {
+    answer = await fetch(address, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
@@ -37,14 +46,24 @@ export type Added = { id: number } | { refused: string }
  * the address and words every refusal (400, 409, 415); its words are passed
  * on as they are.
  */
-export async function addDownload(url: string): Promise<Added> {
+export function addDownload(url: string): Promise<Added> {
+  return add('/api/downloads', 'application/json', JSON.stringify({ url }))
+}
+
+/** Asks the engine that served the page to fetch the torrent of a magnet link. */
+export function addMagnet(magnet: string): Promise<Added> {
+  return add('/api/torrents', 'application/json', JSON.stringify({ magnet }))
+}
+
+/** Asks the engine that served the page to fetch a chosen .torrent file, sent as its bytes. */
+export function addTorrentFile(file: Blob): Promise<Added> {
+  return add('/api/torrents', 'application/x-bittorrent', file)
+}
+
+async function add(address: string, contentType: string, sent: BodyInit): Promise<Added> {
   let answer: Response
   try {
-    answer = await fetch('/api/downloads', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-    })
+    answer = await fetch(address, { method: 'POST', headers: { 'Content-Type': contentType }, body: sent })
   } catch {
     return { refused: 'the engine is not answering' }
   }

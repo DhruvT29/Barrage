@@ -1,23 +1,39 @@
 // The transfer queue's arithmetic, apart from its markup: which filter a
 // download falls under, its time left, and how its piece bar is coloured.
-import type { DownloadState, DownloadView } from '../api/types'
+import type { DownloadState, DownloadView, TorrentPhase, TorrentView } from '../api/types'
 import { formatEta } from './format'
 
 /** What the queue can be narrowed to. Every state falls under exactly one, besides All. */
-export type Filter = 'all' | 'active' | 'stopped' | 'done' | 'failed'
+export type Filter = 'all' | 'active' | 'torrents' | 'stopped' | 'done' | 'failed'
 
-export const FILTERS: Filter[] = ['all', 'active', 'stopped', 'done', 'failed']
+export const FILTERS: Filter[] = ['all', 'active', 'torrents', 'stopped', 'done', 'failed']
 
 /** Active is everything still under way: finding the file, waiting for a cable, or fetching. */
-export function filterOf(state: DownloadState): Exclude<Filter, 'all'> {
+export function filterOf(state: DownloadState): Exclude<Filter, 'all' | 'torrents'> {
   if (state === 'starting' || state === 'waiting' || state === 'downloading') return 'active'
   return state
 }
 
-/** How many downloads each filter would show. */
-export function countByFilter(list: readonly DownloadView[]): Record<Filter, number> {
-  const counts: Record<Filter, number> = { all: list.length, active: 0, stopped: 0, done: 0, failed: 0 }
+/** A torrent falls under the same filters, and Torrents as well. */
+export function torrentFilterOf(phase: TorrentPhase): Exclude<Filter, 'all' | 'torrents'> {
+  return phase === 'finding' || phase === 'downloading' ? 'active' : phase
+}
+
+/** How many downloads and torrents each filter would show. */
+export function countByFilter(
+  list: readonly DownloadView[],
+  torrents: readonly TorrentView[] = [],
+): Record<Filter, number> {
+  const counts: Record<Filter, number> = {
+    all: list.length + torrents.length,
+    active: 0,
+    torrents: torrents.length,
+    stopped: 0,
+    done: 0,
+    failed: 0,
+  }
   for (const d of list) counts[filterOf(d.state)] += 1
+  for (const t of torrents) counts[torrentFilterOf(t.phase)] += 1
   return counts
 }
 
@@ -41,6 +57,34 @@ export function etaText(d: DownloadView): string {
   return formatEta((Math.max(0, d.length - d.done) * 8) / d.bps)
 }
 
+/** What the time-left figure says of a torrent that is not fetching. */
+const TORRENT_ETA_WORDS: Record<Exclude<TorrentPhase, 'downloading'>, string> = {
+  finding: 'Finding',
+  stopped: 'Stopped',
+  done: 'Complete',
+  failed: 'Failed',
+}
+
+/** A torrent's time left, as `etaText`. */
+export function torrentEta(t: TorrentView): string {
+  if (t.phase !== 'downloading') return TORRENT_ETA_WORDS[t.phase]
+  if (t.length === null || t.down_bps <= 0) return '-'
+  return formatEta((Math.max(0, t.length - t.done) * 8) / t.down_bps)
+}
+
+/** What the piece bar needs of a download or a torrent. */
+export type Bar = Pick<DownloadView, 'state' | 'length' | 'done'> & { cables: { name: string; bytes: number }[] }
+
+/** A torrent as the piece bar draws it: split by what each cable received. */
+export function torrentBar(t: TorrentView): Bar {
+  return {
+    state: t.phase === 'finding' ? 'starting' : t.phase,
+    length: t.length,
+    done: t.done,
+    cables: t.cables.map((c) => ({ name: c.name, bytes: c.received })),
+  }
+}
+
 /** The piece bar's blocks: 10 px squares, 3 px apart. */
 const BLOCK = 10
 const GAP = 3
@@ -60,7 +104,7 @@ export function blockCount(width: number): number {
  * accounts for are green. Null when there is no length to fill against.
  */
 export function pieceBlocks(
-  d: DownloadView,
+  d: Bar,
   colors: Record<string, string>,
   count: number,
 ): (string | null)[] | null {
@@ -91,16 +135,16 @@ export function pieceBlocks(
   return blocks
 }
 
-// The user's choice to open or close a card's list of cables, by download,
-// kept while the page is open: a card drawn anew (filtered away and back, or
+// The user's choice to open or close a card's list of cables, by download's
+// id or `t` and a torrent's, kept while the page is open: a card drawn anew (filtered away and back, or
 // the tab changed) opens as it was left.
-const choices = new Map<number, boolean>()
+const choices = new Map<string | number, boolean>()
 
-export function openChoice(id: number): boolean | undefined {
+export function openChoice(id: string | number): boolean | undefined {
   return choices.get(id)
 }
 
-export function rememberOpen(id: number, open: boolean): void {
+export function rememberOpen(id: string | number, open: boolean): void {
   choices.set(id, open)
 }
 

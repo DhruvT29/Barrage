@@ -1,7 +1,8 @@
 import { expect, test } from 'vitest'
 
+import type { TorrentView } from '../api/types'
 import type { CableShare, DownloadState, DownloadView } from '../api/types'
-import { blockCount, countByFilter, etaText, filterOf, pieceBlocks } from './queue'
+import { blockCount, countByFilter, etaText, filterOf, pieceBlocks, torrentBar, torrentEta, torrentFilterOf } from './queue'
 
 function cable(name: string, bytes: number): CableShare {
   return { name, bytes, bps: 0, connections: 0, wanted: 0, notes: [] }
@@ -105,8 +106,60 @@ test('each state belongs to one filter, and the counts add up', () => {
   expect(countByFilter(states.map((state, id) => download({ id, state })))).toEqual({
     all: 7,
     active: 4,
+    torrents: 0,
     stopped: 1,
     done: 1,
     failed: 1,
   })
+})
+
+function torrent(fields: Partial<TorrentView> = {}): TorrentView {
+  return {
+    id: 1,
+    name: 'distro.iso',
+    info_hash: 'ab'.repeat(20),
+    phase: 'downloading',
+    length: 1_000_000,
+    done: 0,
+    down_bps: 8_000_000,
+    up_bps: 0,
+    peers: 3,
+    note: null,
+    cables: [],
+    ...fields,
+  }
+}
+
+test('a torrent falls under the same filters as a download, and Torrents besides', () => {
+  expect(torrentFilterOf('finding')).toBe('active')
+  expect(torrentFilterOf('downloading')).toBe('active')
+  expect(torrentFilterOf('stopped')).toBe('stopped')
+  expect(torrentFilterOf('done')).toBe('done')
+  expect(torrentFilterOf('failed')).toBe('failed')
+  const counts = countByFilter(
+    [download({ id: 1, state: 'done' })],
+    [torrent({ phase: 'downloading' }), torrent({ phase: 'done' }), torrent({ phase: 'stopped' })],
+  )
+  expect(counts).toEqual({ all: 4, active: 1, torrents: 3, stopped: 1, done: 2, failed: 0 })
+})
+
+test('a torrent\'s time left is at its down speed; otherwise its phase in a word', () => {
+  expect(torrentEta(torrent())).toBe('1s')
+  expect(torrentEta(torrent({ down_bps: 0 }))).toBe('-')
+  expect(torrentEta(torrent({ length: null }))).toBe('-')
+  expect(torrentEta(torrent({ phase: 'finding' }))).toBe('Finding')
+  expect(torrentEta(torrent({ phase: 'stopped' }))).toBe('Stopped')
+  expect(torrentEta(torrent({ phase: 'done' }))).toBe('Complete')
+  expect(torrentEta(torrent({ phase: 'failed' }))).toBe('Failed')
+})
+
+test('a torrent\'s bar is split by what each cable received', () => {
+  const bar = torrentBar(
+    torrent({
+      phase: 'finding',
+      cables: [{ name: 'Wi-Fi', received: 5, sent: 9, bps: 0, connections: 0, uploads: true }],
+    }),
+  )
+  expect(bar.state).toBe('starting')
+  expect(bar.cables).toEqual([{ name: 'Wi-Fi', bytes: 5 }])
 })

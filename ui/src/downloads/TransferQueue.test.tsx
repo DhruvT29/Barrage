@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, test } from 'vitest'
 
 import { EMPTY_HISTORY } from '../api/history'
-import type { DownloadState, DownloadView, DownloadsView } from '../api/types'
+import type { DownloadState, DownloadView, DownloadsView, TorrentsView, TorrentPhase, TorrentView } from '../api/types'
 import { forgetChoices } from './queue'
 import { TransferQueue } from './TransferQueue'
 
@@ -26,13 +26,34 @@ function download(id: number, name: string, state: DownloadState = 'done'): Down
   }
 }
 
-function show(downloads: DownloadsView | null, onAdd = () => {}) {
+function torrent(id: number, name: string, phase: TorrentPhase = 'done'): TorrentView {
+  return {
+    id,
+    name,
+    info_hash: String(id).repeat(40).slice(0, 40),
+    phase,
+    length: 1000,
+    done: 400,
+    down_bps: 0,
+    up_bps: 0,
+    peers: 0,
+    note: null,
+    cables: [],
+  }
+}
+
+function swarm(...list: TorrentView[]): TorrentsView {
+  return { list, udp_cable: 'Wi-Fi', listening: { state: 'trying', cable: 'Wi-Fi', why: null } }
+}
+
+function show(downloads: DownloadsView | null, onAdd = () => {}, torrents: TorrentsView | null = null) {
   return render(
     <TransferQueue
       status="live"
       table={null}
       feed={[]}
       downloads={downloads}
+      torrents={torrents}
       history={EMPTY_HISTORY}
       colors={{ 'Wi-Fi': '#22ff66' }}
       onAdd={onAdd}
@@ -177,4 +198,63 @@ test("the user's choice to open or close a card's cables is kept per download, a
   show(MIXED)
   expect(toggleOf('b.iso')).toHaveAttribute('aria-expanded', 'false')
   expect(toggleOf('a.iso')).toHaveAttribute('aria-expanded', 'true')
+})
+
+const titles = () =>
+  within(screen.getByRole('region', { name: 'Transfer queue' }))
+    .getAllByRole('region')
+    .map((card) => card.getAttribute('aria-label'))
+
+const chip = (name: RegExp) => screen.getByRole('button', { name })
+
+test('torrents sit above downloads, each the newest first, and both are counted', () => {
+  const downloads = { ...NOTHING, list: [download(1, 'a.zip'), download(2, 'b.zip')] }
+  show(downloads, () => {}, swarm(torrent(1, 'x.iso'), torrent(2, 'y.iso')))
+  expect(titles()).toEqual(['y.iso', 'x.iso', 'b.zip', 'a.zip'])
+  expect(screen.getByTestId('count')).toHaveTextContent('04')
+})
+
+test('the Torrents filter shows only torrents', () => {
+  show({ ...NOTHING, list: [download(1, 'a.zip')] }, () => {}, swarm(torrent(1, 'x.iso')))
+  fireEvent.click(chip(/^Torrents/))
+  expect(titles()).toEqual(['x.iso'])
+})
+
+test('the other filters take torrents by their phase', () => {
+  show(
+    { ...NOTHING, list: [download(1, 'a.zip', 'stopped')] },
+    () => {},
+    swarm(torrent(1, 'x.iso', 'downloading'), torrent(2, 'y.iso', 'stopped')),
+  )
+  fireEvent.click(chip(/^Stopped/))
+  expect(titles()).toEqual(['y.iso', 'a.zip'])
+  fireEvent.click(chip(/^Active/))
+  expect(titles()).toEqual(['x.iso'])
+})
+
+test('a queue of nothing but torrents offers no add, and its filters have something to say', () => {
+  show(NOTHING, () => {}, swarm(torrent(1, 'x.iso', 'done')))
+  expect(screen.queryByText('Nothing downloaded yet.')).toBeNull()
+  fireEvent.click(chip(/^Active/))
+  expect(screen.getByText('Nothing active.')).toBeInTheDocument()
+})
+
+test('the swarm line shows once there is a torrent', () => {
+  const { unmount } = show(NOTHING, () => {}, swarm())
+  expect(screen.queryByTestId('swarm')).toBeNull()
+  unmount()
+  show(NOTHING, () => {}, swarm(torrent(1, 'x.iso')))
+  expect(screen.getByTestId('swarm')).toHaveTextContent('DHT and UDP on Wi-Fi')
+})
+
+test('a torrent and a download of one number each keep their own open or closed', () => {
+  const stopped = { ...download(1, 'a.zip', 'stopped') }
+  const held = torrent(1, 'x.iso', 'stopped')
+  held.cables = [{ name: 'Wi-Fi', received: 400, sent: 0, bps: 0, connections: 0, uploads: true }]
+  show({ ...NOTHING, list: [stopped] }, () => {}, swarm(held))
+  const toggle = (name: string) =>
+    within(screen.getByRole('region', { name })).getByRole('button', { name: /Link distribution/ })
+  fireEvent.click(toggle('x.iso'))
+  expect(toggle('x.iso')).toHaveAttribute('aria-expanded', 'true')
+  expect(toggle('a.zip')).toHaveAttribute('aria-expanded', 'false')
 })

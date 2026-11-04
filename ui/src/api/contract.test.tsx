@@ -8,8 +8,8 @@ import { colorsByName } from '../palette'
 import type { Tab } from '../tabs'
 import { messages } from './contract'
 import { EMPTY_HISTORY } from './history'
-import type { DownloadsView, LinkView, LiveMessage, TableView } from './types'
-import { useLive } from './useLive'
+import type { DownloadsView, LinkView, LiveMessage, TableView, TorrentsView } from './types'
+import { useLive, withTorrents } from './useLive'
 
 // Every other test here builds its tables by hand. This one uses messages the
 // engine really sent (contract.ts, written by the engine's own test), passed
@@ -49,6 +49,13 @@ const cableNames = (links: LinkView[]) => [...new Set(links.map((l) => l.name))]
 function lastDownloads(all: LiveMessage[]): DownloadsView {
   const sent = all.flatMap((m) => (m.type === 'downloads' ? [m.downloads] : []))
   expect(sent.length, 'a downloads message').toBeGreaterThan(0)
+  return sent[sent.length - 1]
+}
+
+/** The torrents the engine sent. */
+function lastTorrents(all: LiveMessage[]): TorrentsView {
+  const sent = all.flatMap((m) => (m.type === 'torrents' ? [m.torrents] : []))
+  expect(sent.length, 'a torrents message').toBeGreaterThan(0)
   return sent[sent.length - 1]
 }
 
@@ -99,7 +106,7 @@ test('the download manager draws every message the engine really sends: the cabl
   for (const name of table.connections.flat()) expect(notice).toHaveTextContent(name)
 
   // A download is running, so the hero is its live speed, by cable.
-  const { live } = lastDownloads(messages)
+  const { live } = withTorrents(lastDownloads(messages), lastTorrents(messages as LiveMessage[]))!
   expect(live.parts.length, 'cables carrying data').toBeGreaterThan(0)
   const running = within(screen.getByRole('region', { name: 'Downloading at' }))
   expect(running.getByTestId('total')).toHaveTextContent(`${(live.bps / 1e6).toFixed(1)} Mbps`)
@@ -175,7 +182,9 @@ test('the contract file renders on the download manager: every download card', (
   const cards = within(queue)
     .getAllByRole('region')
     .filter((r) => r.classList.contains('tq-card'))
-  expect(cards.map((c) => c.getAttribute('aria-label'))).toEqual([...titles].reverse())
+  const { list: torrents } = lastTorrents(messages as LiveMessage[])
+  const torrentTitles = torrents.map((t) => t.name ?? t.info_hash)
+  expect(cards.map((c) => c.getAttribute('aria-label'))).toEqual([...torrentTitles.reverse(), ...[...titles].reverse()])
 
   for (const d of list) {
     const card = within(within(queue).getByRole('region', { name: d.name ?? d.url }))
@@ -245,4 +254,32 @@ test("the contract's cards show the metered mark, the data used, and each cable'
       else expect(within(row).queryByTestId('cable-wants')).toBeNull()
     }
   }
+})
+
+test('the contract file renders on the download manager: every torrent card and the swarm line', () => {
+  feedAll('downloads')
+  const { list, udp_cable, listening } = lastTorrents(messages as LiveMessage[])
+  for (const phase of ['finding', 'downloading', 'done', 'stopped', 'failed'] as const) {
+    expect(list.map((t) => t.phase), `a ${phase} torrent`).toContain(phase)
+  }
+  const queue = within(screen.getByRole('region', { name: 'Transfer queue' }))
+  for (const t of list) {
+    const card = within(queue.getByRole('region', { name: t.name ?? t.info_hash }))
+    expect(card.getByTestId('state')).toHaveTextContent(new RegExp(`^${t.phase}$`))
+    expect(card.getByTestId('id')).toHaveTextContent(new RegExp(`^#${t.id}$`))
+    if (t.note !== null) expect(card.getByTestId('note')).toHaveTextContent(t.note)
+    if (t.phase === 'downloading') {
+      expect(card.getByTestId('peers')).toHaveTextContent(String(t.peers))
+      const rows = card.getAllByTestId('cable')
+      expect(rows).toHaveLength(t.cables.length)
+      t.cables.forEach((c, i) => {
+        expect(within(rows[i]).getByTestId('cable-name')).toHaveTextContent(c.name)
+        expect(within(rows[i]).queryByTestId('upload-off') !== null, `${c.name} upload off`).toBe(!c.uploads)
+      })
+    }
+  }
+  const line = screen.getByTestId('swarm')
+  expect(line).toHaveTextContent(`DHT and UDP on ${udp_cable}`)
+  expect(line).toHaveTextContent(`incoming: ${listening.state}`)
+  expect(line).toHaveTextContent(listening.why!)
 })

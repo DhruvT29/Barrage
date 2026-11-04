@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import type { DownloadsView, LiveMessage, TableView, TorrentsView } from './types'
 
@@ -13,6 +13,26 @@ export const RETRY_MS = [1000, 2000, 4000, 5000]
 
 /** The feed keeps this many lines, newest first. */
 export const FEED_MAX = 200
+
+/**
+ * The downloads with the torrents' speed added to their live speed, by cable,
+ * so every figure of what is arriving right now counts both. The list stays
+ * the downloads' own, and with no torrent downloading they are returned as
+ * they are.
+ */
+export function withTorrents(downloads: DownloadsView | null, torrents: TorrentsView | null): DownloadsView | null {
+  const moving = torrents?.list.filter((t) => t.phase === 'downloading') ?? []
+  if (downloads === null || moving.length === 0) return downloads
+  const parts = downloads.live.parts.map((part) => ({ ...part }))
+  let added = 0
+  for (const cable of moving.flatMap((t) => t.cables).filter((c) => c.bps > 0)) {
+    added += cable.bps
+    const part = parts.find((p) => p.name === cable.name)
+    if (part) part.bps += cable.bps
+    else parts.push({ name: cable.name, bps: cable.bps })
+  }
+  return { ...downloads, live: { bps: downloads.live.bps + added, parts } }
+}
 
 /** The engine that served this page. */
 function ownEngine(): string {
@@ -102,5 +122,6 @@ export function useLive(
     }
   }, [url, open])
 
-  return { status, table, feed, downloads, torrents }
+  const counted = useMemo(() => withTorrents(downloads, torrents), [downloads, torrents])
+  return { status, table, feed, downloads: counted, torrents }
 }

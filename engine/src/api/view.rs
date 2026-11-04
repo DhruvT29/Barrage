@@ -1584,6 +1584,7 @@ mod tests {
             ..torrent(1, TorrentPhase::Finding)
         };
         let downloading = TorrentStatus {
+            name: Some("linux-mint-22.iso".to_string()),
             info_hash: hash("b"),
             down_bps: 48_000_000,
             up_bps: 2_000_000,
@@ -1595,15 +1596,18 @@ mod tests {
             ..torrent(2, TorrentPhase::Downloading)
         };
         let done = TorrentStatus {
+            name: Some("fedora-41.iso".to_string()),
             info_hash: hash("c"),
             done: 700_000_000,
             ..torrent(3, TorrentPhase::Done)
         };
         let stopped = TorrentStatus {
+            name: Some("open-movie.mkv".to_string()),
             info_hash: hash("d"),
             ..torrent(4, TorrentPhase::Stopped)
         };
         let failed = TorrentStatus {
+            name: Some("archive.tar".to_string()),
             info_hash: hash("e"),
             note: Some("the disk is full".to_string()),
             ..torrent(5, TorrentPhase::Failed)

@@ -14,7 +14,8 @@ import {
   PauseIcon,
   PlayIcon,
 } from './icons'
-import { blockCount, etaText, pieceBlocks } from './queue'
+import { blockCount, etaText, pieceBlocks, type Bar } from './queue'
+import { useAction } from './useAction'
 
 import './downloads.css'
 
@@ -22,33 +23,6 @@ import './downloads.css'
 function actionFor(state: DownloadState): 'stop' | 'resume' | null {
   if (state === 'starting' || state === 'waiting' || state === 'downloading') return 'stop'
   return state === 'stopped' ? 'resume' : null
-}
-
-/**
- * The card's button: what it asks, whether an answer is awaited, and the
- * engine's last refusal, shown only while the download is in the state it
- * was refused in. The card itself changes when the engine's next status
- * says so.
- */
-function useAction(id: number, state: DownloadState) {
-  const action = actionFor(state)
-  const [refused, setRefused] = useState<{ words: string; state: DownloadState } | null>(null)
-  const [sending, setSending] = useState(false)
-  // A second press before the page redraws must not ask twice.
-  const busy = useRef(false)
-
-  async function press() {
-    if (action === null || busy.current) return
-    busy.current = true
-    setSending(true)
-    setRefused(null)
-    const asked = await controlDownload(id, action)
-    busy.current = false
-    setSending(false)
-    if ('refused' in asked) setRefused({ words: asked.refused, state })
-  }
-
-  return { action, sending, refused: refused?.state === state ? refused.words : null, press }
 }
 
 /** What a card says while it has no speed to show and is still under way. */
@@ -93,7 +67,7 @@ export function DownloadCard({ download: d, colors = {}, expanded, onToggle }: C
   const host = d.name !== null ? hostOf(d.url) : null
   const moving = d.state === 'downloading'
   const words = WAITING_WORDS[d.state]
-  const { action, sending, refused, press } = useAction(d.id, d.state)
+  const { action, sending, refused, press } = useAction(d.id, d.state, actionFor(d.state), controlDownload)
   const [mine, setMine] = useState<boolean | null>(null)
   const open = expanded ?? mine ?? moving
 
@@ -194,7 +168,7 @@ function useBlockCount(ref: RefObject<HTMLElement | null>): number {
  * there is nothing to fill against: while the download is under way, a
  * shimmer runs along the dim blocks instead.
  */
-function PieceBar({ download: d, colors }: { download: DownloadView; colors: Record<string, string> }) {
+export function PieceBar({ download: d, colors }: { download: Bar; colors: Record<string, string> }) {
   const ref = useRef<HTMLDivElement>(null)
   const count = useBlockCount(ref)
   const blocks = pieceBlocks(d, colors, count)
@@ -274,7 +248,7 @@ function Stats({ download: d }: { download: DownloadView }) {
   )
 }
 
-function Stat({
+export function Stat({
   icon,
   label,
   id,

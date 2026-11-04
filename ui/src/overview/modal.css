@@ -220,3 +220,40 @@
     transform: translateY(10px) scale(0.98);
   }
 }
+
+/* A .torrent file instead of a link: quiet, to the left of Download. */
+.modal-foot:has(.modal-file) {
+  justify-content: space-between;
+}
+
+.modal-picker {
+  display: none;
+}
+
+.modal-file {
+  height: 40px;
+  padding: 0 16px;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  font: 600 11.5px/1 var(--mono);
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.modal-file:hover:not(:disabled) {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.modal-file:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+.modal-file:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

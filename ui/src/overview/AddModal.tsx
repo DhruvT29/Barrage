@@ -1,7 +1,7 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from 'react'
 
 import { CloseIcon, LinkIcon } from '../shell/icons'
-import { addDownload } from './control'
+import { addDownload, addMagnet, addTorrentFile, type Added } from './control'
 import './modal.css'
 
 /** What can take focus inside the window, in order. */
@@ -16,9 +16,10 @@ export function AddModal({ open, onClose }: { open: boolean; onClose: () => void
 }
 
 /**
- * The window itself: the field, the engine's refusal under it, and
- * Download. An address the engine takes closes the window; a refused one
- * stays, to be put right. Escape, the close button or a click outside close
+ * The window itself: the field, for an address or a magnet link, the
+ * engine's refusal under it, and Download, beside a button to choose a
+ * .torrent file instead. What the engine takes closes the window; what it
+ * refuses stays, to be put right. Escape, the close button or a click outside close
  * it; focus starts in the field, stays inside while it is open, and goes
  * back to whatever opened it.
  */
@@ -31,6 +32,7 @@ function Window({ onClose }: { onClose: () => void }) {
   const busy = useRef(false)
   const panel = useRef<HTMLDivElement>(null)
   const field = useRef<HTMLInputElement>(null)
+  const picker = useRef<HTMLInputElement>(null)
   const pressedOutside = useRef(false)
   const close = useRef(onClose)
   close.current = onClose
@@ -69,12 +71,10 @@ function Window({ onClose }: { onClose: () => void }) {
     }
   }
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (wanted === '' || busy.current) return
+  async function send(adding: () => Promise<Added>) {
     busy.current = true
     setSending(true)
-    const added = await addDownload(wanted)
+    const added = await adding()
     busy.current = false
     setSending(false)
     if ('id' in added) {
@@ -84,6 +84,20 @@ function Window({ onClose }: { onClose: () => void }) {
     } else {
       setRefused(added.refused)
     }
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (wanted === '' || busy.current) return
+    await send(() => (/^magnet:/i.test(wanted) ? addMagnet(wanted) : addDownload(wanted)))
+  }
+
+  async function picked(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    // Choosing the same file again, after a refusal, must fire again.
+    event.target.value = ''
+    if (!file || busy.current) return
+    await send(() => addTorrentFile(file))
   }
 
   return (
@@ -125,7 +139,7 @@ function Window({ onClose }: { onClose: () => void }) {
         <form noValidate onSubmit={submit}>
           <div className="modal-body">
             <p id={`${id}-says`} className="modal-says">
-              The file is split across every working connection the moment it lands in the queue.
+              It is split across every working connection the moment it lands in the queue.
             </p>
 
             <label className="modal-label" htmlFor={`${id}-url`}>
@@ -139,7 +153,7 @@ function Window({ onClose }: { onClose: () => void }) {
               inputMode="url"
               autoComplete="off"
               spellCheck={false}
-              placeholder="https://example.com/file.iso"
+              placeholder="https://example.com/file.iso or magnet:?xt=..."
               aria-describedby={refused === null ? `${id}-hint` : `${id}-hint ${id}-refused`}
               aria-invalid={refused !== null}
               value={url}
@@ -149,7 +163,8 @@ function Window({ onClose }: { onClose: () => void }) {
               }}
             />
             <p id={`${id}-hint`} className="modal-hint">
-              An http or https address. A stopped download of the same address resumes where it left off.
+              An http or https address, or a magnet link. A stopped download of the same address resumes where it
+              left off.
             </p>
             {refused !== null && (
               <p id={`${id}-refused`} className="modal-refused" role="alert">
@@ -159,6 +174,18 @@ function Window({ onClose }: { onClose: () => void }) {
           </div>
 
           <div className="modal-foot">
+            <input
+              ref={picker}
+              className="modal-picker"
+              type="file"
+              accept=".torrent,application/x-bittorrent"
+              aria-label="A .torrent file"
+              tabIndex={-1}
+              onChange={picked}
+            />
+            <button type="button" className="modal-file" disabled={sending} onClick={() => picker.current?.click()}>
+              Choose a .torrent file
+            </button>
             <button type="submit" className="modal-go" disabled={wanted === '' || sending} aria-busy={sending}>
               Download
             </button>

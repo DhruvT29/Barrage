@@ -3,7 +3,7 @@ import { expect, test } from 'vitest'
 
 import { EMPTY_HISTORY } from '../api/history'
 import type { Status } from '../api/useLive'
-import type { CombinedView, DownloadsView, LinkView, TableView } from '../api/types'
+import type { CombinedView, DownloadsView, LinkView, TableView, TorrentsView } from '../api/types'
 import type { Tab } from '../tabs'
 import { Header } from './Header'
 
@@ -106,4 +106,41 @@ test('the connection to the engine is a word for every status', () => {
     expect(light).toHaveAccessibleName(`System: ${spoken}`)
     unmount()
   }
+})
+
+test('a torrent alone keeps throughput on the live speed', () => {
+  const downloads: DownloadsView = { live: { bps: 9_000_000, parts: [] }, list: [], used: [] }
+  const torrents: TorrentsView = {
+    list: [
+      {
+        id: 1,
+        name: 'distro.iso',
+        info_hash: 'ab'.repeat(20),
+        phase: 'downloading',
+        length: 1000,
+        done: 1,
+        down_bps: 9_000_000,
+        up_bps: 0,
+        peers: 1,
+        note: null,
+        cables: [],
+      },
+    ],
+    udp_cable: null,
+    listening: { state: 'off', cable: null, why: null },
+  }
+  render(
+    <Header
+      status="live"
+      table={TABLE}
+      feed={[]}
+      downloads={downloads}
+      torrents={torrents}
+      history={EMPTY_HISTORY}
+      colors={{}}
+      tab="downloads"
+      onTab={() => {}}
+    />,
+  )
+  expect(screen.getByTestId('throughput')).toHaveTextContent(/^9\.0Mbps$/)
 })

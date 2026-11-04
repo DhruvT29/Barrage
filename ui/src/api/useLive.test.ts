@@ -1,8 +1,8 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import type { DownloadsView, LinkView, LiveMessage, TableView, TorrentsView } from './types'
-import { FEED_MAX, RETRY_MS, useLive } from './useLive'
+import type { DownloadsView, LinkView, LiveMessage, TableView, TorrentsView, TorrentView } from './types'
+import { FEED_MAX, RETRY_MS, useLive, withTorrents } from './useLive'
 
 /** A socket the test drives by hand, standing in for the engine. */
 class FakeSocket {
@@ -297,4 +297,66 @@ test('by default it connects to the engine that served the page', () => {
   const e = engine()
   renderHook(() => useLive(undefined, e.open))
   expect(e.last().url).toBe(`ws://${window.location.host}/api/live`)
+})
+
+function running(fields: Partial<TorrentView> = {}): TorrentView {
+  return {
+    id: 1,
+    name: 'distro.iso',
+    info_hash: 'ab'.repeat(20),
+    phase: 'downloading',
+    length: 1000,
+    done: 100,
+    down_bps: 12,
+    up_bps: 1,
+    peers: 1,
+    note: null,
+    cables: [
+      { name: 'Wi-Fi', received: 1, sent: 0, bps: 8, connections: 1, uploads: true },
+      { name: 'Ethernet 2', received: 1, sent: 0, bps: 4, connections: 1, uploads: false },
+      { name: 'Idle', received: 1, sent: 0, bps: 0, connections: 0, uploads: true },
+    ],
+    ...fields,
+  }
+}
+
+const swarmOf = (...list: TorrentView[]): TorrentsView => ({
+  list,
+  udp_cable: null,
+  listening: { state: 'off', cable: null, why: null },
+})
+
+test('a running torrent adds to the live speed, by cable', () => {
+  const downloads: DownloadsView = {
+    live: { bps: 5, parts: [{ name: 'Wi-Fi', bps: 5 }] },
+    list: [],
+    used: [],
+  }
+  expect(withTorrents(downloads, swarmOf(running()))?.live).toEqual({
+    bps: 17,
+    parts: [
+      { name: 'Wi-Fi', bps: 13 },
+      { name: 'Ethernet 2', bps: 4 },
+    ],
+  })
+})
+
+test('only a downloading torrent adds to the live speed, and nothing changes without one', () => {
+  const downloads: DownloadsView = { live: { bps: 5, parts: [] }, list: [], used: [] }
+  expect(withTorrents(downloads, swarmOf(running({ phase: 'stopped' })))).toBe(downloads)
+  expect(withTorrents(downloads, null)).toBe(downloads)
+  expect(withTorrents(null, swarmOf(running()))).toBeNull()
+})
+
+test('the hook gives the downloads with the torrents\' speed in them, the list left alone', () => {
+  const e = engine()
+  const { result } = renderHook(() => useLive(URL, e.open))
+  e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
+  e.last().send({ type: 'downloads', downloads: { live: { bps: 0, parts: [] }, list: [], used: [] } })
+  e.last().send({ type: 'torrents', torrents: swarmOf(running()) })
+  expect(result.current.downloads?.live.bps).toBe(12)
+  expect(result.current.downloads?.list).toEqual([])
+  const held = result.current.downloads
+  e.last().send({ type: 'change', table: table(link(1, 'Wi-Fi')), lines: [] })
+  expect(result.current.downloads, 'the same object while nothing moved').toBe(held)
 })

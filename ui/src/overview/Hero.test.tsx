@@ -3,7 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 
 import { EMPTY_HISTORY, type SpeedHistory } from '../api/history'
 import type { Status } from '../api/useLive'
-import type { CombinedView, DownloadState, DownloadView, DownloadsView, LinkView, TableView } from '../api/types'
+import type { CombinedView, DownloadState, DownloadView, DownloadsView, LinkView, TableView, TorrentsView } from '../api/types'
 import { colorsByName } from '../palette'
 import type { Tab } from '../tabs'
 import { Hero } from './Hero'
@@ -369,4 +369,62 @@ test('before the first table the chart does not claim a quiet minute: nothing ha
   show({ status: 'connecting', history })
   expect(screen.getByRole('group', { name: /last minute/ })).toHaveTextContent('Nothing from the engine yet')
   expect(screen.queryByText('Nothing measured in the last minute')).toBeNull()
+})
+
+const running: TorrentsView = {
+  list: [
+    {
+      id: 4,
+      name: 'distro.iso',
+      info_hash: 'ab'.repeat(20),
+      phase: 'downloading',
+      length: 1000,
+      done: 100,
+      down_bps: 8_000_000,
+      up_bps: 0,
+      peers: 3,
+      note: null,
+      cables: [],
+    },
+  ],
+  udp_cable: null,
+  listening: { state: 'off', cable: null, why: null },
+}
+
+const noDownloads: DownloadsView = { live: { bps: 8_000_000, parts: [{ name: 'Wi-Fi', bps: 8_000_000 }] }, list: [], used: [] }
+
+function showTorrents() {
+  return render(
+    <Hero
+      status="live"
+      table={null}
+      feed={[]}
+      downloads={noDownloads}
+      torrents={running}
+      history={EMPTY_HISTORY}
+      colors={{}}
+      onAdd={() => {}}
+      onTab={() => {}}
+    />,
+  )
+}
+
+test('a torrent alone keeps the hero live, counted active, and can be the lead transfer', () => {
+  showTorrents()
+  expect(within(downloading()).getByTestId('total')).toHaveTextContent('8.0 Mbps')
+  expect(within(screen.getByRole('group', { name: 'Active' })).getByText('1')).toBeInTheDocument()
+  expect(within(screen.getByRole('group', { name: 'Lead transfer' })).getByText('distro.iso')).toBeInTheDocument()
+})
+
+test('Stop all stops the running torrents too', async () => {
+  const asked: string[] = []
+  vi.stubGlobal('fetch', async (url: string) => {
+    asked.push(url)
+    return { ok: true, status: 200, json: async () => ({ id: 4 }) } as unknown as Response
+  })
+  showTorrents()
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Stop all' }))
+  })
+  expect(asked).toEqual(['/api/torrents/4/stop'])
 })
