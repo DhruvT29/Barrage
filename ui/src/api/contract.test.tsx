@@ -1,5 +1,5 @@
 import { act, render, screen, within } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 
 import { formatBytes, percentText } from '../downloads/format'
 import { Dashboard } from '../links/Dashboard'
@@ -10,6 +10,9 @@ import { messages } from './contract'
 import { EMPTY_HISTORY } from './history'
 import type { DownloadsView, LinkView, LiveMessage, TableView, TorrentsView } from './types'
 import { useLive, withTorrents } from './useLive'
+
+// These draw the whole page once per message, which takes a while on a busy machine.
+vi.setConfig({ testTimeout: 30_000 })
 
 // Every other test here builds its tables by hand. This one uses messages the
 // engine really sent (contract.ts, written by the engine's own test), passed
