@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{FromRef, Path, Request, State};
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection};
+use axum::extract::{DefaultBodyLimit, FromRef, Path, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router, middleware};
@@ -29,15 +30,23 @@ use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::LinkHandle;
-use crate::fetch::{AddError, AddRequest, ControlError, DownloadId, Downloads};
+use crate::bt::{Source, TorrentAddError, TorrentConfig, TorrentControlError, TorrentId, Torrents};
+use crate::fetch::{
+    AddError, AddRequest, ControlError, DownloadConfig, DownloadId, Downloads, Usage,
+};
 use crate::links::watch::LinkTable;
+use crate::transfer::TransferEngine;
 
 pub use view::{
-    DownloadsView, LinkView, LiveMessage, TableView, change_message, downloads_view, table_view,
+    DownloadsView, LinkView, LiveMessage, TableView, TorrentsView, change_message, downloads_view,
+    table_view, torrents_view,
 };
 
 /// The port `barrage` listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7700;
+
+/// The largest .torrent file taken. A real one is rarely over a few MiB.
+const TORRENT_FILE_MOST: usize = 16 << 20;
 
 /// Listen on `port` at this machine's loopback address, never at an address
 /// another device could reach. Port 0 lets the system pick a free one.
@@ -54,8 +63,8 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 /// The API alone:
 ///
 /// - `GET /api/links`: the table as JSON.
-/// - `GET /api/live`: the table and the downloads as a WebSocket stream of
-///   [`LiveMessage`]s.
+/// - `GET /api/live`: the table, the downloads and the torrents as a
+///   WebSocket stream of [`LiveMessage`]s.
 /// - `POST /api/downloads`: start one. The body is JSON, `{"url": string,
 ///   "cables"?: string[]}`, sent as `application/json`. It answers `201
 ///   {"id"}` (a stopped download of the URL is resumed, and its own id
@@ -71,6 +80,15 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 ///   They answer `200 {"id"}` once it has stopped or started again, `404
 ///   {"error"}` for no such download, `409 {"error"}` for one not running or
 ///   not stopped, and `415` or `400` as adding does.
+/// - `POST /api/torrents`: add a torrent, as `application/json`
+///   `{"magnet": string}` or as `application/x-bittorrent` with the file's
+///   bytes. It answers `201 {"id"}`, `400 {"error"}` for a magnet link or
+///   file it cannot use, `409 {"error", "id"}` for a torrent already added,
+///   with its id, `413 {"error"}` for a file over 16 MiB and `415 {"error"}`
+///   for anything else. Neither kind can be sent by a form on another site.
+/// - `GET /api/torrents`: every torrent, as [`TorrentsView`].
+/// - `POST /api/torrents/{id}/stop` and `POST /api/torrents/{id}/resume`: as
+///   a download's.
 ///
 /// Any other address under `/api` answers `404`. Every route answers only
 /// this machine's own pages, and none may be framed ([`guard`]).
@@ -78,15 +96,23 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 /// It holds a copy of the table, never the [`LinkHandle`]. A reader does not
 /// keep the watcher alive, so stopping the engine ends every live stream,
 /// instead of each open page keeping the engine running.
-pub fn router(table: LinkTable, downloads: Downloads) -> Router {
-    guarded(api(table, downloads))
+pub fn router(table: LinkTable, downloads: Downloads, torrents: Torrents) -> Router {
+    guarded(api(table, downloads, torrents))
 }
 
 /// What `barrage` serves: the API, as [`router`], and the built page from
 /// `static_dir` at every other address, all under the same [`guard`].
-pub fn app(table: LinkTable, downloads: Downloads, static_dir: PathBuf) -> Router {
+pub fn app(
+    table: LinkTable,
+    downloads: Downloads,
+    torrents: Torrents,
+    static_dir: PathBuf,
+) -> Router {
     let dir = Arc::new(static_dir);
-    guarded(api(table, downloads).fallback(move |request: Request| page(Arc::clone(&dir), request)))
+    guarded(
+        api(table, downloads, torrents)
+            .fallback(move |request: Request| page(Arc::clone(&dir), request)),
+    )
 }
 
 /// How long the live streams get to send their close frames once the
@@ -99,11 +125,13 @@ const CLOSE_GRACE: Duration = Duration::from_millis(250);
 const SAVE_GRACE: Duration = Duration::from_secs(2);
 
 /// Serve [`app`] on `listener` until `stop` completes, then stop the engine.
-/// Downloads go to `downloads_dir`.
+/// Downloads and torrents go to `downloads_dir`, and add to one count of the
+/// data each cable has used.
 ///
-/// When `stop` fires, the downloads stop first and save their progress, for
-/// at most [`SAVE_GRACE`]: with the links gone first, each would see its
-/// links vanish and fail. Then the handle is dropped, while the server
+/// When `stop` fires, the downloads and torrents stop first, the downloads
+/// saving their progress, for at most [`SAVE_GRACE`]: with the links gone
+/// first, each would see its links vanish and fail. Then the handle is
+/// dropped, while the server
 /// finishes. That stops the watcher, which ends every live stream with a
 /// close frame. Dropping it after the server returns works too with axum
 /// 0.8.9, whose graceful shutdown does not wait for connections that became
@@ -114,14 +142,30 @@ pub async fn serve(
     links: LinkHandle,
     downloads_dir: PathBuf,
     static_dir: PathBuf,
+    torrents: TorrentConfig,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let downloads = Downloads::new(links.table(), downloads_dir);
-    let app = app(links.table(), downloads.clone(), static_dir);
+    let usage = Usage::counting_speed_tests(links.table());
+    let downloads = Downloads::with_usage(
+        links.table(),
+        downloads_dir.clone(),
+        DownloadConfig::default(),
+        Arc::clone(&usage),
+    );
+    let torrents = Torrents::start(links.table(), downloads_dir, usage, torrents)
+        .await
+        .context("the torrents did not start")?;
+    let app = app(
+        links.table(),
+        downloads.clone(),
+        torrents.clone(),
+        static_dir,
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             stop.await;
-            let _ = tokio::time::timeout(SAVE_GRACE, downloads.shutdown()).await;
+            let stopping = async { tokio::join!(downloads.shutdown(), torrents.shutdown()) };
+            let _ = tokio::time::timeout(SAVE_GRACE, stopping).await;
             drop(links);
         })
         .await
@@ -130,11 +174,12 @@ pub async fn serve(
     Ok(())
 }
 
-/// What the routes reach. Each handler takes only the half it needs.
+/// What the routes reach. Each handler takes only the part it needs.
 #[derive(Clone)]
 struct Engine {
     table: LinkTable,
     downloads: Downloads,
+    torrents: Torrents,
 }
 
 impl FromRef<Engine> for LinkTable {
@@ -149,20 +194,38 @@ impl FromRef<Engine> for Downloads {
     }
 }
 
-fn api(table: LinkTable, downloads: Downloads) -> Router {
+impl FromRef<Engine> for Torrents {
+    fn from_ref(engine: &Engine) -> Self {
+        engine.torrents.clone()
+    }
+}
+
+fn api(table: LinkTable, downloads: Downloads, torrents: Torrents) -> Router {
     Router::new()
         .route("/api/links", get(links))
         .route("/api/live", get(live::upgrade))
         .route("/api/downloads", get(list_downloads).post(add_download))
         .route("/api/downloads/{id}/stop", post(stop_download))
         .route("/api/downloads/{id}/resume", post(resume_download))
+        .route(
+            "/api/torrents",
+            get(list_torrents)
+                .post(add_torrent)
+                .layer(DefaultBodyLimit::max(TORRENT_FILE_MOST)),
+        )
+        .route("/api/torrents/{id}/stop", post(stop_torrent))
+        .route("/api/torrents/{id}/resume", post(resume_torrent))
         // Any other address under /api is a route this engine does not have,
         // a typo or one a newer page expects. Left to the page's fallback it
         // would answer 200 with index.html, which a JSON client cannot read.
         .route("/api", any(no_such_route))
         .route("/api/", any(no_such_route))
         .route("/api/{*rest}", any(no_such_route))
-        .with_state(Engine { table, downloads })
+        .with_state(Engine {
+            table,
+            downloads,
+            torrents,
+        })
 }
 
 async fn no_such_route() -> Response {
@@ -224,8 +287,11 @@ async fn stop_download(
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<NoFields>, JsonRejection>,
 ) -> Response {
-    match asked(id, body) {
-        Ok(id) => controlled(id, downloads.stop(id).await),
+    match asked(id, body, "no such download") {
+        Ok(id) => {
+            let id = DownloadId::new(id);
+            controlled(id, downloads.stop(id).await)
+        }
         Err(refused) => *refused,
     }
 }
@@ -235,23 +301,27 @@ async fn resume_download(
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<NoFields>, JsonRejection>,
 ) -> Response {
-    match asked(id, body) {
-        Ok(id) => controlled(id, downloads.resume(id).await),
+    match asked(id, body, "no such download") {
+        Ok(id) => {
+            let id = DownloadId::new(id);
+            controlled(id, downloads.resume(id).await)
+        }
         Err(refused) => *refused,
     }
 }
 
-/// The download a stop or resume names, once its body is `{}` as JSON, or
-/// the refusal. An id that is not a number names no download.
+/// The id a stop or resume names, once its body is `{}` as JSON, or the
+/// refusal. An id that is not a number names nothing, and is `none`.
 fn asked(
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<NoFields>, JsonRejection>,
-) -> Result<DownloadId, Box<Response>> {
+    none: &str,
+) -> Result<u64, Box<Response>> {
     let Ok(Path(id)) = id else {
-        return Err(Box::new(refuse(StatusCode::NOT_FOUND, "no such download")));
+        return Err(Box::new(refuse(StatusCode::NOT_FOUND, none)));
     };
     match body {
-        Ok(_) => Ok(DownloadId::new(id)),
+        Ok(_) => Ok(id),
         Err(JsonRejection::MissingJsonContentType(_)) => Err(Box::new(refuse(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "send {} as JSON, with Content-Type: application/json",
@@ -273,6 +343,107 @@ async fn list_downloads(State(downloads): State<Downloads>) -> Json<DownloadsVie
     Json(downloads_view(
         &downloads.status().borrow(),
         &downloads.used().borrow(),
+    ))
+}
+
+/// The body of a magnet link added. As for adding a download, a field it
+/// does not know is refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MagnetBody {
+    magnet: String,
+}
+
+/// The torrent a request carries, or the refusal, by its content type.
+fn torrent_in(headers: &HeaderMap, body: &[u8]) -> Result<Source, Box<Response>> {
+    let kind = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let kind = kind.split(';').next().unwrap_or_default().trim();
+    if kind.eq_ignore_ascii_case("application/x-bittorrent") {
+        return Ok(Source::File(body.to_vec()));
+    }
+    if !kind.eq_ignore_ascii_case("application/json") {
+        return Err(Box::new(refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "send a magnet link as JSON, with Content-Type: application/json, or a .torrent \
+             file with Content-Type: application/x-bittorrent",
+        )));
+    }
+    match serde_json::from_slice::<MagnetBody>(body) {
+        Ok(body) => Ok(Source::Magnet(body.magnet)),
+        Err(e) => Err(Box::new(refuse(StatusCode::BAD_REQUEST, &e.to_string()))),
+    }
+}
+
+async fn add_torrent(
+    State(torrents): State<Torrents>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(e) => return refuse(e.status(), &e.body_text()),
+    };
+    let source = match torrent_in(&headers, &body) {
+        Ok(source) => source,
+        Err(refused) => return *refused,
+    };
+    match torrents.add(source).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id.as_u64() }))).into_response(),
+        Err(e @ TorrentAddError::AlreadyAdded(id)) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": e.to_string(), "id": id.as_u64() })),
+        )
+            .into_response(),
+        Err(e) => refuse(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn stop_torrent(
+    State(torrents): State<Torrents>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body, "no such torrent") {
+        Ok(id) => {
+            let id = TorrentId(id);
+            torrent_controlled(id, torrents.stop(id).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn resume_torrent(
+    State(torrents): State<Torrents>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body, "no such torrent") {
+        Ok(id) => {
+            let id = TorrentId(id);
+            torrent_controlled(id, torrents.resume(id).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+/// What a stop or resume of torrent `id` answers.
+fn torrent_controlled(id: TorrentId, done: Result<(), TorrentControlError>) -> Response {
+    match done {
+        Ok(()) => (StatusCode::OK, Json(json!({ "id": id.as_u64() }))).into_response(),
+        Err(e @ TorrentControlError::NoSuchTorrent) => {
+            refuse(StatusCode::NOT_FOUND, &e.to_string())
+        }
+        Err(e) => refuse(StatusCode::CONFLICT, &e.to_string()),
+    }
+}
+
+async fn list_torrents(State(torrents): State<Torrents>) -> Json<TorrentsView> {
+    Json(torrents_view(
+        &torrents.status().borrow(),
+        &torrents.swarm().borrow(),
     ))
 }
 

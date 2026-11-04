@@ -12,8 +12,10 @@
 //! which is most of what this phase needs to get right.
 
 pub mod api;
+pub mod bt;
 pub mod fetch;
 pub mod links;
 pub mod logging;
+pub mod transfer;
 
 pub use links::LinkHandle;

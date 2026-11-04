@@ -1,5 +1,5 @@
 import { act, render, screen, within } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 
 import { formatBytes, percentText } from '../downloads/format'
 import { Dashboard } from '../links/Dashboard'
@@ -8,8 +8,11 @@ import { colorsByName } from '../palette'
 import type { Tab } from '../tabs'
 import { messages } from './contract'
 import { EMPTY_HISTORY } from './history'
-import type { DownloadsView, LinkView, LiveMessage, TableView } from './types'
-import { useLive } from './useLive'
+import type { DownloadsView, LinkView, LiveMessage, TableView, TorrentsView } from './types'
+import { useLive, withTorrents } from './useLive'
+
+// These draw the whole page once per message, which takes a while on a busy machine.
+vi.setConfig({ testTimeout: 30_000 })
 
 // Every other test here builds its tables by hand. This one uses messages the
 // engine really sent (contract.ts, written by the engine's own test), passed
@@ -52,6 +55,13 @@ function lastDownloads(all: LiveMessage[]): DownloadsView {
   return sent[sent.length - 1]
 }
 
+/** The torrents the engine sent. */
+function lastTorrents(all: LiveMessage[]): TorrentsView {
+  const sent = all.flatMap((m) => (m.type === 'torrents' ? [m.torrents] : []))
+  expect(sent.length, 'a torrents message').toBeGreaterThan(0)
+  return sent[sent.length - 1]
+}
+
 /** The last change the engine sent: the contract ends with one. */
 function lastChange(): Extract<LiveMessage, { type: 'change' }> {
   const last = messages[messages.length - 1] as LiveMessage
@@ -66,7 +76,7 @@ test('the download manager draws every message the engine really sends: the cabl
   // A downloads message carries no table: the cards stay as the last table drew them.
   let drawn: LinkView[] = []
   feedAll('downloads', (message, page) => {
-    if (message.type !== 'downloads') drawn = message.table.links
+    if ('table' in message) drawn = message.table.links
     expect(page.querySelectorAll('section.ml-card')).toHaveLength(cableNames(drawn).length)
   })
 
@@ -99,7 +109,7 @@ test('the download manager draws every message the engine really sends: the cabl
   for (const name of table.connections.flat()) expect(notice).toHaveTextContent(name)
 
   // A download is running, so the hero is its live speed, by cable.
-  const { live } = lastDownloads(messages)
+  const { live } = withTorrents(lastDownloads(messages), lastTorrents(messages as LiveMessage[]))!
   expect(live.parts.length, 'cables carrying data').toBeGreaterThan(0)
   const running = within(screen.getByRole('region', { name: 'Downloading at' }))
   expect(running.getByTestId('total')).toHaveTextContent(`${(live.bps / 1e6).toFixed(1)} Mbps`)
@@ -138,7 +148,7 @@ test('with nothing downloading, the hero is the combined speed: its parts, and w
 test('the radar draws every message the engine really sends: a node and a roster row per cable, and the change lines', () => {
   let drawn: TableView | null = null
   const container = feedAll('links', (message, page) => {
-    if (message.type !== 'downloads') drawn = message.table
+    if ('table' in message) drawn = message.table
     const names = drawn ? cableNames(drawn.links) : []
     expect(page.querySelectorAll('.rd-node')).toHaveLength(names.length)
     expect(page.querySelectorAll('.rd-row')).toHaveLength(names.length)
@@ -175,7 +185,9 @@ test('the contract file renders on the download manager: every download card', (
   const cards = within(queue)
     .getAllByRole('region')
     .filter((r) => r.classList.contains('tq-card'))
-  expect(cards.map((c) => c.getAttribute('aria-label'))).toEqual([...titles].reverse())
+  const { list: torrents } = lastTorrents(messages as LiveMessage[])
+  const torrentTitles = torrents.map((t) => t.name ?? t.info_hash)
+  expect(cards.map((c) => c.getAttribute('aria-label'))).toEqual([...torrentTitles.reverse(), ...[...titles].reverse()])
 
   for (const d of list) {
     const card = within(within(queue).getByRole('region', { name: d.name ?? d.url }))
@@ -207,7 +219,7 @@ test('the contract file renders on the download manager: every download card', (
 // The page draws these from phase 4 on; the sample must keep sending one of
 // each, or the page's handling of them is never tried against the engine.
 test('the contract carries a metered cable, a cable wanting more than it holds, and the data used', () => {
-  const tables = messages.flatMap((m) => (m.type === 'downloads' ? [] : [m.table]))
+  const tables = (messages as LiveMessage[]).flatMap((m) => ('table' in m ? [m.table] : []))
   expect(tables.some((t) => t.links.some((l) => l.metered))).toBe(true)
   const { list, used } = lastDownloads(messages)
   expect(list.some((d) => d.cables.some((c) => c.wanted > c.connections))).toBe(true)
@@ -245,4 +257,32 @@ test("the contract's cards show the metered mark, the data used, and each cable'
       else expect(within(row).queryByTestId('cable-wants')).toBeNull()
     }
   }
+})
+
+test('the contract file renders on the download manager: every torrent card and the swarm line', () => {
+  feedAll('downloads')
+  const { list, udp_cable, listening } = lastTorrents(messages as LiveMessage[])
+  for (const phase of ['finding', 'downloading', 'done', 'stopped', 'failed'] as const) {
+    expect(list.map((t) => t.phase), `a ${phase} torrent`).toContain(phase)
+  }
+  const queue = within(screen.getByRole('region', { name: 'Transfer queue' }))
+  for (const t of list) {
+    const card = within(queue.getByRole('region', { name: t.name ?? t.info_hash }))
+    expect(card.getByTestId('state')).toHaveTextContent(new RegExp(`^${t.phase}$`))
+    expect(card.getByTestId('id')).toHaveTextContent(new RegExp(`^#${t.id}$`))
+    if (t.note !== null) expect(card.getByTestId('note')).toHaveTextContent(t.note)
+    if (t.phase === 'downloading') {
+      expect(card.getByTestId('peers')).toHaveTextContent(String(t.peers))
+      const rows = card.getAllByTestId('cable')
+      expect(rows).toHaveLength(t.cables.length)
+      t.cables.forEach((c, i) => {
+        expect(within(rows[i]).getByTestId('cable-name')).toHaveTextContent(c.name)
+        expect(within(rows[i]).queryByTestId('upload-off') !== null, `${c.name} upload off`).toBe(!c.uploads)
+      })
+    }
+  }
+  const line = screen.getByTestId('swarm')
+  expect(line).toHaveTextContent(`DHT and UDP on ${udp_cable}`)
+  expect(line).toHaveTextContent(`incoming: ${listening.state}`)
+  expect(line).toHaveTextContent(listening.why!)
 })

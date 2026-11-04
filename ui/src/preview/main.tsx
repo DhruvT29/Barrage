@@ -15,11 +15,12 @@ import '../fonts'
 import '../app.css'
 
 import { useSpeedHistory } from '../api/history'
-import type { DownloadsView, TableView } from '../api/types'
+import { withTorrents } from '../api/useLive'
+import type { DownloadsView, TableView, TorrentsView } from '../api/types'
 import type { FeedLine, Status } from '../api/useLive'
 import { Dashboard } from '../links/Dashboard'
 import { useTab } from '../tabs'
-import { PREVIEW_FEED, previewDownloads, previewTable, withLongWords } from './fixtures'
+import { PREVIEW_FEED, previewDownloads, previewTable, previewTorrents, withLongWords } from './fixtures'
 
 const query = new URLSearchParams(window.location.search)
 
@@ -33,22 +34,35 @@ function Preview() {
 
   const status: Status = query.has('disconnected') ? 'disconnected' : query.has('connecting') ? 'connecting' : 'live'
   let table: TableView | null = previewTable(t)
+  let torrents: TorrentsView | null = previewTorrents(t)
   let downloads: DownloadsView | null = previewDownloads(t)
   if (query.has('long')) [table, downloads] = withLongWords(table, downloads)
   if (query.has('empty')) {
     table = { links: [], shared: [], connections: [], combined: { bps: 0, parts: [], not_counted: [] } }
     downloads = { live: { bps: 0, parts: [] }, list: [], used: [] }
+    torrents = { list: [], udp_cable: null, listening: { state: 'off', cable: null, why: null } }
   }
   if (status === 'connecting') {
     table = null
     downloads = null
+    torrents = null
   }
+  downloads = withTorrents(downloads, torrents)
   const feed: FeedLine[] = PREVIEW_FEED.map((text, i) => ({ at: new Date(Date.now() - i * 47_000), text }))
   const history = useSpeedHistory(table, downloads)
   const [tab, setTab] = useTab()
 
   return (
-    <Dashboard status={status} table={table} feed={feed} downloads={downloads} history={history} tab={tab} onTab={setTab} />
+    <Dashboard
+      status={status}
+      table={table}
+      feed={feed}
+      downloads={downloads}
+      torrents={torrents}
+      history={history}
+      tab={tab}
+      onTab={setTab}
+    />
   )
 }
 

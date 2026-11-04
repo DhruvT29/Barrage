@@ -5,16 +5,20 @@
 
 mod fake;
 mod serve;
+mod torrent;
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use barrage::LinkHandle;
 use barrage::api::live::Feed;
 use barrage::api::{LiveMessage, app, bind, router, serve, table_view};
-use barrage::fetch::{DownloadConfig, Downloads};
+use barrage::bt::{TorrentConfig, Torrents};
+use barrage::fetch::{DownloadConfig, Downloads, Usage};
 use barrage::links::LinkState;
 use barrage::links::watch::{LinkTable, WatchConfig};
 use fake::{Fake, SAMPLED_BPS, cand, cand_idx, ms};
@@ -27,6 +31,7 @@ use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use torrent::{FILE, Seeds, fresh_dir, listening_on, pattern, seeds, seeds_with};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -54,6 +59,27 @@ fn downloads_in(table: &LinkTable, dir: &Path) -> Downloads {
     Downloads::with_config(table.clone(), dir.to_path_buf(), config)
 }
 
+/// Torrents that find no one but `peers` and do not listen.
+fn quiet_torrents(peers: Vec<SocketAddr>) -> TorrentConfig {
+    TorrentConfig {
+        network: false,
+        listen: false,
+        tick: ms(20),
+        peers,
+        ..TorrentConfig::default()
+    }
+}
+
+/// Torrents into a folder of their own, with nobody to fetch from.
+async fn torrents_on(table: &LinkTable) -> Torrents {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = fresh_dir(&format!("api-{}", NEXT.fetch_add(1, Ordering::SeqCst)));
+    let usage = Usage::counting_speed_tests(table.clone());
+    Torrents::start(table.clone(), dir, usage, quiet_torrents(Vec::new()))
+        .await
+        .unwrap()
+}
+
 /// Serve the API for `table` on a free loopback port. Nothing is
 /// downloaded into the folder: a test that downloads uses [`serve_with`].
 async fn serve_api(table: LinkTable) -> SocketAddr {
@@ -64,8 +90,9 @@ async fn serve_api(table: LinkTable) -> SocketAddr {
 async fn serve_with(table: LinkTable, downloads: Downloads) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let torrents = torrents_on(&table).await;
     tokio::spawn(async move {
-        axum::serve(listener, router(table, downloads))
+        axum::serve(listener, router(table, downloads, torrents))
             .await
             .unwrap()
     });
@@ -105,12 +132,14 @@ async fn frame_where(socket: &mut Socket, what: &str, check: impl Fn(&Value) -> 
     }
 }
 
-/// What every client is sent first: the table, then the downloads.
+/// What every client is sent first: the table, the downloads, the torrents.
 async fn opening(socket: &mut Socket) -> (Value, Value) {
     let table = frame(socket).await;
     assert_eq!(table["type"], "table", "{table}");
     let downloads = frame(socket).await;
     assert_eq!(downloads["type"], "downloads", "{downloads}");
+    let torrents = frame(socket).await;
+    assert_eq!(torrents["type"], "torrents", "{torrents}");
     (table, downloads)
 }
 
@@ -241,12 +270,16 @@ async fn a_client_that_reads_late_gets_the_latest_table_not_a_backlog() {
         vec![wifi, tether],
     ]));
     let downloads = downloads_in(&h.table(), &std::env::temp_dir());
-    let mut feed = Feed::new(h.table(), &downloads);
+    let torrents = torrents_on(&h.table()).await;
+    let mut feed = Feed::new(h.table(), &downloads, &torrents);
     let Some(LiveMessage::Table { .. }) = feed.next().await else {
         panic!("expected the table first");
     };
     let Some(LiveMessage::Downloads { .. }) = feed.next().await else {
         panic!("expected the downloads next");
+    };
+    let Some(LiveMessage::Torrents { .. }) = feed.next().await else {
+        panic!("expected the torrents last");
     };
 
     // Away while both links appear, come up, are measured and looked up.
@@ -438,7 +471,8 @@ async fn serve_app(table: LinkTable, dir: &Folder) -> SocketAddr {
     let listener = bind(0).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let downloads = downloads_in(&table, &std::env::temp_dir());
-    let app = app(table, downloads, dir.0.clone());
+    let torrents = torrents_on(&table).await;
+    let app = app(table, downloads, torrents, dir.0.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     addr
 }
@@ -504,9 +538,16 @@ async fn stopping_closes_every_page_and_returns() {
         true,
     )]]));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(serve(listener, h, dir.0.clone(), dir.0.clone(), async {
-        let _ = stopped.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        h,
+        dir.0.clone(),
+        dir.0.clone(),
+        quiet_torrents(Vec::new()),
+        async {
+            let _ = stopped.await;
+        },
+    ));
     let mut socket = connect(addr).await;
     frame(&mut socket).await;
 
@@ -549,6 +590,7 @@ async fn stopping_saves_each_downloads_progress() {
         wifi_to_the_file_server(),
         dir.0.clone(),
         dir.0.clone(),
+        quiet_torrents(Vec::new()),
         async {
             let _ = stopped.await;
         },
@@ -1163,4 +1205,377 @@ async fn the_data_used_reaches_an_open_page() {
     let list = listed(addr).await;
     assert_eq!(list["used"][0]["cable"], "Wi-Fi", "{list}");
     assert!(list["used"][0]["bytes"].as_u64() >= Some(SONG), "{list}");
+}
+
+const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=song.flac";
+const TORRENT_FILE: &str = "application/x-bittorrent";
+
+/// `POST /api/torrents`: the status and the answer.
+async fn post_torrent(addr: SocketAddr, content_type: &str, body: Vec<u8>) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/torrents"))
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    let json = serde_json::from_str(&text).unwrap_or_else(|_| panic!("not JSON: {text}"));
+    (status, json)
+}
+
+/// One seed sending `kib` KiB a second, so a torrent is still running when a
+/// test looks.
+async fn slow_seeds(name: &str, len: usize, kib: u32) -> Seeds {
+    seeds_with(name, 1, &pattern(len), 64 << 10, move || {
+        let mut options = listening_on("127.0.0.1");
+        options.ratelimits.upload_bps = NonZeroU32::new(kib << 10);
+        options
+    })
+    .await
+}
+
+/// A magnet link, as the page sends it.
+async fn post_magnet(addr: SocketAddr, magnet: &str) -> (u16, Value) {
+    let body = json!({ "magnet": magnet }).to_string().into_bytes();
+    post_torrent(addr, "application/json", body).await
+}
+
+/// `GET /api/torrents`.
+async fn torrents_listed(addr: SocketAddr) -> Value {
+    let (status, body) = get(format!("http://{addr}/api/torrents")).await;
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// `GET /api/torrents` until it passes `check`, failing the test after `secs`.
+async fn torrents_where(
+    addr: SocketAddr,
+    secs: u64,
+    what: &str,
+    check: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let list = torrents_listed(addr).await;
+        if check(&list) {
+            return list;
+        }
+        assert!(Instant::now() < deadline, "waited for {what}: {list}");
+        tokio::time::sleep(ms(20)).await;
+    }
+}
+
+/// A torrent's stop or resume: the address's id, the content type and body.
+async fn torrent_control(
+    addr: SocketAddr,
+    id: &str,
+    action: &str,
+    content_type: &str,
+    body: &str,
+) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/torrents/{id}/{action}"))
+        .header("content-type", content_type)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    let json = serde_json::from_str(&text).unwrap_or_else(|_| panic!("not JSON: {text}"));
+    (status, json)
+}
+
+#[tokio::test]
+async fn adding_a_magnet_answers_its_id() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let (status, answer) = post_magnet(addr, MAGNET).await;
+    assert_eq!((status, &answer), (201, &json!({ "id": 1 })));
+
+    let list = torrents_listed(addr).await;
+    assert_eq!(list["list"].as_array().unwrap().len(), 1, "{list}");
+    let torrent = &list["list"][0];
+    assert_eq!(torrent["id"], 1);
+    assert_eq!(
+        torrent["info_hash"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(torrent["name"], "song.flac");
+    assert_eq!(torrent["phase"], "finding");
+}
+
+#[tokio::test]
+async fn a_torrent_file_body_is_accepted() {
+    let seeds = seeds("api-file", 1, &pattern(1 << 20), 64 << 10).await;
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let (status, answer) = post_torrent(addr, TORRENT_FILE, seeds.torrent.clone()).await;
+    assert_eq!((status, &answer), (201, &json!({ "id": 1 })));
+    let list = torrents_where(addr, 5, "its name and length", |list| {
+        list["list"][0]["name"] == FILE
+    })
+    .await;
+    assert_eq!(list["list"][0]["length"], 1 << 20);
+    assert_eq!(
+        list["list"][0]["info_hash"],
+        seeds.info_hash.as_string().as_str()
+    );
+}
+
+/// Review Focus 5.
+#[tokio::test]
+async fn a_bad_magnet_is_400_in_the_engines_words() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let (status, answer) = post_magnet(addr, "magnet:?dn=nothing").await;
+    assert_eq!(status, 400, "{answer}");
+    let error = answer["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("not a magnet link this engine can use"),
+        "{error}"
+    );
+
+    let (status, answer) = post_magnet(addr, "https://example.com/a.iso").await;
+    assert_eq!(status, 400, "{answer}");
+
+    let (status, answer) = post_torrent(addr, TORRENT_FILE, b"not bencode".to_vec()).await;
+    assert_eq!(status, 400, "{answer}");
+    let error = answer["error"].as_str().unwrap();
+    assert!(error.starts_with("not a torrent file"), "{error}");
+
+    assert_eq!(torrents_listed(addr).await["list"], json!([]));
+}
+
+/// Review Focus 5: a magnet and its .torrent file are one torrent.
+#[tokio::test]
+async fn the_same_torrent_twice_is_409() {
+    let seeds = seeds("api-twice", 1, &pattern(1 << 20), 64 << 10).await;
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let (status, _) = post_magnet(addr, &seeds.magnet).await;
+    assert_eq!(status, 201);
+    let (status, answer) = post_torrent(addr, TORRENT_FILE, seeds.torrent.clone()).await;
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer["error"], "already added, as torrent 1");
+    assert_eq!(answer["id"], 1);
+    assert_eq!(
+        torrents_listed(addr).await["list"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_live_socket_sends_torrents() {
+    let wifi = cand_idx(1, "Wi-Fi", "127.0.0.1", true);
+    let net = Fake::scripted(vec![vec![wifi]]).loopback_links();
+    let h = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(20))).unwrap();
+    wait_until("Wi-Fi usable", || !h.usable().is_empty()).await;
+    let addr = serve_api(h.table()).await;
+    let mut socket = connect(addr).await;
+    frame(&mut socket).await;
+    frame(&mut socket).await;
+    let first = frame(&mut socket).await;
+    assert_eq!(first["type"], "torrents", "{first}");
+    assert_eq!(
+        first["torrents"],
+        json!({
+            "list": [],
+            "udp_cable": "Wi-Fi",
+            "listening": { "state": "off", "cable": null, "why": null }
+        })
+    );
+
+    assert_eq!(post_magnet(addr, MAGNET).await.0, 201);
+    let added = frame_where(&mut socket, "the torrent", |frame| {
+        frame["type"] == "torrents" && frame["torrents"]["list"][0]["id"] == 1
+    })
+    .await;
+    assert_eq!(added["torrents"]["list"][0]["phase"], "finding");
+}
+
+#[tokio::test]
+async fn a_torrent_stops_and_resumes_through_the_api() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    assert_eq!(post_magnet(addr, MAGNET).await.0, 201);
+    let json = "application/json";
+
+    let (status, answer) = torrent_control(addr, "1", "stop", json, "{}").await;
+    assert_eq!((status, &answer), (200, &json!({ "id": 1 })));
+    assert_eq!(torrents_listed(addr).await["list"][0]["phase"], "stopped");
+
+    let (status, answer) = torrent_control(addr, "1", "stop", json, "{}").await;
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(
+        answer["error"],
+        "it is not running, so there is nothing to stop"
+    );
+
+    let (status, answer) = torrent_control(addr, "1", "resume", json, "{}").await;
+    assert_eq!((status, &answer), (200, &json!({ "id": 1 })));
+    assert_eq!(torrents_listed(addr).await["list"][0]["phase"], "finding");
+
+    let (status, answer) = torrent_control(addr, "1", "resume", json, "{}").await;
+    assert_eq!(status, 409, "{answer}");
+
+    for id in ["2", "not-a-number"] {
+        let (status, answer) = torrent_control(addr, id, "stop", json, "{}").await;
+        assert_eq!(status, 404, "{answer}");
+        assert_eq!(answer["error"], "no such torrent");
+    }
+
+    let (status, _) = torrent_control(addr, "1", "stop", "text/plain", "{}").await;
+    assert_eq!(status, 415);
+    let (status, _) = torrent_control(addr, "1", "stop", json, r#"{"now": true}"#).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn only_a_magnet_or_a_torrent_file_is_accepted() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let (status, answer) = post_torrent(addr, "text/plain", MAGNET.into()).await;
+    assert_eq!(status, 415, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("magnet"),
+        "{answer}"
+    );
+
+    let json = "application/json";
+    for body in [
+        r#"{"url": "x"}"#,
+        r#"{"magnet": "x", "more": 1}"#,
+        "not json",
+    ] {
+        let (status, answer) = post_torrent(addr, json, body.into()).await;
+        assert_eq!(status, 400, "{body}: {answer}");
+        assert!(answer["error"].is_string(), "{answer}");
+    }
+
+    // Past axum's usual 2 MiB: a real file this size must reach the parser.
+    let (status, answer) = post_torrent(addr, TORRENT_FILE, vec![0; 3 << 20]).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("not a torrent file")
+    );
+
+    let (status, answer) = post_torrent(addr, TORRENT_FILE, vec![0; 17 << 20]).await;
+    assert_eq!(status, 413, "{answer}");
+    assert!(answer["error"].is_string(), "{answer}");
+
+    let charset = "application/x-bittorrent; charset=binary";
+    let (status, answer) = post_torrent(addr, charset, b"not bencode".to_vec()).await;
+    assert_eq!(
+        status, 400,
+        "the file is read, whatever follows the type: {answer}"
+    );
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("not a torrent file")
+    );
+}
+
+#[tokio::test]
+async fn another_sites_page_cannot_add_a_torrent() {
+    let h = start(Fake::scripted(vec![vec![]]));
+    let addr = serve_api(h.table()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/torrents"))
+        .header("content-type", TORRENT_FILE)
+        .header("origin", "https://attacker.example")
+        .body(b"anything".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(torrents_listed(addr).await["list"], json!([]));
+}
+
+/// Stopping the engine hangs up on every peer of a torrent still running,
+/// and still returns promptly.
+#[tokio::test]
+async fn stopping_ends_a_running_torrents_connections() {
+    let seeds = slow_seeds("api-stops", 4 << 20, 64).await;
+    let dir = Folder::new("stops-torrents");
+    let listener = bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let links = wifi_to_the_file_server();
+    wait_until("Wi-Fi usable", || !links.usable().is_empty()).await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        links,
+        dir.0.clone(),
+        dir.0.clone(),
+        quiet_torrents(seeds.addrs.clone()),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let (status, _) = post_torrent(addr, TORRENT_FILE, seeds.torrent.clone()).await;
+    assert_eq!(status, 201);
+    wait_until("the seed connected", || seeds.peers() > 0).await;
+
+    stop.send(()).unwrap();
+    let returned = timeout(Duration::from_secs(4), server).await;
+    assert!(
+        matches!(returned, Ok(Ok(Ok(())))),
+        "the server did not return within 4 s: {returned:?}"
+    );
+    assert_eq!(seeds.peers(), 0, "still connected when it returned");
+}
+
+/// What `barrage` runs: a torrent through a cable shows in the one count of
+/// data used the downloads report, both ways.
+#[tokio::test]
+async fn serve_keeps_one_count_of_the_data_used() {
+    let len: usize = 1 << 20;
+    let seeds = seeds("api-one-count", 1, &pattern(len), 64 << 10).await;
+    let dir = Folder::new("one-count");
+    let listener = bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let links = wifi_to_the_file_server();
+    wait_until("Wi-Fi usable", || !links.usable().is_empty()).await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        links,
+        dir.0.clone(),
+        dir.0.clone(),
+        quiet_torrents(seeds.addrs.clone()),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let (status, _) = post_torrent(addr, TORRENT_FILE, seeds.torrent.clone()).await;
+    assert_eq!(status, 201);
+    torrents_where(addr, 30, "the torrent done", |list| {
+        list["list"][0]["phase"] == "done"
+    })
+    .await;
+    assert_eq!(std::fs::read(dir.0.join(FILE)).unwrap(), seeds.bytes);
+    let used = listed_where(addr, "the data used", |list| {
+        list["used"][0]["bytes"].as_u64() >= Some(len as u64)
+    })
+    .await;
+    assert_eq!(used["used"][0]["cable"], "Wi-Fi");
+    assert!(used["used"][0]["sent"].as_u64() > Some(0), "{used}");
+    drop(stop);
+    timeout(Duration::from_secs(4), server)
+        .await
+        .expect("the server returns")
+        .unwrap()
+        .unwrap();
 }

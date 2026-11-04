@@ -22,9 +22,9 @@ const TAB_ICONS: Record<Tab, () => ReactNode> = { downloads: DownloadIcon, links
  * what the cables could give together), the cables that carry data, and
  * the page's own connection to the engine, always as a word.
  */
-export function Header({ status, table, downloads, tab, onTab }: PageProps & { tab: Tab; onTab: (tab: Tab) => void }) {
+export function Header({ status, table, downloads, torrents, tab, onTab }: PageProps & { tab: Tab; onTab: (tab: Tab) => void }) {
   const tabs = useRef<(HTMLButtonElement | null)[]>([])
-  const figure = heroFigure(table, downloads)
+  const figure = heroFigure(table, downloads, torrents)
   const linked = linkedCables(table)
   const system = SYSTEM[status]
 

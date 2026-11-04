@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use barrage::LinkHandle;
-use barrage::fetch::{CableUse, DownloadConfig, DownloadStatus, Downloads, Phase};
+use barrage::fetch::{CableUse, DownloadConfig, DownloadStatus, Downloads, Phase, Usage};
 use barrage::links::LinkState;
 use barrage::links::probe::ProbeVerdict;
 use barrage::links::watch::{LinkTable, WatchConfig};
@@ -970,6 +970,48 @@ async fn a_speed_test_counts_as_data_used() {
             tokio::time::Instant::now() < deadline,
             "speed tests never counted: {:?}",
             downloads.used().borrow()
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+}
+
+/// Two engines share one count (phase 5: the downloads and the torrents):
+/// what either carries adds to it, and each speed test is added once, not
+/// once per engine.
+#[tokio::test]
+async fn two_engines_share_one_count_and_each_speed_test_counts_once() {
+    let net = two_links().sample_bytes(3 * MIB).loopback_links();
+    let links = LinkHandle::start_with(Arc::new(net), WatchConfig::every(ms(20))).unwrap();
+    let usage = Usage::counting_speed_tests(links.table());
+    let (dir1, dir2) = (
+        fetching::Folder::new("shared-1"),
+        fetching::Folder::new("shared-2"),
+    );
+    let first = Downloads::with_usage(links.table(), dir1.0.clone(), config(), Arc::clone(&usage));
+    let second = Downloads::with_usage(links.table(), dir2.0.clone(), config(), Arc::clone(&usage));
+
+    // What the speed tests pulled through the Wi-Fi, by the watcher's count.
+    let tested = || -> u64 {
+        links
+            .snapshot()
+            .iter()
+            .filter(|l| l.name == "Wi-Fi")
+            .map(|l| l.tested)
+            .sum()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (a, b, t) = (
+            used_by(&first, "Wi-Fi"),
+            used_by(&second, "Wi-Fi"),
+            tested(),
+        );
+        if t > 0 && a == t && b == t {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the engines show {a} and {b} for the Wi-Fi; its speed tests pulled {t}"
         );
         tokio::time::sleep(ms(20)).await;
     }

@@ -23,6 +23,15 @@ function Icon({ children, size = 14 }: { children: ReactNode; size?: number }) {
   )
 }
 
+/** Sent: an arrow leaving upward. */
+export function UploadIcon() {
+  return (
+    <Icon size={12}>
+      <path d="M8 13V3.5M4.5 7 8 3.5 11.5 7" />
+    </Icon>
+  )
+}
+
 /** Stop: two bars. */
 export function PauseIcon() {
   return (

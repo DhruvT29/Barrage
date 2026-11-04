@@ -1,7 +1,7 @@
 // The hero's and the header's figures, worked out from the engine's own
 // fields and nothing else. Small pure functions, so each rule is tested on
 // its own: unknown is null (drawn as "-"), never 0.
-import type { CombinedView, DownloadView, DownloadsView, NotCounted, TableView } from '../api/types'
+import type { CombinedView, DownloadView, DownloadsView, NotCounted, TableView, TorrentView, TorrentsView } from '../api/types'
 import { formatEta } from '../downloads/format'
 import { cables, joinNames, mbps } from '../links/cables'
 
@@ -12,15 +12,21 @@ export type HeroFigure = {
   bps: number | null
   /** By cable while downloading, by independent connection otherwise. */
   parts: { name: string; bps: number }[]
-  /** Downloads downloading. */
+  /** Downloads and torrents downloading. */
   running: number
   /** The combined speed available, in bits per second; null until measured. */
   available: number | null
 }
 
-/** The downloads downloading. Running is a state, not a speed: one that stalls keeps the hero on it. */
-export function downloadingCount(downloads: DownloadsView | null): number {
-  return downloads?.list.filter((d) => d.state === 'downloading').length ?? 0
+/** The torrents downloading. */
+function runningTorrents(torrents: TorrentsView | null | undefined): TorrentView[] {
+  return torrents?.list.filter((t) => t.phase === 'downloading') ?? []
+}
+
+/** The downloads and torrents downloading. Running is a state, not a speed: one that stalls keeps the hero on it. */
+export function downloadingCount(downloads: DownloadsView | null, torrents?: TorrentsView | null): number {
+  const own = downloads?.list.filter((d) => d.state === 'downloading').length ?? 0
+  return own + runningTorrents(torrents).length
 }
 
 /** The combined speed available, or null while nothing is measured: the engine's 0 then means "no parts". */
@@ -31,10 +37,15 @@ function availableBps(table: TableView | null): number | null {
 /**
  * While anything downloads, the live download speed, a part per cable
  * carrying data; otherwise the combined speed available, a part per
- * independent connection. The engine works out both (`api/view.rs`).
+ * independent connection. The engine works out both (`api/view.rs`), and
+ * `useLive` adds the torrents' speed to the downloads'.
  */
-export function heroFigure(table: TableView | null, downloads: DownloadsView | null): HeroFigure {
-  const running = downloadingCount(downloads)
+export function heroFigure(
+  table: TableView | null,
+  downloads: DownloadsView | null,
+  torrents?: TorrentsView | null,
+): HeroFigure {
+  const running = downloadingCount(downloads, torrents)
   const available = availableBps(table)
   if (downloads && running > 0) {
     return { mode: 'live', bps: downloads.live.bps, parts: downloads.live.parts, running, available }
@@ -112,7 +123,7 @@ export function averagePing(table: TableView | null): number | null {
   return Math.round(rtts.reduce((a, b) => a + b, 0) / rtts.length)
 }
 
-/** Every byte the cables have received for the downloads since the engine started; null before the first downloads. */
+/** Every byte the cables have received for the downloads and torrents since the engine started; null before the first downloads. */
 export function fetched(downloads: DownloadsView | null): number | null {
   if (!downloads) return null
   return downloads.used.reduce((sum, u) => sum + u.bytes, 0)
@@ -123,9 +134,27 @@ function left(d: DownloadView): number | null {
   return d.length === null ? null : Math.max(0, d.length - d.done)
 }
 
-/** The downloading download with the most left to fetch; one of unknown size only when no size is known. */
-export function leadTransfer(downloads: DownloadsView | null): DownloadView | null {
-  const running = downloads?.list.filter((d) => d.state === 'downloading') ?? []
+/** A torrent as the lead transfer shows it: its info hash stands for an address until it has a name. */
+function asTransfer(t: TorrentView): DownloadView {
+  return {
+    id: t.id,
+    url: t.info_hash,
+    name: t.name,
+    state: 'downloading',
+    length: t.length,
+    done: t.done,
+    bps: t.down_bps,
+    note: t.note,
+    cables: [],
+  }
+}
+
+/** The download or torrent downloading with the most left to fetch; one of unknown size only when no size is known. */
+export function leadTransfer(downloads: DownloadsView | null, torrents?: TorrentsView | null): DownloadView | null {
+  const running = [
+    ...(downloads?.list.filter((d) => d.state === 'downloading') ?? []),
+    ...runningTorrents(torrents).map(asTransfer),
+  ]
   if (running.length === 0) return null
   const sized = running.filter((d) => d.length !== null)
   if (sized.length === 0) return running[0]
@@ -152,6 +181,11 @@ export function clock(ms: number): string {
 /** The downloads Stop all asks: the ones a card's Stop would (starting, waiting, downloading). */
 export function stoppable(downloads: DownloadsView | null): DownloadView[] {
   return downloads?.list.filter((d) => d.state === 'starting' || d.state === 'waiting' || d.state === 'downloading') ?? []
+}
+
+/** The torrents Stop all asks: the ones a card's Stop would (finding, downloading). */
+export function stoppableTorrents(torrents: TorrentsView | null | undefined): TorrentView[] {
+  return torrents?.list.filter((t) => t.phase === 'finding' || t.phase === 'downloading') ?? []
 }
 
 /** "57.6": a speed's figure without its unit, for chips and tiles. */

@@ -14,7 +14,7 @@ import {
   StopIcon,
 } from '../shell/icons'
 import type { Tab } from '../tabs'
-import { stopDownload } from './control'
+import { controlTorrent, stopDownload } from './control'
 import {
   LIVE_NOTE,
   averagePing,
@@ -31,6 +31,7 @@ import {
   notCountedText,
   refusalLines,
   stoppable,
+  stoppableTorrents,
   type HeroFigure,
 } from './figures'
 import { Gauge } from './Gauge'
@@ -54,12 +55,13 @@ export function Hero({
   status,
   table,
   downloads,
+  torrents,
   history,
   colors,
   onAdd,
   onTab,
 }: PageProps & { onAdd: () => void; onTab: (tab: Tab) => void }) {
-  const figure = heroFigure(table, downloads)
+  const figure = heroFigure(table, downloads, torrents)
   const live = figure.mode === 'live'
   const connectedFor = useConnectedFor(table !== null)
   const regionName = live ? 'Downloading at' : table ? 'Combined speed available' : 'Overview'
@@ -121,7 +123,7 @@ export function Hero({
         )}
       </div>
 
-      <Side {...{ table, downloads, onAdd, onTab }} />
+      <Side {...{ table, downloads, torrents, onAdd, onTab }} />
     </section>
   )
 }
@@ -258,13 +260,14 @@ function chartSeries(
 function Side({
   table,
   downloads,
+  torrents,
   onAdd,
   onTab,
-}: Pick<PageProps, 'table' | 'downloads'> & { onAdd: () => void; onTab: (tab: Tab) => void }) {
+}: Pick<PageProps, 'table' | 'downloads' | 'torrents'> & { onAdd: () => void; onTab: (tab: Tab) => void }) {
   const ping = averagePing(table)
   const linked = linkedCables(table)
   const bytes = fetched(downloads)
-  const lead = leadTransfer(downloads)
+  const lead = leadTransfer(downloads, torrents)
   const leftOut = table?.combined.not_counted ?? []
 
   return (
@@ -274,13 +277,13 @@ function Side({
           <PlusIcon />
           Add download
         </button>
-        <StopAll downloads={downloads} />
+        <StopAll downloads={downloads} torrents={torrents} />
       </div>
 
       <div className="hero-tiles">
         <Tile label="Links" icon={<NodesIcon />} value={linked === null ? '-' : String(linked)} />
         <Tile label="Avg ping" icon={<PingIcon />} value={ping === null ? '-' : `${ping} ms`} />
-        <Tile label="Active" icon={<ActiveIcon />} value={downloads ? String(downloadingCount(downloads)) : '-'} />
+        <Tile label="Active" icon={<ActiveIcon />} value={downloads ? String(downloadingCount(downloads, torrents)) : '-'} />
         <Tile label="Fetched" icon={<FetchedIcon />} value={bytes === null ? '-' : formatBytes(bytes)} />
       </div>
 
@@ -339,12 +342,18 @@ function Lead({ download: d }: { download: NonNullable<ReturnType<typeof leadTra
 }
 
 /**
- * Stops every download a card's Stop would, all at once, while any runs.
- * Waits for every answer before it can be pressed again; a refusal is
- * written under it in the engine's words, by download.
+ * Stops every download and torrent a card's Stop would, all at once, while
+ * any runs. Waits for every answer before it can be pressed again; a refusal
+ * is written under it in the engine's words, by download.
  */
-function StopAll({ downloads }: { downloads: PageProps['downloads'] }) {
-  const running = stoppable(downloads)
+function StopAll({ downloads, torrents }: Pick<PageProps, 'downloads' | 'torrents'>) {
+  const running = [
+    ...stoppable(downloads).map((d) => ({ name: d.name ?? d.url, stop: () => stopDownload(d.id) })),
+    ...stoppableTorrents(torrents).map((t) => ({
+      name: t.name ?? t.info_hash,
+      stop: () => controlTorrent(t.id, 'stop'),
+    })),
+  ]
   const [sending, setSending] = useState(false)
   const [refused, setRefused] = useState<string[]>([])
   // A second press before the page redraws must not ask twice.
@@ -357,10 +366,10 @@ function StopAll({ downloads }: { downloads: PageProps['downloads'] }) {
     busy.current = true
     setSending(true)
     setRefused([])
-    const answers = await Promise.all(running.map(async (d) => ({ d, answer: await stopDownload(d.id) })))
+    const answers = await Promise.all(running.map(async (one) => ({ name: one.name, answer: await one.stop() })))
     busy.current = false
     setSending(false)
-    const words = answers.flatMap(({ d, answer }) => ('refused' in answer ? [{ name: d.name ?? d.url, words: answer.refused }] : []))
+    const words = answers.flatMap(({ name, answer }) => ('refused' in answer ? [{ name, words: answer.refused }] : []))
     setRefused(refusalLines(words, answers.length))
   }
 

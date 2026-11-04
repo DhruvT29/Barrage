@@ -1,7 +1,7 @@
 // Made-up engine messages for the preview page (preview.html), never built
 // into the engine's page. Addresses are documentation ranges only
 // (192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::): the repository is public.
-import type { DownloadsView, DownloadView, LinkView, TableView } from '../api/types'
+import type { DownloadsView, DownloadView, LinkView, TableView, TorrentsView, TorrentView } from '../api/types'
 
 const MB = 8e6
 
@@ -94,9 +94,9 @@ export function previewDownloads(t: number): DownloadsView {
     live: { bps: wifi + eth + phone, parts },
     list,
     used: [
-      { cable: 'Ethernet', bytes: 3.9e9 + bigDone * 0.62 },
-      { cable: 'Wi-Fi', bytes: 3.3e9 + bigDone * 0.38 },
-      { cable: 'Ethernet 2', bytes: isoDone },
+      { cable: 'Ethernet', bytes: 3.9e9 + bigDone * 0.62, sent: 0 },
+      { cable: 'Wi-Fi', bytes: 3.3e9 + bigDone * 0.38, sent: 0 },
+      { cable: 'Ethernet 2', bytes: isoDone, sent: 0 },
     ],
   }
 }
@@ -140,7 +140,59 @@ export function withLongWords(table: TableView, downloads: DownloadsView): [Tabl
       ...downloads,
       live: { bps: downloads.live.bps + 3 * MB, parts: [...downloads.live.parts, { name, bps: 3 * MB }] },
       list: [...downloads.list, ...long],
-      used: [...downloads.used, { cable: name, bytes: 3.3e9 }],
+      used: [...downloads.used, { cable: name, bytes: 3.3e9, sent: 0 }],
     },
   ]
+}
+
+/** The torrents at second `t`: one in each phase, one downloading through two cables, one of them metered. */
+export function previewTorrents(t: number): TorrentsView {
+  const wifi = wiggle(9 * MB, t, 0.7)
+  const phone = wiggle(5 * MB, t, 3.1)
+  const whole = 3.2e9
+  const fromWifi = Math.min(whole * 0.7, 1.1e9 + (t * wifi) / 8)
+  const fromPhone = Math.min(whole * 0.3, 0.42e9 + (t * phone) / 8)
+  const done = Math.floor(fromWifi + fromPhone)
+  const list: TorrentView[] = [
+    {
+      id: 1, name: 'a-distribution-netinst-amd64.iso', info_hash: 'a'.repeat(40), phase: 'done', length: 660e6, done: 660e6,
+      down_bps: 0, up_bps: 0, peers: 0, note: null,
+      cables: [{ name: 'Wi-Fi', received: 660e6, sent: 41e6, bps: 0, connections: 0, uploads: true }],
+    },
+    {
+      id: 2, name: 'open-movie-2160p.mkv', info_hash: 'b'.repeat(40), phase: 'stopped', length: 8.4e9, done: 2.9e9,
+      down_bps: 0, up_bps: 0, peers: 0, note: null,
+      cables: [
+        { name: 'Wi-Fi', received: 2.2e9, sent: 180e6, bps: 0, connections: 0, uploads: true },
+        { name: 'Ethernet 2', received: 0.7e9, sent: 0, bps: 0, connections: 0, uploads: false },
+      ],
+    },
+    {
+      id: 3, name: 'research-dataset-2026.tar', info_hash: 'c'.repeat(40), phase: 'failed', length: 21e9, done: 4e9,
+      down_bps: 0, up_bps: 0, peers: 0, note: 'error writing to disk: there is not enough space on the disk', cables: [],
+    },
+    {
+      id: 4, name: 'distro-24.04-desktop-amd64.iso', info_hash: 'd'.repeat(40), phase: 'downloading', length: whole, done,
+      down_bps: wifi + phone, up_bps: wiggle(1.4 * MB, t, 1.9), peers: 23, note: null,
+      cables: [
+        { name: 'Wi-Fi', received: Math.floor(fromWifi), sent: 96e6, bps: wifi, connections: 16, uploads: true },
+        { name: 'Ethernet 2', received: Math.floor(fromPhone), sent: 0, bps: phone, connections: 7, uploads: false },
+      ],
+    },
+    {
+      id: 5, name: null, info_hash: '0123456789abcdef0123456789abcdef01234567', phase: 'finding', length: null, done: 0,
+      down_bps: 0, up_bps: 0, peers: 0, note: null, cables: [],
+    },
+  ]
+  return {
+    list,
+    udp_cable: 'Wi-Fi',
+    listening: t % 40 < 20
+      ? { state: 'trying', cable: 'Wi-Fi', why: null }
+      : {
+          state: 'closed',
+          cable: 'Wi-Fi',
+          why: 'no peer called in within 10 minutes; this PC cannot be reached from outside on Wi-Fi',
+        },
+  }
 }

@@ -207,3 +207,97 @@ test('Tab stays inside the window', () => {
   fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })
   expect(button()).toHaveFocus()
 })
+
+const MAGNET = 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=song.flac'
+
+function typeAndSend(text: string) {
+  fireEvent.change(screen.getByRole('textbox', { name: 'Link' }), { target: { value: text } })
+  fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+}
+
+/** Chooses `file`, as the system's file window does. */
+function choose(file: File) {
+  const picker = screen.getByLabelText('A .torrent file') as HTMLInputElement
+  fireEvent.change(picker, { target: { files: [file] } })
+}
+
+test('a magnet link in the field is sent as a torrent', async () => {
+  const asked = engine({ status: 201, body: { id: 1 } })
+  const closed = vi.fn()
+  render(<Page onClose={closed} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  await act(async () => typeAndSend(`  ${MAGNET}  `))
+  expect(asked.map((a) => a.url)).toEqual(['/api/torrents'])
+  expect(asked[0].init.headers).toEqual({ 'Content-Type': 'application/json' })
+  expect(JSON.parse(asked[0].init.body as string)).toEqual({ magnet: MAGNET })
+  expect(closed).toHaveBeenCalledOnce()
+})
+
+test('a magnet link is one in any case, and an address stays a download', async () => {
+  const asked = engine({ status: 201, body: { id: 1 } }, { status: 201, body: { id: 2 } })
+  const { unmount } = render(<Page />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  await act(async () => typeAndSend('MAGNET:?xt=urn:btih:aa'))
+  unmount()
+  render(<Page />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  await act(async () => typeAndSend('https://example.com/magnet:file.iso'))
+  expect(asked.map((a) => a.url)).toEqual(['/api/torrents', '/api/downloads'])
+})
+
+test('a chosen .torrent file is sent as its bytes', async () => {
+  const asked = engine({ status: 201, body: { id: 1 } })
+  const closed = vi.fn()
+  render(<Page onClose={closed} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  const file = new File(['d4:infoe'], 'distro.torrent', { type: 'application/x-bittorrent' })
+  await act(async () => choose(file))
+  expect(asked.map((a) => a.url)).toEqual(['/api/torrents'])
+  expect(asked[0].init.headers).toEqual({ 'Content-Type': 'application/x-bittorrent' })
+  expect(asked[0].init.body).toBe(file)
+  expect(closed).toHaveBeenCalledOnce()
+})
+
+test('the Choose button opens the system\'s file window', () => {
+  render(<Page />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  const picker = screen.getByLabelText('A .torrent file') as HTMLInputElement
+  const opened = vi.spyOn(picker, 'click')
+  fireEvent.click(screen.getByRole('button', { name: 'Choose a .torrent file' }))
+  expect(opened).toHaveBeenCalledOnce()
+  expect(picker.accept).toContain('.torrent')
+})
+
+test('the engine\'s refusal of a magnet or a file is shown as it is, and the window stays', async () => {
+  const magnetWords = 'not a magnet link this engine can use: it has no v1 (btih) info hash'
+  const fileWords = 'not a torrent file: the data is cut short'
+  engine({ status: 400, body: { error: magnetWords } }, { status: 400, body: { error: fileWords } })
+  const closed = vi.fn()
+  render(<Page onClose={closed} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  await act(async () => typeAndSend('magnet:?dn=nothing'))
+  expect(screen.getByRole('alert')).toHaveTextContent(magnetWords)
+  await act(async () => choose(new File(['x'], 'bad.torrent')))
+  expect(screen.getByRole('alert')).toHaveTextContent(fileWords)
+  expect(closed).not.toHaveBeenCalled()
+  expect(screen.getByRole('dialog')).toBeInTheDocument()
+})
+
+test('a torrent already added says so, in the engine\'s words', async () => {
+  engine({ status: 409, body: { error: 'already added, as torrent 3', id: 3 } })
+  render(<Page />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  await act(async () => typeAndSend(MAGNET))
+  expect(screen.getByRole('alert')).toHaveTextContent('already added, as torrent 3')
+})
+
+test('with nothing chosen, the file window closing sends nothing', async () => {
+  const asked = engine()
+  render(<Page />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+  const picker = screen.getByLabelText('A .torrent file')
+  await act(async () => {
+    fireEvent.change(picker, { target: { files: [] } })
+  })
+  expect(asked).toEqual([])
+})

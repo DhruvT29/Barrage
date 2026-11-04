@@ -26,12 +26,12 @@ mod disk;
 mod download;
 pub mod name;
 pub mod ranges;
-mod rate;
+pub(crate) mod rate;
 pub mod remote;
 mod saved;
-mod schedule;
+pub(crate) mod schedule;
 mod spans;
-mod used;
+pub(crate) mod used;
 mod worker;
 
 use std::collections::HashMap;
@@ -52,6 +52,7 @@ pub use disk::downloads_folder;
 pub use name::{file_name, free_name};
 pub use ranges::Ranges;
 pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Refused, Remote, Validator, find, retry_after};
+pub use used::Usage;
 
 /// Every download the engine runs, and what each is doing. Cheap to clone:
 /// the clones share the downloads.
@@ -265,12 +266,16 @@ pub struct DownloadStatus {
     pub note: Option<String>,
 }
 
-/// The data one cable has received for the engine's downloads.
+/// The data one cable has carried for the engine: every download and
+/// torrent, and its speed tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CableUse {
     /// The cable's name.
     pub cable: String,
+    /// Received.
     pub bytes: u64,
+    /// Sent: a torrent's upload.
+    pub sent: u64,
 }
 
 /// One link's part in a download. A link that has gone keeps its share, so
@@ -298,12 +303,19 @@ impl Downloads {
     }
 
     pub fn with_config(table: LinkTable, dir: PathBuf, config: DownloadConfig) -> Self {
+        let usage = Usage::counting_speed_tests(table.clone());
+        Self::with_usage(table, dir, config, usage)
+    }
+
+    /// As [`Downloads::with_config`], adding to `usage`, the engine's one
+    /// count, which the torrents add to as well.
+    pub fn with_usage(
+        table: LinkTable,
+        dir: PathBuf,
+        config: DownloadConfig,
+        used: Arc<Usage>,
+    ) -> Self {
         let (status, _) = watch::channel(Vec::new());
-        let used = Arc::new(used::Usage::new());
-        // Outside a runtime there is no watcher either, so nothing to count.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(used::count_speed_tests(table.clone(), Arc::clone(&used)));
-        }
         Self {
             inner: Arc::new(Inner {
                 table,
@@ -577,6 +589,34 @@ pub(crate) fn size_words(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+impl crate::transfer::TransferEngine for Downloads {
+    type Request = AddRequest;
+    type Id = DownloadId;
+    type Status = DownloadStatus;
+    type AddError = AddError;
+    type ControlError = ControlError;
+
+    async fn add(&self, request: AddRequest) -> Result<DownloadId, AddError> {
+        Downloads::add(self, request).await
+    }
+
+    fn status(&self) -> watch::Receiver<Vec<DownloadStatus>> {
+        Downloads::status(self)
+    }
+
+    async fn stop(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::stop(self, id).await
+    }
+
+    async fn resume(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::resume(self, id).await
+    }
+
+    async fn shutdown(&self) {
+        Downloads::shutdown(self).await
+    }
 }
 
 #[cfg(test)]

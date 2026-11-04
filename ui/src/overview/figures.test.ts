@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest'
 
 import { etaText } from '../downloads/queue'
-import type { CombinedView, DownloadState, DownloadView, DownloadsView, LinkView, TableView } from '../api/types'
+import type { CombinedView, DownloadState, DownloadView, DownloadsView, LinkView, TableView, TorrentsView, TorrentView } from '../api/types'
 import {
   averagePing,
   clock,
@@ -9,12 +9,14 @@ import {
   eta,
   fetched,
   gaugeCaption,
+  downloadingCount,
   heroFigure,
   leadTransfer,
   linkedCables,
   notCountedText,
   refusalLines,
   stoppable,
+  stoppableTorrents,
 } from './figures'
 
 let nextId = 1
@@ -143,8 +145,8 @@ test('the average ping is over the usable cables that have one, "-" when none', 
 
 test('fetched is every byte the cables have received', () => {
   const used = [
-    { cable: 'Wi-Fi', bytes: 1_200_000 },
-    { cable: 'Ethernet', bytes: 300_000 },
+    { cable: 'Wi-Fi', bytes: 1_200_000, sent: 0 },
+    { cable: 'Ethernet', bytes: 300_000, sent: 0 },
   ]
   expect(fetched(downloads([], { used }))).toBe(1_500_000)
   expect(fetched(null)).toBeNull()
@@ -230,4 +232,57 @@ test("Stop all's refusals: each wording once, with the downloads it was for unle
     ),
   ).toEqual(['a.iso: download 1 is not running', `b.iso, c.iso: ${off}`])
   expect(refusalLines([], 3)).toEqual([])
+})
+
+function torrent(fields: Partial<TorrentView> = {}): TorrentView {
+  return {
+    id: 9,
+    name: 'distro.iso',
+    info_hash: 'ab'.repeat(20),
+    phase: 'downloading',
+    length: 1000,
+    done: 100,
+    down_bps: 8_000,
+    up_bps: 0,
+    peers: 1,
+    note: null,
+    cables: [],
+    ...fields,
+  }
+}
+
+const swarmOf = (...list: TorrentView[]): TorrentsView => ({
+  list,
+  udp_cable: null,
+  listening: { state: 'off', cable: null, why: null },
+})
+
+const NO_DOWNLOADS: DownloadsView = { live: { bps: 0, parts: [] }, list: [], used: [] }
+
+test('a torrent downloading counts as running, and keeps the hero on the live speed', () => {
+  const torrents = swarmOf(torrent(), torrent({ phase: 'finding' }), torrent({ phase: 'done' }))
+  expect(downloadingCount(NO_DOWNLOADS, torrents)).toBe(1)
+  expect(heroFigure(null, NO_DOWNLOADS, torrents)).toMatchObject({ mode: 'live', running: 1 })
+  expect(heroFigure(null, NO_DOWNLOADS, swarmOf(torrent({ phase: 'stopped' }))).mode).toBe('available')
+})
+
+test('the lead transfer is the torrent with the most left, among the downloads too', () => {
+  const big = torrent({ name: 'big.iso', length: 9000, done: 0 })
+  expect(leadTransfer(NO_DOWNLOADS, swarmOf(big))?.name).toBe('big.iso')
+  expect(leadTransfer(NO_DOWNLOADS, swarmOf(big))?.bps).toBe(8_000)
+  expect(leadTransfer(NO_DOWNLOADS, swarmOf(torrent({ phase: 'stopped' })))).toBeNull()
+  const hash = torrent({ name: null })
+  expect(leadTransfer(NO_DOWNLOADS, swarmOf(hash))?.url).toBe(hash.info_hash)
+})
+
+test('Stop all takes the torrents a card\'s Stop would', () => {
+  const torrents = swarmOf(
+    torrent({ id: 1 }),
+    torrent({ id: 2, phase: 'finding' }),
+    torrent({ id: 3, phase: 'stopped' }),
+    torrent({ id: 4, phase: 'done' }),
+    torrent({ id: 5, phase: 'failed' }),
+  )
+  expect(stoppableTorrents(torrents).map((t) => t.id)).toEqual([1, 2])
+  expect(stoppableTorrents(null)).toEqual([])
 })
