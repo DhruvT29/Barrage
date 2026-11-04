@@ -19,7 +19,7 @@ use barrage::bt::{
 use barrage::fetch::Usage;
 use barrage::transfer::TransferEngine;
 use fetching::{ethernet, links};
-use torrent::{FILE, Seeds, fresh_dir, listening_on, pattern, seeds_with};
+use torrent::{FILE, Seeds, folder_seeds, fresh_dir, listening_on, pattern, seeds_with};
 
 /// "Ethernet 2", up.
 async fn one_cable() -> LinkHandle {
@@ -275,5 +275,61 @@ async fn shutdown_ends_the_session() {
         refused,
         Err(TorrentAddError::Stopped),
         "nothing is added once the engine has stopped"
+    );
+}
+
+/// A multi-file torrent keeps to a folder of its own, its name, so two with
+/// a file of one name do not overwrite each other, or scatter through the
+/// download folder. One comes by a magnet link, its layout known only from
+/// a peer.
+#[tokio::test]
+async fn multi_file_torrents_keep_to_a_folder_of_their_own() {
+    let (poster_one, poster_two) = (pattern(70_000), pattern(90_000));
+    let track = pattern(200_000);
+    let one = folder_seeds(
+        "album-one",
+        &[("poster.jpg", &poster_one), ("disc 1/track.bin", &track)],
+    )
+    .await;
+    let two = folder_seeds(
+        "album-two",
+        &[("poster.jpg", &poster_two), ("notes.txt", b"liner notes")],
+    )
+    .await;
+    let cables = one_cable().await;
+    let peers = [one.addrs.clone(), two.addrs.clone()].concat();
+    let (torrents, dir) = torrents("multi-file", &cables, peers).await;
+
+    let first = torrents
+        .add(Source::File(one.torrent.clone()))
+        .await
+        .unwrap();
+    let second = torrents
+        .add(Source::Magnet(two.magnet.clone()))
+        .await
+        .unwrap();
+    for id in [first, second] {
+        wait_for(&torrents, id, 30, "done", |t| t.phase == TorrentPhase::Done).await;
+    }
+
+    assert_eq!(
+        std::fs::read(dir.join("album-one/poster.jpg")).unwrap(),
+        poster_one
+    );
+    assert_eq!(
+        std::fs::read(dir.join("album-one/disc 1/track.bin")).unwrap(),
+        track
+    );
+    assert_eq!(
+        std::fs::read(dir.join("album-two/poster.jpg")).unwrap(),
+        poster_two
+    );
+    assert_eq!(
+        std::fs::read(dir.join("album-two/notes.txt")).unwrap(),
+        b"liner notes"
+    );
+    assert!(
+        !dir.join("poster.jpg").exists(),
+        "loose in the download folder"
     );
 }

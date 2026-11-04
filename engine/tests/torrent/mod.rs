@@ -165,6 +165,58 @@ pub async fn seeds_with(
     }
 }
 
+/// One seed of a multi-file torrent named `name`: `files` by their paths in it.
+pub async fn folder_seeds(name: &str, files: &[(&str, &[u8])]) -> Seeds {
+    let dir = fresh_dir(&format!("{name}-seed"));
+    let folder = dir.join(name);
+    for (path, bytes) in files {
+        let path = folder.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let made = create_torrent(
+        &folder,
+        CreateTorrentOptions {
+            name: Some(name),
+            trackers: vec![],
+            piece_length: Some(64 << 10),
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await
+    .unwrap();
+    let torrent = made.as_bytes().unwrap().to_vec();
+    let info_hash = made.info_hash();
+    let session = Session::new_with_opts(dir.clone(), listening_on("127.0.0.1"))
+        .await
+        .unwrap();
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(folder.to_string_lossy().into_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap()
+        .wait_until_completed()
+        .await
+        .unwrap();
+    Seeds {
+        addrs: vec![session.listen_addr().expect("a seed listens")],
+        torrent,
+        magnet: format!("magnet:?xt=urn:btih:{}", info_hash.as_string()),
+        info_hash,
+        bytes: Vec::new(),
+        dir,
+        sessions: vec![session],
+    }
+}
+
 /// `n` seeds of `bytes`, listening on 127.0.0.1.
 pub async fn seeds(name: &str, n: usize, bytes: &[u8], piece_len: u32) -> Seeds {
     seeds_with(name, n, bytes, piece_len, || listening_on("127.0.0.1")).await

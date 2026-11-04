@@ -298,8 +298,9 @@ impl Inner {
                 Source::Magnet(link) => AddTorrent::from_url(link),
                 Source::File(bytes) => AddTorrent::from_bytes(bytes),
             };
+            // No output folder: left to the session's, a multi-file torrent
+            // gets a folder of its own, by its name, checked against traversal.
             let options = AddTorrentOptions {
-                output_folder: Some(giving.dir.to_string_lossy().into_owned()),
                 overwrite: true,
                 paused,
                 initial_peers: (!giving.config.peers.is_empty())
