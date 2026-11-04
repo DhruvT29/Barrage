@@ -4,11 +4,12 @@
 //! every tick from librqbit's state. A finished torrent is paused, and so is
 //! a stopped one: neither uploads (no seeding, the user's choice).
 //!
-//! The session's DHT, UDP tracker and uTP sockets are bound to the UDP
-//! cable (`choose::udp_cable`), and librqbit binds them only when a session
-//! starts: when the UDP cable changes, the session is rebuilt on the new
-//! one (`rebuild::due`) and every torrent given to it again in its phase.
-//! librqbit checks the files already on disk, so each keeps what it has.
+//! The session's DHT, UDP tracker and uTP sockets and its listener are bound
+//! to the UDP cable (`choose::udp_cable`), and librqbit binds them only when
+//! a session starts: when the UDP cable changes, or the port opens or closes
+//! (`listen::next`), the session is rebuilt (`rebuild::due`) and every
+//! torrent given to it again in its phase. librqbit checks the files already
+//! on disk, so each keeps what it has.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -18,14 +19,15 @@ use std::time::Duration;
 
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig,
-    ManagedTorrent, Session, SessionOptions, TorrentStatsState,
+    ListenerMode, ListenerOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::choose::udp_cable;
 use super::connect::Connector;
-use super::rebuild::due;
+use super::listen::{Listening, TRY_FOR, next};
+use super::rebuild::{Place, due};
 use super::source::{Source, TorrentAddError, info_hash};
 use super::status::{
     Swarm, TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus,
@@ -44,8 +46,10 @@ pub struct TorrentConfig {
     /// DHT bootstrapping and trackers. Off, the DHT socket still opens but
     /// is told of nobody, and torrents find only `peers`.
     pub network: bool,
-    /// Listen for peers calling in (Task 9).
+    /// Listen for peers calling in.
     pub listen: bool,
+    /// How long a torrent runs with nobody calling in before the port closes.
+    pub try_for: Duration,
     /// How often the status is published.
     pub tick: Duration,
     /// Peers every torrent starts with, besides what it finds.
@@ -57,6 +61,7 @@ impl Default for TorrentConfig {
         Self {
             network: true,
             listen: true,
+            try_for: TRY_FOR,
             tick: Duration::from_secs(1),
             peers: Vec::new(),
         }
@@ -103,8 +108,8 @@ struct Inner {
     session: Mutex<Arc<Session>>,
     /// Counts the sessions, one more at each rebuild.
     generation: AtomicU64,
-    /// The UDP cable and address the session is on, and when it was last
-    /// rebuilt.
+    /// Where the session is, where the port stands, and when the session
+    /// was last rebuilt.
     udp: Mutex<Udp>,
     swarm: watch::Sender<Swarm>,
     dir: PathBuf,
@@ -122,7 +127,8 @@ struct Inner {
 
 #[derive(Default)]
 struct Udp {
-    on: Option<(String, IpAddr)>,
+    on: Option<Place>,
+    listening: Listening,
     rebuilt: Option<Instant>,
 }
 
@@ -141,10 +147,21 @@ impl Torrents {
     ) -> anyhow::Result<Self> {
         let connector = Arc::new(Connector::new(table.clone(), Arc::clone(&usage)));
         let udp = udp_cable(&table.snapshot());
-        let ip = udp.as_ref().map_or(NO_CABLE, |(_, ip)| *ip);
+        let listening = if config.listen {
+            let cable = udp.as_ref().map(|(cable, _)| cable.as_str());
+            let now = Instant::now();
+            next(&Listening::Off, now, 0, false, cable, config.try_for)
+        } else {
+            Listening::Off
+        };
+        let on = udp.map(|(cable, ip)| Place {
+            cable,
+            ip,
+            listening: listening.wants_port(),
+        });
         let session = Session::new_with_opts(
             dir.clone(),
-            session_options(Arc::clone(&connector), &config, ip),
+            session_options(Arc::clone(&connector), &config, on.as_ref()),
         )
         .await?;
         let torrents = Self {
@@ -152,11 +169,13 @@ impl Torrents {
                 session: Mutex::new(session),
                 generation: AtomicU64::new(0),
                 swarm: watch::channel(Swarm {
-                    udp_cable: udp.as_ref().map(|(cable, _)| cable.clone()),
+                    udp_cable: on.as_ref().map(|on| on.cable.clone()),
+                    listening: listening.clone(),
                 })
                 .0,
                 udp: Mutex::new(Udp {
-                    on: udp,
+                    on,
+                    listening,
                     rebuilt: None,
                 }),
                 dir,
@@ -183,13 +202,13 @@ impl Torrents {
                     return;
                 }
                 inner.publish().await;
-                inner.move_udp().await;
+                inner.move_session().await;
             }
         });
         Ok(torrents)
     }
 
-    /// The UDP cable, kept up to date.
+    /// The UDP cable and the listening port, kept up to date.
     pub fn swarm(&self) -> watch::Receiver<Swarm> {
         self.inner.swarm.subscribe()
     }
@@ -199,15 +218,21 @@ impl Torrents {
     pub fn udp_addrs(&self) -> Vec<SocketAddr> {
         self.inner.session().udp_local_addrs()
     }
+
+    /// The address peers can call in on, while the session listens.
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        self.inner.session().listen_addr()
+    }
 }
 
-/// librqbit's options: BARRAGE opens every peer connection; UDP on `udp_ip`;
+/// librqbit's options: BARRAGE opens every peer connection; UDP and any
+/// listener at `place`, or on this machine, with no listener, without one;
 /// no local service discovery (it multicasts on every interface, not one
 /// cable); no persistence before phase 6.
 fn session_options(
     connector: Arc<Connector>,
     config: &TorrentConfig,
-    udp_ip: IpAddr,
+    place: Option<&Place>,
 ) -> SessionOptions {
     let mut options = SessionOptions {
         connect: Some(ConnectionOptions {
@@ -219,11 +244,16 @@ fn session_options(
             port: None,
             persistence: None,
         }),
-        udp_bind_ip: Some(udp_ip),
+        udp_bind_ip: Some(place.map_or(NO_CABLE, |on| on.ip)),
         disable_local_service_discovery: true,
         fastresume: false,
         persistence: None,
-        listen: None,
+        listen: place.filter(|on| on.listening).map(|on| ListenerOptions {
+            mode: ListenerMode::TcpAndUtp,
+            listen_addr: SocketAddr::new(on.ip, 0),
+            enable_upnp_port_forwarding: config.network,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     if !config.network {
@@ -313,22 +343,57 @@ impl Inner {
         });
     }
 
-    /// Rebuild the session on the UDP cable, if it has changed and the last
-    /// rebuild is long enough ago.
-    async fn move_udp(self: &Arc<Self>) {
-        let wanted = udp_cable(&self.table.snapshot());
-        let (cable, ip) = {
+    /// Where the port stands now, given the UDP cable wanted.
+    fn look_at_port(&self, udp: &mut Udp, wanted: Option<(&str, IpAddr)>, now: Instant) {
+        // A peer reaching the old listener says nothing of a cable the
+        // session has yet to move to.
+        let settled = udp.on.as_ref().map(|on| (on.cable.as_str(), on.ip)) == wanted;
+        let incoming = self.connector.take_incoming();
+        let running = self
+            .list
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.wanted == Wanted::Running && e.failed.is_none());
+        let port = next(
+            &udp.listening,
+            now,
+            if settled { incoming } else { 0 },
+            running,
+            wanted.map(|(cable, _)| cable),
+            self.config.try_for,
+        );
+        if !port.reads_like(&udp.listening) {
+            self.swarm
+                .send_modify(|swarm| swarm.listening = port.clone());
+        }
+        udp.listening = port;
+    }
+
+    /// Rebuild the session if the UDP cable or the port has changed and the
+    /// last rebuild is long enough ago.
+    async fn move_session(self: &Arc<Self>) {
+        let cable = udp_cable(&self.table.snapshot());
+        let place = {
             let mut udp = self.udp.lock().unwrap();
             let now = Instant::now();
-            let current = udp.on.as_ref().map(|(cable, ip)| (cable.as_str(), *ip));
-            let asked = wanted.as_ref().map(|(cable, ip)| (cable.as_str(), *ip));
-            if !due(now, current, asked, udp.rebuilt) {
+            if self.config.listen {
+                let asked = cable.as_ref().map(|(cable, ip)| (cable.as_str(), *ip));
+                self.look_at_port(&mut udp, asked, now);
+            }
+            let wanted = cable.map(|(cable, ip)| Place {
+                cable,
+                ip,
+                listening: udp.listening.wants_port(),
+            });
+            if !due(now, udp.on.as_ref(), wanted.as_ref(), udp.rebuilt) {
                 return;
             }
             udp.rebuilt = Some(now);
             wanted.expect("due wants a cable")
         };
-        let options = session_options(Arc::clone(&self.connector), &self.config, ip);
+        let cable = place.cable.clone();
+        let options = session_options(Arc::clone(&self.connector), &self.config, Some(&place));
         let session = match Session::new_with_opts(self.dir.clone(), options).await {
             Ok(session) => session,
             Err(why) => {
@@ -361,10 +426,9 @@ impl Inner {
                 (e.id, e.source.clone(), e.wanted != Wanted::Running)
             })
             .collect();
-        self.udp.lock().unwrap().on = Some((cable.clone(), ip));
-        self.swarm.send_replace(Swarm {
-            udp_cable: Some(cable),
-        });
+        self.udp.lock().unwrap().on = Some(place);
+        self.swarm
+            .send_modify(|swarm| swarm.udp_cable = Some(cable));
         old.stop().await;
         if self.stopping.load(Ordering::SeqCst) {
             // Shut down meanwhile, perhaps before this session was in place.

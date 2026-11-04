@@ -52,7 +52,30 @@ pub struct Seeds {
     pub magnet: String,
     /// The file's bytes, to compare a download with.
     pub bytes: Vec<u8>,
+    dir: PathBuf,
     sessions: Vec<Arc<Session>>,
+}
+
+impl Seeds {
+    /// One more seed, calling in on `peer`.
+    pub async fn calling(&self, peer: SocketAddr) -> Arc<Session> {
+        let session = Session::new_with_opts(self.dir.clone(), quiet_options())
+            .await
+            .unwrap();
+        session
+            .add_torrent(
+                AddTorrent::from_bytes(self.torrent.clone()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(self.dir.to_string_lossy().into_owned()),
+                    overwrite: true,
+                    initial_peers: Some(vec![peer]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        session
+    }
 }
 
 /// A folder of its own for one test, emptied first.
@@ -122,6 +145,7 @@ pub async fn seeds_with(
         magnet: format!("magnet:?xt=urn:btih:{}", info_hash.as_string()),
         info_hash,
         bytes: bytes.to_vec(),
+        dir,
         sessions,
     }
 }

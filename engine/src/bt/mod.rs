@@ -5,11 +5,13 @@
 pub mod choose;
 mod connect;
 mod counted;
+pub mod listen;
 mod rebuild;
 pub mod source;
 mod status;
 mod torrents;
 
+pub use listen::Listening;
 pub use source::{Source, TorrentAddError};
 pub use status::{
     Swarm, TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus,

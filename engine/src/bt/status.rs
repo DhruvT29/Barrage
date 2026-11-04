@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use super::listen::Listening;
+
 /// A torrent's id, from 1 in the order torrents were added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TorrentId(pub(crate) u64);
@@ -68,6 +70,8 @@ pub struct Swarm {
     /// The cable carrying DHT, UDP trackers and uTP; `None` while no cable
     /// works, when they stay on this machine.
     pub udp_cable: Option<String>,
+    /// Whether peers can call in.
+    pub listening: Listening,
 }
 
 /// Why a torrent was not stopped or resumed, in the engine's words.

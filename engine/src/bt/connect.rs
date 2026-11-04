@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +48,8 @@ pub(crate) struct Connector {
     /// Each torrent's part through each cable, by (info hash, cable), in
     /// the order each first carried.
     tallies: Mutex<Vec<(String, String, Arc<Tally>)>>,
+    /// Peers that called in since the last `take_incoming`.
+    incoming: AtomicU64,
 }
 
 impl Connector {
@@ -58,7 +60,13 @@ impl Connector {
             open: Arc::default(),
             lines: Mutex::default(),
             tallies: Mutex::default(),
+            incoming: AtomicU64::new(0),
         }
+    }
+
+    /// How many peers called in since the last time this was asked.
+    pub fn take_incoming(&self) -> u64 {
+        self.incoming.swap(0, Ordering::SeqCst)
     }
 
     /// Apply the link table to the connections already open: a metered
@@ -255,6 +263,7 @@ impl PeerConnector for Connector {
         read: Box<dyn AsyncRead + Send + Unpin>,
         write: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> PeerSocket {
+        self.incoming.fetch_add(1, Ordering::SeqCst);
         let links = self.table.snapshot();
         let cable = links
             .iter()

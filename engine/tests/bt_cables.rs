@@ -72,6 +72,7 @@ async fn torrents(
     let config = TorrentConfig {
         network: false,
         listen: false,
+        try_for: barrage::bt::listen::TRY_FOR,
         tick: ms(50),
         peers,
     };
