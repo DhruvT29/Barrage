@@ -480,3 +480,19 @@ async fn a_peer_on_the_old_cable_opens_nothing() {
     let now = torrents.swarm().borrow().listening.clone();
     assert!(matches!(now, Listening::Trying { .. }), "{now:?}");
 }
+
+/// A cable whose address is gone by the time the session binds it leaves
+/// the engine running, on this machine, for the next tick to move.
+#[tokio::test]
+async fn a_cable_that_will_not_bind_waits_on_this_machine() {
+    let wifi = cand_idx(1, "Wi-Fi", "192.0.2.10", true);
+    let (links, _live) = cables(vec![wifi], &[("192.0.2.10", 30)]).await;
+    let (torrents, _) = listening("l-no-bind", &links, ms(200), Vec::new()).await;
+    assert_eq!(torrents.swarm().borrow().udp_cable, None);
+    assert_eq!(torrents.listen_addr(), None);
+    let addrs = torrents.udp_addrs();
+    assert!(
+        addrs.iter().all(|a| a.ip() == IpAddr::from([127, 0, 0, 1])),
+        "{addrs:?}"
+    );
+}

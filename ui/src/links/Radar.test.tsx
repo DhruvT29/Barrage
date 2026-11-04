@@ -58,8 +58,8 @@ const LIVE: DownloadsView = {
   },
   list: [],
   used: [
-    { cable: 'Ethernet', bytes: 3_000_000_000 },
-    { cable: 'Wi-Fi', bytes: 1_000_000_000 },
+    { cable: 'Ethernet', bytes: 3_000_000_000, sent: 0 },
+    { cable: 'Wi-Fi', bytes: 1_000_000_000, sent: 0 },
   ],
 }
 

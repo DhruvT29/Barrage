@@ -159,11 +159,17 @@ impl Torrents {
             ip,
             listening: listening.wants_port(),
         });
-        let session = Session::new_with_opts(
-            dir.clone(),
-            session_options(Arc::clone(&connector), &config, on.as_ref()),
-        )
-        .await?;
+        let options = |place| session_options(Arc::clone(&connector), &config, place);
+        let (session, on, listening) =
+            match Session::new_with_opts(dir.clone(), options(on.as_ref())).await {
+                Ok(session) => (session, on, listening),
+                Err(why) => {
+                    // Its address gone already: the next tick moves it on.
+                    tracing::warn!("torrents: starting on this machine only: {why:#}");
+                    let session = Session::new_with_opts(dir.clone(), options(None)).await?;
+                    (session, None, Listening::Off)
+                }
+            };
         let torrents = Self {
             inner: Arc::new(Inner {
                 session: Mutex::new(session),

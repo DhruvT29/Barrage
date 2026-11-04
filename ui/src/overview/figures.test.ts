@@ -143,8 +143,8 @@ test('the average ping is over the usable cables that have one, "-" when none', 
 
 test('fetched is every byte the cables have received', () => {
   const used = [
-    { cable: 'Wi-Fi', bytes: 1_200_000 },
-    { cable: 'Ethernet', bytes: 300_000 },
+    { cable: 'Wi-Fi', bytes: 1_200_000, sent: 0 },
+    { cable: 'Ethernet', bytes: 300_000, sent: 0 },
   ]
   expect(fetched(downloads([], { used }))).toBe(1_500_000)
   expect(fetched(null)).toBeNull()

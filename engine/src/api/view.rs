@@ -1,4 +1,4 @@
-//! The link table and the downloads as the UI reads them.
+//! The link table, the downloads and the torrents as the UI reads them.
 //!
 //! Every figure says the same as `brg-links`: the state words, whole
 //! milliseconds, and the change lines, which come from
@@ -10,6 +10,7 @@
 
 use serde::Serialize;
 
+use crate::bt::{Listening, Swarm, TorrentCable, TorrentPhase, TorrentStatus};
 use crate::fetch::{CableUse, DownloadStatus, LinkShare, Phase};
 use crate::links::render::{cable_speed, cables_in_order, changes, state_word};
 use crate::links::{Link, LinkState, shared_connections, shared_upstreams};
@@ -81,22 +82,83 @@ pub struct NotCounted {
     pub why: &'static str,
 }
 
+/// Every torrent since the engine started, and what the session does apart
+/// from any one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TorrentsView {
+    /// In the order they were added.
+    pub list: Vec<TorrentView>,
+    /// The cable carrying DHT, UDP trackers and uTP; `null` while no cable
+    /// works.
+    pub udp_cable: Option<String>,
+    pub listening: ListeningView,
+}
+
+/// Whether peers can call in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListeningView {
+    /// `"off"`, `"trying"`, `"open"` or `"closed"`.
+    pub state: &'static str,
+    pub cable: Option<String>,
+    /// Why it closed, in the engine's words.
+    pub why: Option<String>,
+}
+
+/// One torrent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TorrentView {
+    pub id: u64,
+    /// Its name, once known.
+    pub name: Option<String>,
+    /// 40 lowercase hex characters.
+    pub info_hash: String,
+    /// `"finding"`, `"downloading"`, `"done"`, `"stopped"` or `"failed"`.
+    pub phase: &'static str,
+    /// In bytes, once the metadata is known.
+    pub length: Option<u64>,
+    /// Bytes downloaded and checked.
+    pub done: u64,
+    /// In bits per second, 0 unless downloading.
+    pub down_bps: u64,
+    pub up_bps: u64,
+    /// Peers connected right now.
+    pub peers: u32,
+    /// Why it failed, or what to know about it, in the engine's words.
+    pub note: Option<String>,
+    pub cables: Vec<TorrentCableView>,
+}
+
+/// One cable's part in a torrent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TorrentCableView {
+    pub name: String,
+    pub received: u64,
+    pub sent: u64,
+    /// In bits per second.
+    pub bps: u64,
+    pub connections: u32,
+    /// Whether its connections may upload (not on a metered connection).
+    pub uploads: bool,
+}
+
 /// Every download since the engine started, and the speed they make together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DownloadsView {
     pub live: LiveSpeed,
     /// In the order they were added.
     pub list: Vec<DownloadView>,
-    /// What each cable has received for every download since the engine
-    /// started, written or not, in the order cables first carried.
+    /// What each cable has moved for every download and torrent since the
+    /// engine started, in the order cables first carried.
     pub used: Vec<UseView>,
 }
 
-/// The data one cable has received.
+/// The data one cable has moved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UseView {
     pub cable: String,
+    /// Received.
     pub bytes: u64,
+    pub sent: u64,
 }
 
 /// The live download speed: what the downloads that are downloading are
@@ -157,8 +219,8 @@ pub struct CableShare {
 }
 
 /// What the live socket sends: the whole table when a client connects, then
-/// the downloads, then each change to either: the table with the lines saying
-/// what changed, or the downloads again.
+/// the downloads, then the torrents, then each change to any of them: the
+/// table with the lines saying what changed, the downloads or the torrents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveMessage {
@@ -171,6 +233,9 @@ pub enum LiveMessage {
     },
     Downloads {
         downloads: DownloadsView,
+    },
+    Torrents {
+        torrents: TorrentsView,
     },
 }
 
@@ -323,8 +388,75 @@ pub fn downloads_view(all: &[DownloadStatus], used: &[CableUse]) -> DownloadsVie
             .map(|u| UseView {
                 cable: u.cable.clone(),
                 bytes: u.bytes,
+                sent: u.sent,
             })
             .collect(),
+    }
+}
+
+pub fn torrents_view(all: &[TorrentStatus], swarm: &Swarm) -> TorrentsView {
+    TorrentsView {
+        list: all.iter().map(torrent_view).collect(),
+        udp_cable: swarm.udp_cable.clone(),
+        listening: listening_view(&swarm.listening),
+    }
+}
+
+fn torrent_view(status: &TorrentStatus) -> TorrentView {
+    TorrentView {
+        id: status.id.as_u64(),
+        name: status.name.clone(),
+        info_hash: status.info_hash.clone(),
+        phase: torrent_phase_word(status.phase),
+        length: status.length,
+        done: status.done,
+        down_bps: status.down_bps,
+        up_bps: status.up_bps,
+        peers: status.peers,
+        note: status.note.clone(),
+        cables: status.cables.iter().map(torrent_cable_view).collect(),
+    }
+}
+
+fn torrent_cable_view(cable: &TorrentCable) -> TorrentCableView {
+    TorrentCableView {
+        name: cable.name.clone(),
+        received: cable.received,
+        sent: cable.sent,
+        bps: cable.bps,
+        connections: cable.connections,
+        uploads: cable.uploads,
+    }
+}
+
+fn torrent_phase_word(phase: TorrentPhase) -> &'static str {
+    match phase {
+        TorrentPhase::Finding => "finding",
+        TorrentPhase::Downloading => "downloading",
+        TorrentPhase::Done => "done",
+        TorrentPhase::Stopped => "stopped",
+        TorrentPhase::Failed => "failed",
+    }
+}
+
+fn listening_view(listening: &Listening) -> ListeningView {
+    let on = |state, cable: &String| ListeningView {
+        state,
+        cable: Some(cable.clone()),
+        why: None,
+    };
+    match listening {
+        Listening::Off => ListeningView {
+            state: "off",
+            cable: None,
+            why: None,
+        },
+        Listening::Trying { cable, .. } => on("trying", cable),
+        Listening::Open { cable } => on("open", cable),
+        Listening::Closed { cable, why } => ListeningView {
+            why: Some(why.clone()),
+            ..on("closed", cable)
+        },
     }
 }
 
@@ -394,6 +526,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::bt::{Listening, TorrentCable, TorrentId, TorrentPhase};
     use crate::fetch::DownloadId;
     use crate::links::model::{Addr, LinkId};
     use crate::links::render::changes;
@@ -926,8 +1059,8 @@ mod tests {
         assert_eq!(
             json["used"],
             json!([
-                { "cable": "Ethernet 3", "bytes": 7000000 },
-                { "cable": "Wi-Fi", "bytes": 3100000 }
+                { "cable": "Ethernet 3", "bytes": 7000000, "sent": 0 },
+                { "cable": "Wi-Fi", "bytes": 3100000, "sent": 0 }
             ])
         );
     }
@@ -1132,6 +1265,141 @@ mod tests {
         );
     }
 
+    fn torrent(id: u64, phase: TorrentPhase) -> TorrentStatus {
+        TorrentStatus {
+            id: TorrentId(id),
+            name: Some("debian-13.iso".to_string()),
+            info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            phase,
+            length: Some(700_000_000),
+            done: 350_000_000,
+            down_bps: 0,
+            up_bps: 0,
+            peers: 0,
+            note: None,
+            cables: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_torrent_reads_in_the_engines_words() {
+        let phases = [
+            (TorrentPhase::Finding, "finding"),
+            (TorrentPhase::Downloading, "downloading"),
+            (TorrentPhase::Done, "done"),
+            (TorrentPhase::Stopped, "stopped"),
+            (TorrentPhase::Failed, "failed"),
+        ];
+        for (id, (phase, word)) in phases.into_iter().enumerate() {
+            let view = torrents_view(&[torrent(id as u64 + 1, phase)], &Swarm::default());
+            assert_eq!(view.list[0].phase, word);
+            assert_eq!(view.list[0].id, id as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn a_torrents_cables_keep_their_figures() {
+        let mut status = torrent(1, TorrentPhase::Downloading);
+        status.cables.push(TorrentCable {
+            name: "Ethernet 2".to_string(),
+            received: 5_000,
+            sent: 40,
+            bps: 8_000,
+            connections: 3,
+            uploads: false,
+        });
+        let json = serde_json::to_value(torrents_view(&[status], &Swarm::default())).unwrap();
+        assert_eq!(
+            json["list"][0]["cables"][0],
+            json!({
+                "name": "Ethernet 2",
+                "received": 5_000,
+                "sent": 40,
+                "bps": 8_000,
+                "connections": 3,
+                "uploads": false
+            })
+        );
+    }
+
+    #[test]
+    fn the_port_reads_as_a_state_a_cable_and_a_why() {
+        let view = |listening| {
+            let swarm = Swarm {
+                udp_cable: Some("Wi-Fi".to_string()),
+                listening,
+            };
+            torrents_view(&[], &swarm).listening
+        };
+        let cable = "Wi-Fi".to_string();
+        let on = |state| ListeningView {
+            state,
+            cable: Some("Wi-Fi".to_string()),
+            why: None,
+        };
+        assert_eq!(
+            view(Listening::Off),
+            ListeningView {
+                state: "off",
+                cable: None,
+                why: None
+            }
+        );
+        assert_eq!(
+            view(Listening::Trying {
+                cable: cable.clone(),
+                ran: Duration::from_secs(60),
+                at: tokio::time::Instant::now(),
+            }),
+            on("trying")
+        );
+        assert_eq!(
+            view(Listening::Open {
+                cable: cable.clone()
+            }),
+            on("open")
+        );
+        assert_eq!(
+            view(Listening::Closed {
+                cable,
+                why: "nobody called".to_string()
+            }),
+            ListeningView {
+                why: Some("nobody called".to_string()),
+                ..on("closed")
+            }
+        );
+    }
+
+    #[test]
+    fn the_swarm_names_its_udp_cable() {
+        let swarm = Swarm {
+            udp_cable: Some("Wi-Fi".to_string()),
+            listening: Listening::Off,
+        };
+        assert_eq!(
+            torrents_view(&[], &swarm).udp_cable.as_deref(),
+            Some("Wi-Fi")
+        );
+    }
+
+    #[test]
+    fn the_data_used_says_what_was_sent() {
+        let used = [CableUse {
+            cable: "Wi-Fi".to_string(),
+            bytes: 900,
+            sent: 12,
+        }];
+        assert_eq!(
+            downloads_view(&[], &used).used,
+            [UseView {
+                cable: "Wi-Fi".to_string(),
+                bytes: 900,
+                sent: 12
+            }]
+        );
+    }
+
     /// The page's copy of the contract: messages exactly as this engine
     /// sends them, written out as TypeScript, so the page's type check holds
     /// every field to `types.ts` and `contract.test.tsx` renders them.
@@ -1296,6 +1564,62 @@ mod tests {
 
     /// What the sample's cables received: a little over what they wrote, as
     /// bytes past a cut count.
+    /// One torrent in each phase: a cable that may not upload, and the port
+    /// closed, which has the most to say.
+    fn contract_torrents() -> (Vec<TorrentStatus>, Swarm) {
+        let hash = |c: &str| c.repeat(40);
+        let cable = |name: &str, received, sent, bps, connections, uploads| TorrentCable {
+            name: name.to_string(),
+            received,
+            sent,
+            bps,
+            connections,
+            uploads,
+        };
+        let finding = TorrentStatus {
+            name: None,
+            info_hash: hash("a"),
+            length: None,
+            done: 0,
+            ..torrent(1, TorrentPhase::Finding)
+        };
+        let downloading = TorrentStatus {
+            info_hash: hash("b"),
+            down_bps: 48_000_000,
+            up_bps: 2_000_000,
+            peers: 14,
+            cables: vec![
+                cable("Wi-Fi", 260_000_000, 18_000_000, 36_000_000, 10, true),
+                cable("Ethernet 2", 90_000_000, 0, 12_000_000, 4, false),
+            ],
+            ..torrent(2, TorrentPhase::Downloading)
+        };
+        let done = TorrentStatus {
+            info_hash: hash("c"),
+            done: 700_000_000,
+            ..torrent(3, TorrentPhase::Done)
+        };
+        let stopped = TorrentStatus {
+            info_hash: hash("d"),
+            ..torrent(4, TorrentPhase::Stopped)
+        };
+        let failed = TorrentStatus {
+            info_hash: hash("e"),
+            note: Some("the disk is full".to_string()),
+            ..torrent(5, TorrentPhase::Failed)
+        };
+        let swarm = Swarm {
+            udp_cable: Some("Wi-Fi".to_string()),
+            listening: Listening::Closed {
+                cable: "Wi-Fi".to_string(),
+                why: "no peer called in within 10 minutes; this PC cannot be reached \
+                      from outside on Wi-Fi"
+                    .to_string(),
+            },
+        };
+        (vec![finding, downloading, done, stopped, failed], swarm)
+    }
+
     fn contract_used() -> Vec<CableUse> {
         vec![
             CableUse {
@@ -1317,12 +1641,16 @@ mod tests {
     #[test]
     fn the_ui_contract_file_is_up_to_date() {
         let (before, after) = contract_sample();
+        let (list, swarm) = contract_torrents();
         let messages = [
             LiveMessage::Table {
                 table: table_view(&before),
             },
             LiveMessage::Downloads {
                 downloads: downloads_view(&contract_downloads(), &contract_used()),
+            },
+            LiveMessage::Torrents {
+                torrents: torrents_view(&list, &swarm),
             },
             change_message(&before, &after),
         ];

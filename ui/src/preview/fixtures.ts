@@ -94,9 +94,9 @@ export function previewDownloads(t: number): DownloadsView {
     live: { bps: wifi + eth + phone, parts },
     list,
     used: [
-      { cable: 'Ethernet', bytes: 3.9e9 + bigDone * 0.62 },
-      { cable: 'Wi-Fi', bytes: 3.3e9 + bigDone * 0.38 },
-      { cable: 'Ethernet 2', bytes: isoDone },
+      { cable: 'Ethernet', bytes: 3.9e9 + bigDone * 0.62, sent: 0 },
+      { cable: 'Wi-Fi', bytes: 3.3e9 + bigDone * 0.38, sent: 0 },
+      { cable: 'Ethernet 2', bytes: isoDone, sent: 0 },
     ],
   }
 }
@@ -140,7 +140,7 @@ export function withLongWords(table: TableView, downloads: DownloadsView): [Tabl
       ...downloads,
       live: { bps: downloads.live.bps + 3 * MB, parts: [...downloads.live.parts, { name, bps: 3 * MB }] },
       list: [...downloads.list, ...long],
-      used: [...downloads.used, { cable: name, bytes: 3.3e9 }],
+      used: [...downloads.used, { cable: name, bytes: 3.3e9, sent: 0 }],
     },
   ]
 }

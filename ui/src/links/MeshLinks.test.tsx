@@ -69,7 +69,7 @@ test('a cable carrying a download shows its live speed and its share', () => {
       ],
     },
     list: [],
-    used: [{ cable: 'Wi-Fi', bytes: 2_000_000_000 }],
+    used: [{ cable: 'Wi-Fi', bytes: 2_000_000_000, sent: 0 }],
   }
   render(<MeshLinks {...page('live', THREE(), downloads)} />)
 

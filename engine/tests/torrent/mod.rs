@@ -57,6 +57,21 @@ pub struct Seeds {
 }
 
 impl Seeds {
+    /// The peers connected to the seeds right now.
+    pub fn peers(&self) -> u32 {
+        self.sessions
+            .iter()
+            .map(|session| {
+                session.with_torrents(|torrents| {
+                    torrents
+                        .filter_map(|(_, torrent)| torrent.stats().live)
+                        .map(|live| live.snapshot.peer_stats.live)
+                        .sum::<u32>()
+                })
+            })
+            .sum()
+    }
+
     /// One more seed, calling in on `peer`.
     pub async fn calling(&self, peer: SocketAddr) -> Arc<Session> {
         let session = Session::new_with_opts(self.dir.clone(), quiet_options())

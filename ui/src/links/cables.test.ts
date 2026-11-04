@@ -189,10 +189,10 @@ test("a cable is metered when Windows says any of its addresses' connection is",
 test('each cable carries the data BARRAGE has used through it, 0 when none', () => {
   const t = table([link('Wi-Fi', '192.0.2.10'), link('Ethernet 2', '198.51.100.20'), link('Ethernet 3', '198.51.100.30')])
   const used = [
-    { cable: 'Ethernet 2', bytes: 1_858_200_000 },
-    { cable: 'Wi-Fi', bytes: 1_326_100_000 },
+    { cable: 'Ethernet 2', bytes: 1_858_200_000, sent: 0 },
+    { cable: 'Wi-Fi', bytes: 1_326_100_000, sent: 0 },
     // A cable that carried and has since gone has no card.
-    { cable: 'Ethernet 9', bytes: 5 },
+    { cable: 'Ethernet 9', bytes: 5, sent: 0 },
   ]
   expect(cables(t, used).map((c) => [c.name, c.used])).toEqual([
     ['Wi-Fi', 1_326_100_000],

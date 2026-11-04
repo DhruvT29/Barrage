@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use barrage::LinkHandle;
 use barrage::api::{DEFAULT_PORT, bind, serve};
+use barrage::bt::TorrentConfig;
 use barrage::fetch::downloads_folder;
 use barrage::links::render::changes;
 use barrage::links::watch::LinkTable;
@@ -75,9 +76,17 @@ async fn run() -> anyhow::Result<()> {
         println!("Could not open the browser ({e}). Open {url} yourself.");
     }
 
-    serve(listener, handle, downloads, options.static_dir, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    let torrents = TorrentConfig::default();
+    serve(
+        listener,
+        handle,
+        downloads,
+        options.static_dir,
+        torrents,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
     .await?;
     tracing::info!("stopped");
     println!("stopped.");

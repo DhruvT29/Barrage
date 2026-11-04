@@ -1,7 +1,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import type { DownloadsView, LinkView, LiveMessage, TableView } from './types'
+import type { DownloadsView, LinkView, LiveMessage, TableView, TorrentsView } from './types'
 import { FEED_MAX, RETRY_MS, useLive } from './useLive'
 
 /** A socket the test drives by hand, standing in for the engine. */
@@ -84,7 +84,7 @@ afterEach(() => {
 test('the first table makes it live', () => {
   const e = engine()
   const { result } = renderHook(() => useLive(URL, e.open))
-  expect(result.current).toEqual({ status: 'connecting', table: null, feed: [], downloads: null })
+  expect(result.current).toEqual({ status: 'connecting', table: null, feed: [], downloads: null, torrents: null })
   expect(e.last().url).toBe(URL)
 
   e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
@@ -131,7 +131,7 @@ const RUNNING: DownloadsView = {
       cables: [{ name: 'Wi-Fi', bytes: 300, bps: 1_000_000, connections: 4, wanted: 4, notes: [] }],
     },
   ],
-  used: [{ cable: 'Wi-Fi', bytes: 300 }],
+  used: [{ cable: 'Wi-Fi', bytes: 300, sent: 0 }],
 }
 
 test('a downloads message replaces the downloads, and leaves the table and the feed alone', () => {
@@ -145,6 +145,26 @@ test('a downloads message replaces the downloads, and leaves the table and the f
   expect(result.current.downloads).toEqual({ live: { bps: 0, parts: [] }, list: [], used: [] })
   e.last().send({ type: 'downloads', downloads: RUNNING })
   expect(result.current.downloads).toEqual(RUNNING)
+
+  expect(result.current.table).toBe(before)
+  expect(result.current.feed).toBe(feed)
+  expect(result.current.status).toBe('live')
+})
+
+test('a torrents message replaces the torrents, and leaves the table and the feed alone', () => {
+  const e = engine()
+  const { result } = renderHook(() => useLive(URL, e.open))
+  e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
+  const { table: before, feed } = result.current
+  expect(result.current.torrents).toBeNull()
+
+  const torrents: TorrentsView = {
+    list: [],
+    udp_cable: 'Wi-Fi',
+    listening: { state: 'trying', cable: 'Wi-Fi', why: null },
+  }
+  e.last().send({ type: 'torrents', torrents })
+  expect(result.current.torrents).toEqual(torrents)
 
   expect(result.current.table).toBe(before)
   expect(result.current.feed).toBe(feed)

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-import type { DownloadsView, LiveMessage, TableView } from './types'
+import type { DownloadsView, LiveMessage, TableView, TorrentsView } from './types'
 
 /** `connecting` until the first table, `live` while tables arrive, `disconnected` once lost. */
 export type Status = 'connecting' | 'live' | 'disconnected'
@@ -24,7 +24,7 @@ function connect(url: string): WebSocket {
 }
 
 /**
- * The engine's live table and downloads, kept connected: when the socket is
+ * The engine's live table, downloads and torrents, kept connected: when the socket is
  * lost, the last of each stays on screen and the hook tries again, waiting
  * longer each time, until the engine answers. One socket at a time, always.
  *
@@ -33,11 +33,18 @@ function connect(url: string): WebSocket {
 export function useLive(
   url: string = ownEngine(),
   open: (url: string) => WebSocket = connect,
-): { status: Status; table: TableView | null; feed: FeedLine[]; downloads: DownloadsView | null } {
+): {
+  status: Status
+  table: TableView | null
+  feed: FeedLine[]
+  downloads: DownloadsView | null
+  torrents: TorrentsView | null
+} {
   const [status, setStatus] = useState<Status>('connecting')
   const [table, setTable] = useState<TableView | null>(null)
   const [feed, setFeed] = useState<FeedLine[]>([])
   const [downloads, setDownloads] = useState<DownloadsView | null>(null)
+  const [torrents, setTorrents] = useState<TorrentsView | null>(null)
 
   useEffect(() => {
     let socket: WebSocket | null = null
@@ -55,6 +62,11 @@ export function useLive(
         // carries no table, so the links stay as they are.
         if (message.type === 'downloads') {
           setDownloads(message.downloads)
+          return
+        }
+        // The same for the torrents.
+        if (message.type === 'torrents') {
+          setTorrents(message.torrents)
           return
         }
         failures = 0
@@ -90,5 +102,5 @@ export function useLive(
     }
   }, [url, open])
 
-  return { status, table, feed, downloads }
+  return { status, table, feed, downloads, torrents }
 }

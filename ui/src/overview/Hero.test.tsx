@@ -75,8 +75,8 @@ const LIVE: DownloadsView = {
   },
   list: [download(1, 'done'), download(2, 'downloading', { length: 712_000_000, done: 0, bps: 8_000_000 })],
   used: [
-    { cable: 'Wi-Fi', bytes: 1_000_000_000 },
-    { cable: 'Ethernet 2', bytes: 500_000_000 },
+    { cable: 'Wi-Fi', bytes: 1_000_000_000, sent: 0 },
+    { cable: 'Ethernet 2', bytes: 500_000_000, sent: 0 },
   ],
 }
 

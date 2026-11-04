@@ -66,7 +66,7 @@ test('the download manager draws every message the engine really sends: the cabl
   // A downloads message carries no table: the cards stay as the last table drew them.
   let drawn: LinkView[] = []
   feedAll('downloads', (message, page) => {
-    if (message.type !== 'downloads') drawn = message.table.links
+    if ('table' in message) drawn = message.table.links
     expect(page.querySelectorAll('section.ml-card')).toHaveLength(cableNames(drawn).length)
   })
 
@@ -138,7 +138,7 @@ test('with nothing downloading, the hero is the combined speed: its parts, and w
 test('the radar draws every message the engine really sends: a node and a roster row per cable, and the change lines', () => {
   let drawn: TableView | null = null
   const container = feedAll('links', (message, page) => {
-    if (message.type !== 'downloads') drawn = message.table
+    if ('table' in message) drawn = message.table
     const names = drawn ? cableNames(drawn.links) : []
     expect(page.querySelectorAll('.rd-node')).toHaveLength(names.length)
     expect(page.querySelectorAll('.rd-row')).toHaveLength(names.length)
@@ -207,7 +207,7 @@ test('the contract file renders on the download manager: every download card', (
 // The page draws these from phase 4 on; the sample must keep sending one of
 // each, or the page's handling of them is never tried against the engine.
 test('the contract carries a metered cable, a cable wanting more than it holds, and the data used', () => {
-  const tables = messages.flatMap((m) => (m.type === 'downloads' ? [] : [m.table]))
+  const tables = (messages as LiveMessage[]).flatMap((m) => ('table' in m ? [m.table] : []))
   expect(tables.some((t) => t.links.some((l) => l.metered))).toBe(true)
   const { list, used } = lastDownloads(messages)
   expect(list.some((d) => d.cables.some((c) => c.wanted > c.connections))).toBe(true)

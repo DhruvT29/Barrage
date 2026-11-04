@@ -318,13 +318,110 @@ export const messages = [
       "used": [
         {
           "cable": "Wi-Fi",
-          "bytes": 1326100000
+          "bytes": 1326100000,
+          "sent": 0
         },
         {
           "cable": "Ethernet 2",
-          "bytes": 1858200000
+          "bytes": 1858200000,
+          "sent": 0
         }
       ]
+    }
+  },
+  {
+    "type": "torrents",
+    "torrents": {
+      "list": [
+        {
+          "id": 1,
+          "name": null,
+          "info_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "finding",
+          "length": null,
+          "done": 0,
+          "down_bps": 0,
+          "up_bps": 0,
+          "peers": 0,
+          "note": null,
+          "cables": []
+        },
+        {
+          "id": 2,
+          "name": "debian-13.iso",
+          "info_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "phase": "downloading",
+          "length": 700000000,
+          "done": 350000000,
+          "down_bps": 48000000,
+          "up_bps": 2000000,
+          "peers": 14,
+          "note": null,
+          "cables": [
+            {
+              "name": "Wi-Fi",
+              "received": 260000000,
+              "sent": 18000000,
+              "bps": 36000000,
+              "connections": 10,
+              "uploads": true
+            },
+            {
+              "name": "Ethernet 2",
+              "received": 90000000,
+              "sent": 0,
+              "bps": 12000000,
+              "connections": 4,
+              "uploads": false
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "name": "debian-13.iso",
+          "info_hash": "cccccccccccccccccccccccccccccccccccccccc",
+          "phase": "done",
+          "length": 700000000,
+          "done": 700000000,
+          "down_bps": 0,
+          "up_bps": 0,
+          "peers": 0,
+          "note": null,
+          "cables": []
+        },
+        {
+          "id": 4,
+          "name": "debian-13.iso",
+          "info_hash": "dddddddddddddddddddddddddddddddddddddddd",
+          "phase": "stopped",
+          "length": 700000000,
+          "done": 350000000,
+          "down_bps": 0,
+          "up_bps": 0,
+          "peers": 0,
+          "note": null,
+          "cables": []
+        },
+        {
+          "id": 5,
+          "name": "debian-13.iso",
+          "info_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "phase": "failed",
+          "length": 700000000,
+          "done": 350000000,
+          "down_bps": 0,
+          "up_bps": 0,
+          "peers": 0,
+          "note": "the disk is full",
+          "cables": []
+        }
+      ],
+      "udp_cable": "Wi-Fi",
+      "listening": {
+        "state": "closed",
+        "cable": "Wi-Fi",
+        "why": "no peer called in within 10 minutes; this PC cannot be reached from outside on Wi-Fi"
+      }
     }
   },
   {

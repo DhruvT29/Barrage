@@ -65,14 +65,16 @@ export interface DownloadsView {
   live: LiveSpeed
   /** In the order they were added. */
   list: DownloadView[]
-  /** What each cable has received for every download since the engine started, written or not, in the order cables first carried. */
+  /** What each cable has moved for every download and torrent since the engine started, in the order cables first carried. */
   used: UseView[]
 }
 
-/** The data one cable has received, in bytes. */
+/** The data one cable has moved, in bytes. */
 export interface UseView {
   cable: string
+  /** Received. */
   bytes: number
+  sent: number
 }
 
 /** What the downloads that are downloading fetch right now, all together. */
@@ -120,12 +122,67 @@ export interface CableShare {
   notes: string[]
 }
 
+/** A torrent's phase words. `done` and `stopped` share nothing. */
+export type TorrentPhase = 'finding' | 'downloading' | 'done' | 'stopped' | 'failed'
+
+/** Every torrent since the engine started, and what the session does apart from any one of them. */
+export interface TorrentsView {
+  /** In the order they were added. */
+  list: TorrentView[]
+  /** The cable carrying DHT, UDP trackers and uTP; null while no cable works. */
+  udp_cable: string | null
+  listening: ListeningView
+}
+
+/** Whether peers can call in. */
+export interface ListeningView {
+  state: 'off' | 'trying' | 'open' | 'closed'
+  cable: string | null
+  /** Why it closed, in the engine's words. */
+  why: string | null
+}
+
+/** One torrent. */
+export interface TorrentView {
+  id: number
+  /** Its name, once known. */
+  name: string | null
+  /** 40 lowercase hex characters. */
+  info_hash: string
+  phase: TorrentPhase
+  /** In bytes, once the metadata is known. */
+  length: number | null
+  /** Bytes downloaded and checked. */
+  done: number
+  /** In bits per second, 0 unless downloading. */
+  down_bps: number
+  up_bps: number
+  /** Peers connected right now. */
+  peers: number
+  /** Why it failed, or what to know about it, in the engine's words. */
+  note: string | null
+  cables: TorrentCableView[]
+}
+
+/** One cable's part in a torrent. */
+export interface TorrentCableView {
+  name: string
+  received: number
+  sent: number
+  /** In bits per second. */
+  bps: number
+  connections: number
+  /** Whether its connections may upload (not on a metered connection). */
+  uploads: boolean
+}
+
 /**
  * What the live socket sends: the table on connect, then the downloads, then
- * the table and its change lines on every change to the links, and the
- * downloads again on every change to them.
+ * the torrents, then the table and its change lines on every change to the
+ * links, and the downloads or the torrents again on every change to them.
  */
 export type LiveMessage =
   | { type: 'table'; table: TableView }
   | { type: 'change'; table: TableView; lines: string[] }
   | { type: 'downloads'; downloads: DownloadsView }
+  | { type: 'torrents'; torrents: TorrentsView }
