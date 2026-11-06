@@ -76,6 +76,7 @@ async fn torrents(
         try_for: barrage::bt::listen::TRY_FOR,
         tick: ms(50),
         peers,
+        ..TorrentConfig::default()
     };
     let torrents = Torrents::start(links.table(), dir.clone(), Arc::clone(&usage), config)
         .await

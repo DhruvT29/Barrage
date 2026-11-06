@@ -4,6 +4,7 @@
 use std::fmt;
 
 use super::listen::Listening;
+use crate::record::Priority;
 
 /// A torrent's id, from 1 in the order torrents were added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,6 +50,9 @@ pub struct TorrentStatus {
     /// Why it failed, or what to know about it, in the engine's words.
     pub note: Option<String>,
     pub cables: Vec<TorrentCable>,
+    /// Its place in the order of adding, across downloads and torrents.
+    pub seq: u64,
+    pub priority: Priority,
 }
 
 /// One cable's part in a torrent.

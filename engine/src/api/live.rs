@@ -270,6 +270,8 @@ mod tests {
 
     fn status(id: u64, done: u64) -> TorrentStatus {
         TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             id: TorrentId(id),
             name: None,
             info_hash: "ab".repeat(20),

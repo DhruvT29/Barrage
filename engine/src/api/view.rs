@@ -1272,6 +1272,8 @@ mod tests {
 
     fn torrent(id: u64, phase: TorrentPhase) -> TorrentStatus {
         TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             id: TorrentId(id),
             name: Some("debian-13.iso".to_string()),
             info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1586,6 +1588,8 @@ mod tests {
             uploads,
         };
         let finding = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: None,
             info_hash: hash("a"),
             length: None,
@@ -1593,6 +1597,8 @@ mod tests {
             ..torrent(1, TorrentPhase::Finding)
         };
         let downloading = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("linux-mint-22.iso".to_string()),
             info_hash: hash("b"),
             down_bps: 48_000_000,
@@ -1605,17 +1611,23 @@ mod tests {
             ..torrent(2, TorrentPhase::Downloading)
         };
         let done = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("fedora-41.iso".to_string()),
             info_hash: hash("c"),
             done: 700_000_000,
             ..torrent(3, TorrentPhase::Done)
         };
         let stopped = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("open-movie.mkv".to_string()),
             info_hash: hash("d"),
             ..torrent(4, TorrentPhase::Stopped)
         };
         let failed = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("archive.tar".to_string()),
             info_hash: hash("e"),
             note: Some("the disk is full".to_string()),

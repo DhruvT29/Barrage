@@ -12,7 +12,7 @@
 //! on disk, so each keeps what it has.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,9 +32,13 @@ use super::source::{Source, TorrentAddError, info_hash};
 use super::status::{
     Swarm, TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus,
 };
-use crate::fetch::Usage;
+use crate::fetch::{Usage, replace};
 use crate::links::watch::LinkTable;
+use crate::record::{self, KeptState, Priority, What};
 use crate::transfer::TransferEngine;
+
+/// The note on a torrent brought back without what it takes to start it.
+const LOST_FILE: &str = "its saved .torrent file has gone: remove it and add it again";
 
 /// Where the UDP sockets bind while no cable works: nothing leaves this
 /// machine through Windows' choice of link.
@@ -54,6 +58,11 @@ pub struct TorrentConfig {
     pub tick: Duration,
     /// Peers every torrent starts with, besides what it finds.
     pub peers: Vec<SocketAddr>,
+    /// The order of adding, shared with the downloads.
+    pub seq: Arc<AtomicU64>,
+    /// The engine's own folder, where each `.torrent` and its fast resume
+    /// data are kept. `None`: neither is.
+    pub state: Option<PathBuf>,
 }
 
 impl Default for TorrentConfig {
@@ -64,6 +73,8 @@ impl Default for TorrentConfig {
             try_for: TRY_FOR,
             tick: Duration::from_secs(1),
             peers: Vec::new(),
+            seq: Arc::new(AtomicU64::new(0)),
+            state: None,
         }
     }
 }
@@ -88,6 +99,16 @@ struct Kept {
 
 struct Entry {
     id: TorrentId,
+    seq: u64,
+    priority: Priority,
+    /// The folder its files go under: the session's when it was added.
+    dir: PathBuf,
+    /// The folder librqbit chose in `dir`, once known, so it stays there
+    /// whatever the session's folder is later.
+    output: Option<PathBuf>,
+    /// Whether it has been given to a session. One brought back stopped or
+    /// done has not, and needs none until it runs again.
+    given: bool,
     info_hash: String,
     /// What to give librqbit again after a rebuild: once its metadata is
     /// known, the .torrent file's bytes, even for a magnet.
@@ -225,6 +246,119 @@ impl Torrents {
         self.inner.session().udp_local_addrs()
     }
 
+    /// Put every torrent of `kept`, from an earlier engine, back on the list
+    /// with its id. What should run is given to the session; a stopped or
+    /// done one waits as a row, and one whose `.torrent` has gone says so.
+    /// `next` is the highest id that engine ever gave.
+    pub async fn restore(&self, kept: Vec<record::Kept>, next: u64) {
+        let inner = &self.inner;
+        inner.next.fetch_max(next, Ordering::SeqCst);
+        let generation = inner.generation.load(Ordering::SeqCst);
+        let mut start = Vec::new();
+        for kept in kept {
+            let What::Torrent {
+                id,
+                info_hash,
+                magnet,
+                output,
+            } = kept.what
+            else {
+                continue;
+            };
+            inner.next.fetch_max(id, Ordering::SeqCst);
+            inner.config.seq.fetch_max(kept.seq, Ordering::SeqCst);
+            let saved = match (magnet, inner.kept_file(&info_hash)) {
+                (Some(link), _) => Some(Source::Magnet(link)),
+                (None, Some(path)) => std::fs::read(path).ok().map(Source::File),
+                (None, None) => None,
+            };
+            let id = TorrentId(id);
+            let run = kept.state == KeptState::Run;
+            let lost = saved.is_none() && run;
+            let name = kept.name.or_else(|| match &saved {
+                Some(Source::Magnet(link)) => {
+                    librqbit::Magnet::parse(link).ok().and_then(|m| m.name)
+                }
+                _ => None,
+            });
+            let source = saved.clone().unwrap_or(Source::File(Vec::new()));
+            inner.list.lock().unwrap().push(Entry {
+                id,
+                seq: kept.seq,
+                priority: kept.priority,
+                dir: kept.dir,
+                output,
+                given: false,
+                info_hash,
+                source,
+                name,
+                handle: None,
+                generation,
+                kept: (kept.length.is_some() || kept.done > 0).then_some(Kept {
+                    length: kept.length,
+                    done: kept.done,
+                }),
+                wanted: match kept.state {
+                    KeptState::Stopped => Wanted::Stopped,
+                    KeptState::Done => Wanted::Done,
+                    _ => Wanted::Running,
+                },
+                failed: match kept.state {
+                    KeptState::Failed => Some(kept.note.unwrap_or_else(|| "it failed".into())),
+                    _ if lost => Some(LOST_FILE.to_string()),
+                    _ => None,
+                },
+            });
+            if let (true, false, Some(source)) = (run, lost, saved) {
+                start.push((id, source));
+            }
+        }
+        for (id, source) in start {
+            inner.give(id, source, generation, false);
+        }
+        inner.publish().await;
+    }
+
+    /// Every torrent as saved.
+    pub fn kept(&self) -> Vec<record::Kept> {
+        let shown = self.inner.status.borrow();
+        let list = self.inner.list.lock().unwrap();
+        list.iter()
+            .filter_map(|e| {
+                let s = shown.iter().find(|s| s.id == e.id)?;
+                Some(record::Kept {
+                    seq: e.seq,
+                    priority: e.priority,
+                    state: match (s.phase, e.wanted) {
+                        (TorrentPhase::Failed, _) => KeptState::Failed,
+                        (_, Wanted::Stopped) => KeptState::Stopped,
+                        (TorrentPhase::Done, _) | (_, Wanted::Done) => KeptState::Done,
+                        _ => KeptState::Run,
+                    },
+                    dir: e.dir.clone(),
+                    name: s.name.clone(),
+                    length: s.length,
+                    done: s.done,
+                    note: s.note.clone(),
+                    what: What::Torrent {
+                        id: e.id.as_u64(),
+                        info_hash: e.info_hash.clone(),
+                        magnet: match &e.source {
+                            Source::Magnet(link) => Some(link.clone()),
+                            Source::File(_) => None,
+                        },
+                        output: e.output.clone(),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// The highest id given so far.
+    pub fn last_id(&self) -> u64 {
+        self.inner.next.load(Ordering::SeqCst)
+    }
+
     /// The address peers can call in on, while the session listens.
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.inner.session().listen_addr()
@@ -234,7 +368,8 @@ impl Torrents {
 /// librqbit's options: BARRAGE opens every peer connection; UDP and any
 /// listener at `place`, or on this machine, with no listener, without one;
 /// no local service discovery (it multicasts on every interface, not one
-/// cable); no persistence before phase 6.
+/// cable); fast resume data beside the record, and no session store:
+/// BARRAGE's own list says what runs.
 fn session_options(
     connector: Arc<Connector>,
     config: &TorrentConfig,
@@ -253,6 +388,7 @@ fn session_options(
         udp_bind_ip: Some(place.map_or(NO_CABLE, |on| on.ip)),
         disable_local_service_discovery: true,
         fastresume: false,
+        fastresume_folder: config.state.as_ref().map(|state| state.join("resume")),
         persistence: None,
         listen: place.filter(|on| on.listening).map(|on| ListenerOptions {
             mode: ListenerMode::TcpAndUtp,
@@ -293,6 +429,10 @@ impl Inner {
     fn give(self: &Arc<Self>, id: TorrentId, source: Source, generation: u64, paused: bool) {
         let session = self.session();
         let giving = Arc::clone(self);
+        let output = self.entry(id, |e| {
+            e.given = true;
+            e.output.clone()
+        });
         tokio::spawn(async move {
             let add = match source {
                 Source::Magnet(link) => AddTorrent::from_url(link),
@@ -303,6 +443,9 @@ impl Inner {
             let options = AddTorrentOptions {
                 overwrite: true,
                 paused,
+                output_folder: output
+                    .flatten()
+                    .map(|folder| folder.to_string_lossy().into_owned()),
                 initial_peers: (!giving.config.peers.is_empty())
                     .then(|| giving.config.peers.clone()),
                 ..Default::default()
@@ -314,9 +457,18 @@ impl Inner {
                     AddTorrentResponse::Added(_, handle)
                     | AddTorrentResponse::AlreadyManaged(_, handle),
                 ) => {
+                    let bytes = handle
+                        .with_metadata(|m| m.torrent_bytes.to_vec())
+                        .ok()
+                        .filter(|bytes| !bytes.is_empty());
                     let wanted = giving.entry(id, |e| {
                         current(e).then(|| {
                             e.handle = Some(Arc::clone(&handle));
+                            e.output = Some(handle.output_folder().to_path_buf());
+                            if let Some(bytes) = &bytes {
+                                giving.keep_file(&e.info_hash, bytes);
+                                e.source = Source::File(bytes.clone());
+                            }
                             e.wanted
                         })
                     });
@@ -348,6 +500,26 @@ impl Inner {
             }
             giving.publish().await;
         });
+    }
+
+    /// Save a torrent's `.torrent` beside the record, so it can come back.
+    fn keep_file(&self, hash: &str, bytes: &[u8]) {
+        let Some(path) = self.kept_file(hash) else {
+            return;
+        };
+        let saved = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| replace(&path, bytes));
+        if let Err(e) = saved {
+            tracing::warn!("cannot save {}: {e}", path.display());
+        }
+    }
+
+    /// Where a torrent's `.torrent` is kept.
+    fn kept_file(&self, hash: &str) -> Option<PathBuf> {
+        let state = self.config.state.as_deref()?;
+        Some(torrent_file(state, hash))
     }
 
     /// Where the port stands now, given the UDP cable wanted.
@@ -416,7 +588,7 @@ impl Inner {
             .lock()
             .unwrap()
             .iter_mut()
-            .filter(|e| e.failed.is_none())
+            .filter(|e| e.failed.is_none() && e.given)
             .map(|e| {
                 if let Some(handle) = e.handle.take() {
                     let stats = handle.stats();
@@ -490,6 +662,11 @@ impl Inner {
     }
 }
 
+/// Where the `.torrent` of the torrent named `hash` is kept in `state`.
+fn torrent_file(state: &Path, hash: &str) -> PathBuf {
+    state.join("torrents").join(format!("{hash}.torrent"))
+}
+
 /// The phase of a torrent its session is not running, from what the user
 /// asked.
 fn phase_asked(wanted: Wanted) -> TorrentPhase {
@@ -515,6 +692,8 @@ fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
         peers: 0,
         note: entry.failed.clone(),
         cables,
+        seq: entry.seq,
+        priority: entry.priority,
     };
     if entry.failed.is_some() {
         status.phase = TorrentPhase::Failed;
@@ -578,8 +757,16 @@ impl TransferEngine for Torrents {
             // Read under the list's lock, as a rebuild sets it, so this
             // torrent is either given by the rebuild or meant for its session.
             let generation = inner.generation.load(Ordering::SeqCst);
+            if let Source::File(bytes) = &source {
+                inner.keep_file(&hash, bytes);
+            }
             list.push(Entry {
                 id,
+                seq: inner.config.seq.fetch_add(1, Ordering::SeqCst) + 1,
+                priority: Priority::default(),
+                dir: inner.dir.clone(),
+                output: None,
+                given: false,
                 info_hash: hash,
                 source: source.clone(),
                 name,
@@ -620,16 +807,21 @@ impl TransferEngine for Torrents {
 
     async fn resume(&self, id: TorrentId) -> Result<(), TorrentControlError> {
         let inner = &self.inner;
-        let handle = inner
+        let (handle, source) = inner
             .entry(id, |e| {
                 if e.wanted != Wanted::Stopped {
                     return Err(TorrentControlError::NotStopped);
                 }
                 e.wanted = Wanted::Running;
-                Ok(e.handle.clone())
+                e.generation = inner.generation.load(Ordering::SeqCst);
+                let source = (!e.given).then(|| (e.source.clone(), e.generation));
+                Ok((e.handle.clone(), source))
             })
             .ok_or(TorrentControlError::NoSuchTorrent)??;
-        if let Some(handle) = handle {
+        if let Some((source, generation)) = source {
+            // Brought back stopped: no session has it yet.
+            inner.give(id, source, generation, false);
+        } else if let Some(handle) = handle {
             let _ = inner.session().unpause(&handle).await;
         }
         inner.publish().await;

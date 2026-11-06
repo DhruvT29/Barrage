@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
+use crate::bt::{TorrentId, Torrents};
 use crate::fetch::{Downloads, Usage};
 use crate::record::{KeptState, Record, Store, What};
 use crate::transfer::Key;
@@ -35,7 +36,16 @@ struct Inner {
     opened: Option<String>,
     notice: watch::Sender<Option<String>>,
     downloads: Downloads,
+    torrents: Torrents,
     usage: Arc<Usage>,
+}
+
+/// The key of a saved transfer.
+fn key_of(what: &What) -> Key {
+    match *what {
+        What::Web { id, .. } => Key::Web(crate::fetch::DownloadId::new(id)),
+        What::Torrent { id, .. } => Key::Torrent(TorrentId(id)),
+    }
 }
 
 impl Keeper {
@@ -46,6 +56,7 @@ impl Keeper {
         record: Record,
         note: Option<String>,
         downloads: Downloads,
+        torrents: Torrents,
         usage: Arc<Usage>,
         every: Duration,
     ) -> Self {
@@ -56,6 +67,7 @@ impl Keeper {
             notice: watch::channel(note.clone()).0,
             opened: note,
             downloads,
+            torrents,
             usage,
         });
         tokio::spawn(run(Arc::downgrade(&inner), every));
@@ -64,13 +76,12 @@ impl Keeper {
 
     /// What the engine has running now, for [`Keeper::finish`].
     pub fn running(&self) -> Vec<Key> {
-        let kept = self.inner.downloads.kept();
-        kept.iter()
+        let record = self.inner.record();
+        record
+            .transfers
+            .iter()
             .filter(|k| k.state == KeptState::Run)
-            .filter_map(|k| match k.what {
-                What::Web { id, .. } => Some(Key::Web(crate::fetch::DownloadId::new(id))),
-                What::Torrent { .. } => None,
-            })
+            .map(|k| key_of(&k.what))
             .collect()
     }
 
@@ -79,11 +90,7 @@ impl Keeper {
     pub fn finish(&self, ran: &[Key]) {
         let mut record = self.inner.record();
         for kept in &mut record.transfers {
-            let key = match kept.what {
-                What::Web { id, .. } => Key::Web(crate::fetch::DownloadId::new(id)),
-                What::Torrent { .. } => continue,
-            };
-            if kept.state == KeptState::Stopped && ran.contains(&key) {
+            if kept.state == KeptState::Stopped && ran.contains(&key_of(&kept.what)) {
                 kept.state = KeptState::Run;
             }
         }
@@ -103,10 +110,12 @@ impl Keeper {
 impl Inner {
     fn record(&self) -> Record {
         let mut transfers = self.downloads.kept();
+        transfers.extend(self.torrents.kept());
         transfers.sort_by_key(|k| k.seq);
         Record {
             used: self.usage.kept(),
             next_download: self.downloads.last_id(),
+            next_torrent: self.torrents.last_id(),
             transfers,
             ..self.base.clone()
         }

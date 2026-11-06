@@ -155,18 +155,40 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let (store, record, note) = state;
     let usage = Usage::restored(links.table(), &record.used);
+    let seq = Arc::new(AtomicU64::new(0));
     let downloads = Downloads::sharing(
         links.table(),
         downloads_dir.clone(),
         DownloadConfig::default(),
         Arc::clone(&usage),
-        Arc::new(AtomicU64::new(0)),
+        Arc::clone(&seq),
     );
     downloads.restore(record.transfers.clone(), record.next_download);
-    let torrents = Torrents::start(links.table(), downloads_dir, Arc::clone(&usage), torrents)
-        .await
-        .context("the torrents did not start")?;
-    let keeper = Keeper::start(store, record, note, downloads.clone(), usage, SAVE_EVERY);
+    let torrent_config = TorrentConfig {
+        seq,
+        state: Some(store.folder().to_path_buf()),
+        ..torrents
+    };
+    let torrents = Torrents::start(
+        links.table(),
+        downloads_dir,
+        Arc::clone(&usage),
+        torrent_config,
+    )
+    .await
+    .context("the torrents did not start")?;
+    torrents
+        .restore(record.transfers.clone(), record.next_torrent)
+        .await;
+    let keeper = Keeper::start(
+        store,
+        record,
+        note,
+        downloads.clone(),
+        torrents.clone(),
+        usage,
+        SAVE_EVERY,
+    );
     let app = app(
         links.table(),
         downloads.clone(),

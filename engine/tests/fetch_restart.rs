@@ -13,8 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use barrage::LinkHandle;
+use barrage::bt::{TorrentConfig, Torrents};
 use barrage::fetch::{CableUse, DownloadConfig, Downloads, Phase, Usage};
 use barrage::keeper::Keeper;
+use barrage::links::watch::LinkTable;
 use barrage::record::{Kept, KeptState, Priority, Record, Store, What};
 use fake::ms;
 use fetching::*;
@@ -50,7 +52,17 @@ struct Engine {
     keeper: Keeper,
 }
 
-fn open(links: &LinkHandle, state: &Folder, dir: &Folder) -> Engine {
+/// Torrents with nothing to do.
+async fn no_torrents(table: LinkTable, dir: PathBuf, usage: Arc<Usage>) -> Torrents {
+    let config = TorrentConfig {
+        network: false,
+        listen: false,
+        ..TorrentConfig::default()
+    };
+    Torrents::start(table, dir, usage, config).await.unwrap()
+}
+
+async fn open(links: &LinkHandle, state: &Folder, dir: &Folder) -> Engine {
     let (store, record, note) = Store::open(&state.0).unwrap();
     let usage = Usage::restored(links.table(), &record.used);
     let seq = Arc::new(AtomicU64::new(0));
@@ -62,7 +74,16 @@ fn open(links: &LinkHandle, state: &Folder, dir: &Folder) -> Engine {
         seq,
     );
     downloads.restore(record.transfers.clone(), record.next_download);
-    let keeper = Keeper::start(store, record, note, downloads.clone(), usage, ms(50));
+    let torrents = no_torrents(links.table(), dir.0.clone(), Arc::clone(&usage)).await;
+    let keeper = Keeper::start(
+        store,
+        record,
+        note,
+        downloads.clone(),
+        torrents,
+        usage,
+        ms(50),
+    );
     Engine { downloads, keeper }
 }
 
@@ -150,7 +171,7 @@ async fn a_download_cut_by_a_restart_finishes_with_the_right_hash() {
     let (state, dir) = (Folder::new("cut-state"), Folder::new("cut"));
     let url = server.url("/cut.bin");
 
-    let first = open(&links, &state, &dir);
+    let first = open(&links, &state, &dir).await;
     let id = first.downloads.add(request(&url)).await.unwrap();
     wait_for(&first.downloads, id, "parts under way", |s| {
         s.done > FINISHED
@@ -163,7 +184,7 @@ async fn a_download_cut_by_a_restart_finishes_with_the_right_hash() {
 
     server.at("/cut.bin", Answer::File(whole()));
     let before = server.seen().len();
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     let end = ended(&next.downloads, id).await;
 
     assert_eq!(end.phase, Phase::Done, "{end:?}");
@@ -191,9 +212,20 @@ async fn a_killed_engine_comes_back_from_its_last_save() {
                 let (store, record, note) = Store::open(&state).unwrap();
                 let usage = Usage::restored(links.clone(), &record.used);
                 let seq = Arc::new(AtomicU64::new(0));
-                let downloads = Downloads::sharing(links, dir, saving(), Arc::clone(&usage), seq);
+                let table = links.clone();
+                let downloads =
+                    Downloads::sharing(links, dir.clone(), saving(), Arc::clone(&usage), seq);
                 let id = downloads.add(request(&url)).await.unwrap();
-                let keeper = Keeper::start(store, record, note, downloads.clone(), usage, ms(50));
+                let torrents = no_torrents(table, dir, Arc::clone(&usage)).await;
+                let keeper = Keeper::start(
+                    store,
+                    record,
+                    note,
+                    downloads.clone(),
+                    torrents,
+                    usage,
+                    ms(50),
+                );
                 ((downloads, keeper), id)
             })
             .await
@@ -213,7 +245,7 @@ async fn a_killed_engine_comes_back_from_its_last_save() {
 
     server.at("/killed.bin", Answer::File(whole()));
     let before = server.seen().len();
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     let end = ended(&next.downloads, id).await;
 
     assert_eq!(end.phase, Phase::Done, "{end:?}");
@@ -230,7 +262,7 @@ async fn a_stopped_download_stays_stopped() {
     let (state, dir) = (Folder::new("stopped-state"), Folder::new("stopped"));
     let url = server.url("/stopped.bin");
 
-    let first = open(&links, &state, &dir);
+    let first = open(&links, &state, &dir).await;
     let id = first.downloads.add(request(&url)).await.unwrap();
     wait_for(&first.downloads, id, "parts under way", |s| {
         s.done > FINISHED
@@ -243,7 +275,7 @@ async fn a_stopped_download_stays_stopped() {
 
     server.at("/stopped.bin", Answer::File(whole()));
     let before = server.seen().len();
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     tokio::time::sleep(ms(200)).await;
 
     let back = status_of(&next.downloads, id);
@@ -278,7 +310,7 @@ async fn done_and_failed_stay_as_they_were_and_fetch_nothing() {
     };
     left_behind(&state, vec![done, failed]);
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     tokio::time::sleep(ms(200)).await;
 
     let all = next.downloads.status().borrow().clone();
@@ -313,7 +345,7 @@ async fn ids_carry_on_past_the_highest() {
         .unwrap();
     drop(store);
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     let id = next
         .downloads
         .add(request(&server.url("/next.bin")))
@@ -343,7 +375,7 @@ async fn a_download_finished_just_before_a_kill_is_done_not_fetched_again() {
         }],
     );
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     tokio::time::sleep(ms(200)).await;
 
     let all = next.downloads.status().borrow().clone();
@@ -372,7 +404,7 @@ async fn a_missing_part_is_noted_and_starts_over() {
         }],
     );
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     let id = next.downloads.status().borrow()[0].id;
     let end = ended(&next.downloads, id).await;
 
@@ -406,7 +438,7 @@ async fn a_missing_folder_fails_that_download_alone() {
         ],
     );
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     let ids: Vec<_> = next
         .downloads
         .status()
@@ -440,7 +472,7 @@ async fn the_order_of_adding_carries_on_past_the_highest() {
     };
     left_behind(&state, vec![earlier]);
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
     let id = next
         .downloads
         .add(request(&server.url("/seq.bin")))
@@ -457,7 +489,7 @@ async fn what_each_cable_used_carries_over() {
     server.at("/used.bin", Answer::File(whole()));
     let (state, dir) = (Folder::new("used-state"), Folder::new("used"));
 
-    let first = open(&links, &state, &dir);
+    let first = open(&links, &state, &dir).await;
     let id = first
         .downloads
         .add(request(&server.url("/used.bin")))
@@ -469,7 +501,7 @@ async fn what_each_cable_used_carries_over() {
     assert!(total >= LENGTH, "{used:?}");
     first.close().await;
 
-    let next = open(&links, &state, &dir);
+    let next = open(&links, &state, &dir).await;
 
     assert_eq!(*next.downloads.used().borrow(), used);
     let id = status_of(&next.downloads, id).id;
@@ -484,7 +516,7 @@ async fn a_save_that_fails_tells_the_page_and_the_engine_carries_on() {
     let server = Server::start().await;
     server.at("/on.bin", Answer::File(whole()));
     let (state, dir) = (Folder::new("nosave-state"), Folder::new("nosave"));
-    let engine = open(&links, &state, &dir);
+    let engine = open(&links, &state, &dir).await;
     // Nothing can be renamed over a folder.
     std::fs::remove_file(state.0.join("state.json")).ok();
     std::fs::create_dir(state.0.join("state.json")).unwrap();
