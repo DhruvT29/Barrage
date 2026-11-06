@@ -45,7 +45,7 @@ pub(crate) struct Line {
 /// The waiting transfers, the next first.
 pub(crate) fn line_up(lines: &[Line]) -> Vec<Key> {
     let mut waiting: Vec<&Line> = lines.iter().filter(|l| l.slot == Slot::Waiting).collect();
-    waiting.sort_by_key(|l| l.seq);
+    waiting.sort_by_key(|l| (l.priority, l.seq));
     waiting.into_iter().map(|l| l.key).collect()
 }
 
@@ -277,6 +277,35 @@ mod tests {
             line(2, 20, Slot::Waiting),
         ];
         assert_eq!(line_up(&lines), [web(1), web(2), web(3)]);
+    }
+
+    fn ranked(id: u64, seq: u64, priority: Priority) -> Line {
+        Line {
+            priority,
+            ..line(id, seq, Slot::Waiting)
+        }
+    }
+
+    #[test]
+    fn high_goes_before_an_earlier_normal() {
+        let lines = [ranked(1, 1, Priority::Normal), ranked(2, 2, Priority::High)];
+        assert_eq!(line_up(&lines), [web(2), web(1)]);
+    }
+
+    #[test]
+    fn low_goes_after_a_later_normal() {
+        let lines = [ranked(1, 1, Priority::Low), ranked(2, 2, Priority::Normal)];
+        assert_eq!(line_up(&lines), [web(2), web(1)]);
+    }
+
+    #[test]
+    fn within_a_priority_the_earliest_goes_first() {
+        let lines = [
+            ranked(3, 3, Priority::High),
+            ranked(1, 1, Priority::High),
+            ranked(2, 2, Priority::Low),
+        ];
+        assert_eq!(line_up(&lines), [web(1), web(3), web(2)]);
     }
 
     #[test]

@@ -148,6 +148,8 @@ pub enum ControlError {
     NotStopped,
     /// Releasing: it is not queued.
     NotQueued,
+    /// Changing a priority: it is done or has failed.
+    Finished,
 }
 
 impl fmt::Display for ControlError {
@@ -157,6 +159,7 @@ impl fmt::Display for ControlError {
             Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
             Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
             Self::NotQueued => f.write_str("it is not queued, so there is nothing to start"),
+            Self::Finished => f.write_str("it has ended, so it has no place in line to change"),
         }
     }
 }
@@ -684,6 +687,25 @@ impl Downloads {
         Ok(())
     }
 
+    /// Give download `id` this priority. One running stays running.
+    pub fn set_priority(&self, id: DownloadId, priority: Priority) -> Result<(), ControlError> {
+        let mut outcome = Err(ControlError::NoSuchDownload);
+        self.inner.status.send_if_modified(|all| {
+            let Some(row) = all.iter_mut().find(|s| s.id == id) else {
+                return false;
+            };
+            if matches!(row.phase, Phase::Done | Phase::Failed) {
+                outcome = Err(ControlError::Finished);
+                return false;
+            }
+            outcome = Ok(());
+            let changed = row.priority != priority;
+            row.priority = priority;
+            changed
+        });
+        outcome
+    }
+
     /// Download `id`'s phase, as last published.
     fn phase(&self, id: DownloadId) -> Option<Phase> {
         let all = self.inner.status.borrow();
@@ -857,6 +879,10 @@ impl crate::transfer::TransferEngine for Downloads {
 
     async fn requeue(&self, id: DownloadId) -> Result<(), ControlError> {
         Downloads::requeue(self, id)
+    }
+
+    async fn set_priority(&self, id: DownloadId, priority: Priority) -> Result<(), ControlError> {
+        Downloads::set_priority(self, id, priority)
     }
 
     async fn shutdown(&self) {

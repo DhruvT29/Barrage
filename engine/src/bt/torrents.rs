@@ -826,6 +826,25 @@ impl TransferEngine for Torrents {
         Ok(())
     }
 
+    async fn set_priority(
+        &self,
+        id: TorrentId,
+        priority: Priority,
+    ) -> Result<(), TorrentControlError> {
+        let inner = &self.inner;
+        inner
+            .entry(id, |e| {
+                if e.wanted == Wanted::Done || e.failed.is_some() {
+                    return Err(TorrentControlError::Finished);
+                }
+                e.priority = priority;
+                Ok(())
+            })
+            .ok_or(TorrentControlError::NoSuchTorrent)??;
+        inner.publish().await;
+        Ok(())
+    }
+
     async fn requeue(&self, id: TorrentId) -> Result<(), TorrentControlError> {
         let inner = &self.inner;
         inner

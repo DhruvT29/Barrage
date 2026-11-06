@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 use crate::bt::TorrentId;
 use crate::fetch::DownloadId;
+use crate::record::Priority;
 
 /// One transfer of either kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,6 +58,13 @@ pub trait TransferEngine {
 
     /// Send a stopped one to the back of the line.
     fn requeue(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
+    /// Change who goes next. One already running stays running.
+    fn set_priority(
+        &self,
+        id: Self::Id,
+        priority: Priority,
+    ) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
 
     /// Stop everything, saving what can be saved.
     fn shutdown(&self) -> impl Future<Output = ()> + Send;

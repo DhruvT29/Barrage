@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use barrage::LinkHandle;
 use barrage::bt::{Source, TorrentConfig, TorrentId, TorrentPhase, Torrents};
-use barrage::fetch::{AddError, DownloadConfig, DownloadId, Downloads, Phase, Usage};
+use barrage::fetch::{AddError, ControlError, DownloadConfig, DownloadId, Downloads, Phase, Usage};
 use barrage::keeper::{Engines, Keeper};
 use barrage::queue::{MOST_LIMIT, Queue, QueueError, QueueView};
-use barrage::record::Store;
+use barrage::record::{Priority, Store};
 use barrage::transfer::{Key, TransferEngine};
 use fake::ms;
 use fetching::{MIB, both, config, request, status_of};
@@ -441,4 +441,130 @@ async fn a_dead_magnet_keeps_its_place_and_says_so() {
         status_of(&downloads, waiting).phase != Phase::Queued
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_change_moves_a_waiting_transfer() {
+    let links = both();
+    let files = server().await;
+    let e = engine(&links, "q-moves", 1, Vec::new()).await;
+    let first = add(&e, &files, "/one.bin").await;
+    until("the first running", || running(phase(&e, first))).await;
+    let second = add(&e, &files, "/two.bin").await;
+    let third = add(&e, &files, "/three.bin").await;
+    let view = e.queue.view();
+    until("both in line", || view.borrow().places.len() == 2).await;
+
+    TransferEngine::set_priority(&e.downloads, third, Priority::High)
+        .await
+        .unwrap();
+
+    until("the high one first", || {
+        view.borrow().places.first() == Some(&(Key::Web(third), 1))
+    })
+    .await;
+    assert_eq!(
+        places(&view.borrow()),
+        [(Key::Web(third), 1), (Key::Web(second), 2)]
+    );
+
+    e.downloads.stop(first).await.unwrap();
+    until("the high one running", || running(phase(&e, third))).await;
+    assert_eq!(phase(&e, second), Phase::Queued);
+}
+
+#[tokio::test]
+async fn a_change_never_touches_a_running_one() {
+    let links = both();
+    let files = server().await;
+    let e = engine(&links, "q-touches", 1, Vec::new()).await;
+    let first = add(&e, &files, "/one.bin").await;
+    until("the first running", || running(phase(&e, first))).await;
+    let second = add(&e, &files, "/two.bin").await;
+
+    TransferEngine::set_priority(&e.downloads, first, Priority::Low)
+        .await
+        .unwrap();
+    TransferEngine::set_priority(&e.downloads, second, Priority::High)
+        .await
+        .unwrap();
+    tokio::time::sleep(ms(300)).await;
+
+    assert!(
+        running(phase(&e, first)),
+        "a high one waits for a free place"
+    );
+    assert_eq!(phase(&e, second), Phase::Queued);
+    assert_eq!(status_of(&e.downloads, first).priority, Priority::Low);
+}
+
+#[tokio::test]
+async fn a_torrent_takes_a_priority_too() {
+    let links = both();
+    let files = server().await;
+    let seeds = slow_seeds("q-torrent-seed").await;
+    let e = engine(&links, "q-torrent", 1, seeds.addrs.clone()).await;
+    let first = add(&e, &files, "/one.bin").await;
+    until("the first running", || running(phase(&e, first))).await;
+    let second = add(&e, &files, "/two.bin").await;
+    let third = e
+        .queue
+        .add_torrent(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+
+    TransferEngine::set_priority(&e.torrents, third, Priority::High)
+        .await
+        .unwrap();
+    e.downloads.stop(first).await.unwrap();
+
+    until("the torrent running", || {
+        torrent_phase(&e, third) != TorrentPhase::Queued
+    })
+    .await;
+    assert_eq!(phase(&e, second), Phase::Queued);
+}
+
+#[tokio::test]
+async fn priorities_survive_a_restart() {
+    let links = both();
+    let files = server().await;
+    let (state, dir) = (fresh_dir("q-keeps-state"), fresh_dir("q-keeps"));
+
+    let (e, keeper) = keeping(&links, &state, &dir).await;
+    e.queue.set_limit(1).unwrap();
+    let first = add(&e, &files, "/one.bin").await;
+    until("the first running", || running(phase(&e, first))).await;
+    let second = add(&e, &files, "/two.bin").await;
+    let third = add(&e, &files, "/three.bin").await;
+    TransferEngine::set_priority(&e.downloads, third, Priority::High)
+        .await
+        .unwrap();
+    close(e, keeper).await;
+
+    let (e, _keeper) = keeping(&links, &state, &dir).await;
+
+    assert_eq!(status_of(&e.downloads, third).priority, Priority::High);
+    // The high one takes the only place, ahead of what was running.
+    until("the high one running", || running(phase(&e, third))).await;
+    let view = e.queue.view();
+    until("the rest in line", || view.borrow().places.len() == 2).await;
+    assert_eq!(
+        places(&view.borrow()),
+        [(Key::Web(first), 1), (Key::Web(second), 2)]
+    );
+}
+
+#[tokio::test]
+async fn a_done_transfer_has_no_priority_to_change() {
+    let links = both();
+    let files = server().await;
+    files.at("/quick.bin", Answer::File(quick()));
+    let e = engine(&links, "q-done", 1, Vec::new()).await;
+    let id = add(&e, &files, "/quick.bin").await;
+    until("done", || phase(&e, id) == Phase::Done).await;
+
+    let refused = TransferEngine::set_priority(&e.downloads, id, Priority::High).await;
+
+    assert_eq!(refused, Err(ControlError::Finished));
 }

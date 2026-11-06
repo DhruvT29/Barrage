@@ -1394,11 +1394,12 @@ async fn the_live_socket_sends_torrents() {
     );
 
     assert_eq!(post_magnet(addr, MAGNET).await.0, 201);
+    // In line for a moment, then finding.
     let added = frame_where(&mut socket, "the torrent", |frame| {
-        frame["type"] == "torrents" && frame["torrents"]["list"][0]["id"] == 1
+        frame["type"] == "torrents" && frame["torrents"]["list"][0]["phase"] == "finding"
     })
     .await;
-    assert_eq!(added["torrents"]["list"][0]["phase"], "finding");
+    assert_eq!(added["torrents"]["list"][0]["id"], 1);
 }
 
 #[tokio::test]

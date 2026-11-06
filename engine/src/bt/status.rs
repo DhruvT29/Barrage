@@ -90,6 +90,8 @@ pub enum TorrentControlError {
     NotStopped,
     /// Releasing: it is not queued.
     NotQueued,
+    /// Changing a priority: it is done or has failed.
+    Finished,
 }
 
 impl fmt::Display for TorrentControlError {
@@ -99,6 +101,7 @@ impl fmt::Display for TorrentControlError {
             Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
             Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
             Self::NotQueued => f.write_str("it is not queued, so there is nothing to start"),
+            Self::Finished => f.write_str("it has ended, so it has no place in line to change"),
         }
     }
 }
