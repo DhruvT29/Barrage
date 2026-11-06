@@ -84,7 +84,7 @@ afterEach(() => {
 test('the first table makes it live', () => {
   const e = engine()
   const { result } = renderHook(() => useLive(URL, e.open))
-  expect(result.current).toEqual({ status: 'connecting', table: null, feed: [], downloads: null, torrents: null })
+  expect(result.current).toEqual({ status: 'connecting', table: null, feed: [], downloads: null, torrents: null, queue: null })
   expect(e.last().url).toBe(URL)
 
   e.last().send({ type: 'table', table: table(link(1, 'Wi-Fi')) })
@@ -120,6 +120,7 @@ const RUNNING: DownloadsView = {
   live: { bps: 1_000_000, parts: [{ name: 'Wi-Fi', bps: 1_000_000 }] },
   list: [
     {
+      priority: 'normal',
       id: 1,
       url: 'https://example.com/a.iso',
       name: 'a.iso',
@@ -301,6 +302,7 @@ test('by default it connects to the engine that served the page', () => {
 
 function running(fields: Partial<TorrentView> = {}): TorrentView {
   return {
+    priority: 'normal',
     id: 1,
     name: 'distro.iso',
     info_hash: 'ab'.repeat(20),

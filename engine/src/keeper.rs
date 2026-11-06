@@ -65,9 +65,11 @@ impl Keeper {
             base: record,
             last: Mutex::new(None),
             notice: watch::channel(note.clone()).0,
-            opened: note,
+            opened: note.clone(),
             engines,
         });
+        inner.engines.queue.set_used_since(inner.base.used_since);
+        inner.engines.queue.set_notice(note);
         tokio::spawn(run(Arc::downgrade(&inner), every));
         Self { inner }
     }
@@ -113,6 +115,7 @@ impl Inner {
         transfers.sort_by_key(|k| k.seq);
         Record {
             limit: engines.queue.limit(),
+            used_since: engines.queue.used_since(),
             used: engines.usage.kept(),
             next_download: engines.downloads.last_id(),
             next_torrent: engines.torrents.last_id(),
@@ -156,6 +159,8 @@ impl Inner {
                 });
             }
         }
+        let shown = self.notice.borrow().clone();
+        self.engines.queue.set_notice(shown);
         true
     }
 }

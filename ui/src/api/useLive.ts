@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 
-import type { DownloadsView, LiveMessage, TableView, TorrentsView } from './types'
+import type { QueueView, DownloadsView, LiveMessage, TableView, TorrentsView } from './types'
 
 /** `connecting` until the first table, `live` while tables arrive, `disconnected` once lost. */
 export type Status = 'connecting' | 'live' | 'disconnected'
@@ -59,12 +59,14 @@ export function useLive(
   feed: FeedLine[]
   downloads: DownloadsView | null
   torrents: TorrentsView | null
+  queue: QueueView | null
 } {
   const [status, setStatus] = useState<Status>('connecting')
   const [table, setTable] = useState<TableView | null>(null)
   const [feed, setFeed] = useState<FeedLine[]>([])
   const [downloads, setDownloads] = useState<DownloadsView | null>(null)
   const [torrents, setTorrents] = useState<TorrentsView | null>(null)
+  const [queue, setQueue] = useState<QueueView | null>(null)
 
   useEffect(() => {
     let socket: WebSocket | null = null
@@ -87,6 +89,11 @@ export function useLive(
         // The same for the torrents.
         if (message.type === 'torrents') {
           setTorrents(message.torrents)
+          return
+        }
+        // And the queue.
+        if (message.type === 'queue') {
+          setQueue(message.queue)
           return
         }
         failures = 0
@@ -123,5 +130,5 @@ export function useLive(
   }, [url, open])
 
   const counted = useMemo(() => withTorrents(downloads, torrents), [downloads, torrents])
-  return { status, table, feed, downloads: counted, torrents }
+  return { status, table, feed, downloads: counted, torrents, queue }
 }

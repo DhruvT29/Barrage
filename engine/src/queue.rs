@@ -19,7 +19,7 @@ use tokio::sync::watch;
 
 use crate::bt::{Source, TorrentAddError, TorrentControlError, TorrentId, TorrentPhase, Torrents};
 use crate::fetch::{AddError, AddRequest, ControlError, DownloadId, Downloads, Phase};
-use crate::record::Priority;
+use crate::record::{Priority, unix_now};
 use crate::transfer::{Key, TransferEngine};
 
 /// The highest limit a user can set.
@@ -80,6 +80,10 @@ pub struct QueueView {
     pub holding: u32,
     /// The waiting transfers and their places in line, from 1.
     pub places: Vec<(Key, u32)>,
+    /// What the user should know about the saved list, if anything.
+    pub notice: Option<String>,
+    /// When the data used was last zeroed, in Unix seconds.
+    pub used_since: u64,
 }
 
 /// Starts what the limit allows. Cheap to clone: the clones share the queue.
@@ -145,6 +149,37 @@ impl Queue {
     /// Send a stopped torrent to the back of the line.
     pub async fn resume_torrent(&self, id: TorrentId) -> Result<(), TorrentControlError> {
         TransferEngine::requeue(&self.inner.torrents, id).await
+    }
+
+    /// Tell the page `notice`, or nothing.
+    pub fn set_notice(&self, notice: Option<String>) {
+        self.inner.view.send_if_modified(|shown| {
+            let changed = shown.notice != notice;
+            shown.notice = notice;
+            changed
+        });
+    }
+
+    /// When the data used was last zeroed.
+    pub fn used_since(&self) -> u64 {
+        self.inner.view.borrow().used_since
+    }
+
+    /// Say the data used has been counting since `when`.
+    pub fn set_used_since(&self, when: u64) {
+        self.inner.view.send_if_modified(|shown| {
+            let changed = shown.used_since != when;
+            shown.used_since = when;
+            changed
+        });
+    }
+
+    /// Zero the data used. Returns when the count now starts.
+    pub fn reset_used(&self) -> u64 {
+        self.inner.downloads.reset_used();
+        let now = unix_now();
+        self.set_used_since(now);
+        now
     }
 
     /// The limit now.
@@ -222,16 +257,14 @@ impl Queue {
             }
         }
         let lines = self.lines();
-        let view = QueueView {
-            limit,
-            holding: lines.iter().filter(|l| l.slot == Slot::Held).count() as u32,
-            places: line_up(&lines).into_iter().zip(1..).collect(),
-        };
+        let holding = lines.iter().filter(|l| l.slot == Slot::Held).count() as u32;
+        let places: Vec<(Key, u32)> = line_up(&lines).into_iter().zip(1..).collect();
         self.inner.view.send_if_modified(|shown| {
-            let changed = *shown != view;
-            if changed {
-                *shown = view;
-            }
+            let changed =
+                shown.limit != limit || shown.holding != holding || shown.places != places;
+            shown.limit = limit;
+            shown.holding = holding;
+            shown.places = places;
             changed
         });
     }

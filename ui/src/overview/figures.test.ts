@@ -44,6 +44,7 @@ function table(links: LinkView[], combined: CombinedView = NOTHING): TableView {
 
 function download(id: number, state: DownloadState, fields: Partial<DownloadView> = {}): DownloadView {
   return {
+    priority: 'normal',
     id,
     url: `https://example.com/file-${id}.iso`,
     name: `file-${id}.iso`,
@@ -236,6 +237,7 @@ test("Stop all's refusals: each wording once, with the downloads it was for unle
 
 function torrent(fields: Partial<TorrentView> = {}): TorrentView {
   return {
+    priority: 'normal',
     id: 9,
     name: 'distro.iso',
     info_hash: 'ab'.repeat(20),

@@ -58,7 +58,10 @@ export interface NotCounted {
 }
 
 /** A download's state words. `stopped` keeps what it saved, to resume from. */
-export type DownloadState = 'starting' | 'waiting' | 'downloading' | 'done' | 'failed' | 'stopped'
+export type DownloadState = 'queued' | 'starting' | 'waiting' | 'downloading' | 'done' | 'failed' | 'stopped'
+
+/** Who goes next: high first, then the earliest added. */
+export type Priority = 'high' | 'normal' | 'low'
 
 /** Every download since the engine started, and the speed they make together. */
 export interface DownloadsView {
@@ -107,6 +110,7 @@ export interface DownloadView {
   /** Why it failed, or what to know about it, in the engine's words. */
   note: string | null
   cables: CableShare[]
+  priority: Priority
 }
 
 /** One cable's part in a download: its addresses' shares added up by the engine. */
@@ -123,7 +127,7 @@ export interface CableShare {
 }
 
 /** A torrent's phase words. `done` and `stopped` share nothing. */
-export type TorrentPhase = 'finding' | 'downloading' | 'done' | 'stopped' | 'failed'
+export type TorrentPhase = 'queued' | 'finding' | 'downloading' | 'done' | 'stopped' | 'failed'
 
 /** Every torrent since the engine started, and what the session does apart from any one of them. */
 export interface TorrentsView {
@@ -162,6 +166,7 @@ export interface TorrentView {
   /** Why it failed, or what to know about it, in the engine's words. */
   note: string | null
   cables: TorrentCableView[]
+  priority: Priority
 }
 
 /** One cable's part in a torrent. */
@@ -176,13 +181,37 @@ export interface TorrentCableView {
   uploads: boolean
 }
 
+/** One transfer's place in line, from 1. */
+export interface PlaceView {
+  kind: 'web' | 'torrent'
+  id: number
+  place: number
+}
+
+/** The line and the limit. */
+export interface QueueView {
+  /** How many run at once. */
+  limit: number
+  /** The highest limit the engine takes. */
+  most: number
+  /** How many hold a place now. */
+  holding: number
+  /** The waiting transfers, in line. */
+  places: PlaceView[]
+  /** What the user should know about the saved list, if anything. */
+  notice: string | null
+  /** When the data used was last zeroed, in Unix seconds. */
+  used_since: number
+}
+
 /**
- * What the live socket sends: the table on connect, then the downloads, then
- * the torrents, then the table and its change lines on every change to the
- * links, and the downloads or the torrents again on every change to them.
+ * What the live socket sends: the table on connect, then the downloads, the
+ * torrents and the queue, then the table and its change lines on every change
+ * to the links, and any of the others again on every change to them.
  */
 export type LiveMessage =
   | { type: 'table'; table: TableView }
   | { type: 'change'; table: TableView; lines: string[] }
   | { type: 'downloads'; downloads: DownloadsView }
   | { type: 'torrents'; torrents: TorrentsView }
+  | { type: 'queue'; queue: QueueView }

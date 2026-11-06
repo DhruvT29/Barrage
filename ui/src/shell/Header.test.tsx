@@ -79,7 +79,7 @@ test('throughput is the combined speed available while nothing downloads, and li
 test('throughput is the live download speed while anything downloads', () => {
   const downloads: DownloadsView = {
     live: { bps: 12_300_000, parts: [{ name: 'Wi-Fi', bps: 12_300_000 }] },
-    list: [{ id: 1, url: 'https://example.com/a.iso', name: 'a.iso', state: 'downloading', length: null, done: 0, bps: 12_300_000, note: null, cables: [] }],
+    list: [{ priority: 'normal', id: 1, url: 'https://example.com/a.iso', name: 'a.iso', state: 'downloading', length: null, done: 0, bps: 12_300_000, note: null, cables: [] }],
     used: [],
   }
   show('live', TABLE, downloads)
@@ -113,6 +113,7 @@ test('a torrent alone keeps throughput on the live speed', () => {
   const torrents: TorrentsView = {
     list: [
       {
+        priority: 'normal',
         id: 1,
         name: 'distro.iso',
         info_hash: 'ab'.repeat(20),

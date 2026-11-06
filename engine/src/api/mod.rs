@@ -26,6 +26,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router, middleware};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
@@ -38,12 +39,12 @@ use crate::fetch::{
 use crate::keeper::{Engines, Keeper};
 use crate::links::watch::LinkTable;
 use crate::queue::Queue;
-use crate::record::Opened;
+use crate::record::{Opened, Priority};
 use crate::transfer::TransferEngine;
 
 pub use view::{
-    DownloadsView, LinkView, LiveMessage, TableView, TorrentsView, change_message, downloads_view,
-    table_view, torrents_view,
+    DownloadsView, LinkView, LiveMessage, QueueWire, TableView, TorrentsView, change_message,
+    downloads_view, queue_view, table_view, torrents_view,
 };
 
 /// The port `barrage` listens on unless told otherwise.
@@ -93,6 +94,21 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 /// - `GET /api/torrents`: every torrent, as [`TorrentsView`].
 /// - `POST /api/torrents/{id}/stop` and `POST /api/torrents/{id}/resume`: as
 ///   a download's.
+///
+/// - `GET /api/queue`: the limit and the line, as [`QueueWire`].
+/// - `POST /api/queue/limit`, `{"limit": n}`: `200 {"limit"}`, `400 {"error"}`
+///   for a number out of range.
+/// - `POST /api/downloads/{id}/priority` and the same for torrents,
+///   `{"priority": "high" | "normal" | "low"}`: `200 {"id"}`, `400 {"error"}`
+///   for another word, `404 {"error"}`, and `409 {"error"}` for one that has
+///   ended.
+/// - `POST /api/downloads/{id}/remove` and the same for torrents, `{}`: takes
+///   it off the list, in any state, its files kept. `200 {"id"}` once it has
+///   gone, `404 {"error"}`.
+/// - `POST /api/used/reset`, `{}`: zeroes the data used. `200 {"used_since"}`.
+///
+/// Every POST takes JSON alone, for the reason above, and answers `415`
+/// otherwise; a field it does not know is refused.
 ///
 /// Any other address under `/api` answers `404`. Every route answers only
 /// this machine's own pages, and none may be framed ([`guard`]).
@@ -241,6 +257,8 @@ fn api(table: LinkTable, queue: Queue) -> Router {
         .route("/api/downloads", get(list_downloads).post(add_download))
         .route("/api/downloads/{id}/stop", post(stop_download))
         .route("/api/downloads/{id}/resume", post(resume_download))
+        .route("/api/downloads/{id}/priority", post(prioritise_download))
+        .route("/api/downloads/{id}/remove", post(remove_download))
         .route(
             "/api/torrents",
             get(list_torrents)
@@ -249,6 +267,11 @@ fn api(table: LinkTable, queue: Queue) -> Router {
         )
         .route("/api/torrents/{id}/stop", post(stop_torrent))
         .route("/api/torrents/{id}/resume", post(resume_torrent))
+        .route("/api/torrents/{id}/priority", post(prioritise_torrent))
+        .route("/api/torrents/{id}/remove", post(remove_torrent))
+        .route("/api/queue", get(queue_now))
+        .route("/api/queue/limit", post(set_limit))
+        .route("/api/used/reset", post(reset_used))
         // Any other address under /api is a route this engine does not have,
         // a typo or one a newer page expects. Left to the page's fallback it
         // would answer 200 with index.html, which a JSON client cannot read.
@@ -352,17 +375,130 @@ fn asked(
     body: Result<Json<NoFields>, JsonRejection>,
     none: &str,
 ) -> Result<u64, Box<Response>> {
+    asked_with(id, body, none).map(|(id, _)| id)
+}
+
+/// The id a route names and the body it was sent, or the refusal.
+fn asked_with<T: DeserializeOwned>(
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<T>, JsonRejection>,
+    none: &str,
+) -> Result<(u64, T), Box<Response>> {
     let Ok(Path(id)) = id else {
         return Err(Box::new(refuse(StatusCode::NOT_FOUND, none)));
     };
+    Ok((id, json_body(body)?))
+}
+
+/// The body sent, or the refusal.
+fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Box<Response>> {
     match body {
-        Ok(_) => Ok(id),
+        Ok(Json(body)) => Ok(body),
         Err(JsonRejection::MissingJsonContentType(_)) => Err(Box::new(refuse(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "send {} as JSON, with Content-Type: application/json",
+            "send it as JSON, with Content-Type: application/json",
         ))),
         Err(e) => Err(Box::new(refuse(StatusCode::BAD_REQUEST, &e.body_text()))),
     }
+}
+
+/// The body of a change of priority.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriorityBody {
+    priority: Priority,
+}
+
+async fn prioritise_download(
+    State(downloads): State<Downloads>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<PriorityBody>, JsonRejection>,
+) -> Response {
+    match asked_with(id, body, "no such download") {
+        Ok((id, body)) => {
+            let id = DownloadId::new(id);
+            controlled(id, downloads.set_priority(id, body.priority))
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn prioritise_torrent(
+    State(torrents): State<Torrents>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<PriorityBody>, JsonRejection>,
+) -> Response {
+    match asked_with(id, body, "no such torrent") {
+        Ok((id, body)) => {
+            let id = TorrentId(id);
+            torrent_controlled(id, torrents.set_priority(id, body.priority).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn remove_download(
+    State(downloads): State<Downloads>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body, "no such download") {
+        Ok(id) => {
+            let id = DownloadId::new(id);
+            controlled(id, downloads.forget(id).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn remove_torrent(
+    State(torrents): State<Torrents>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body, "no such torrent") {
+        Ok(id) => {
+            let id = TorrentId(id);
+            torrent_controlled(id, torrents.forget(id).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn queue_now(State(queue): State<Queue>) -> Json<QueueWire> {
+    Json(queue_view(&queue.view().borrow()))
+}
+
+/// The body of a new limit.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitBody {
+    limit: u32,
+}
+
+async fn set_limit(
+    State(queue): State<Queue>,
+    body: Result<Json<LimitBody>, JsonRejection>,
+) -> Response {
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(refused) => return *refused,
+    };
+    match queue.set_limit(body.limit) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "limit": body.limit }))).into_response(),
+        Err(e) => refuse(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn reset_used(
+    State(queue): State<Queue>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    if let Err(refused) = json_body(body) {
+        return *refused;
+    }
+    let since = queue.reset_used();
+    (StatusCode::OK, Json(json!({ "used_since": since }))).into_response()
 }
 
 /// What a stop or resume of download `id` answers.

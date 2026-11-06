@@ -137,6 +137,7 @@ function left(d: DownloadView): number | null {
 /** A torrent as the lead transfer shows it: its info hash stands for an address until it has a name. */
 function asTransfer(t: TorrentView): DownloadView {
   return {
+    priority: 'normal',
     id: t.id,
     url: t.info_hash,
     name: t.name,

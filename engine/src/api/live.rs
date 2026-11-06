@@ -13,11 +13,14 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use tokio::sync::watch;
 
-use super::view::{LiveMessage, change_message, downloads_view, table_view, torrents_view};
-use crate::bt::{Swarm, TorrentStatus, Torrents};
-use crate::fetch::{CableUse, DownloadStatus, Downloads};
+use super::view::{
+    LiveMessage, change_message, downloads_view, queue_view, table_view, torrents_view,
+};
+use crate::bt::{Swarm, TorrentStatus};
+use crate::fetch::{CableUse, DownloadStatus};
 use crate::links::Link;
 use crate::links::watch::LinkTable;
+use crate::queue::{Queue, QueueView};
 use crate::transfer::TransferEngine;
 
 /// What one client is sent, in order.
@@ -39,16 +42,22 @@ pub struct Feed {
     torrents_sent: bool,
     /// False once nothing can change the torrents any more.
     torrents_open: bool,
+    queue: watch::Receiver<QueueView>,
+    /// Whether this client has been sent the queue yet.
+    queue_sent: bool,
+    /// False once nothing can change the queue any more.
+    queue_open: bool,
 }
 
 impl Feed {
-    pub fn new(table: LinkTable, downloads: &Downloads, torrents: &Torrents) -> Self {
+    pub fn new(table: LinkTable, queue: &Queue) -> Self {
         Self::from_parts(
             table,
-            downloads.status(),
-            downloads.used(),
-            torrents.status(),
-            torrents.swarm(),
+            queue.downloads().status(),
+            queue.downloads().used(),
+            queue.torrents().status(),
+            queue.torrents().swarm(),
+            queue.view(),
         )
     }
 
@@ -58,6 +67,7 @@ impl Feed {
         used: watch::Receiver<Vec<CableUse>>,
         torrents: watch::Receiver<Vec<TorrentStatus>>,
         swarm: watch::Receiver<Swarm>,
+        queue: watch::Receiver<QueueView>,
     ) -> Self {
         Self {
             table,
@@ -70,6 +80,9 @@ impl Feed {
             swarm,
             torrents_sent: false,
             torrents_open: true,
+            queue,
+            queue_sent: false,
+            queue_open: true,
         }
     }
 
@@ -98,6 +111,10 @@ impl Feed {
         if !self.torrents_sent {
             self.torrents_sent = true;
             return Some(torrents_message(&mut self.torrents, &mut self.swarm));
+        }
+        if !self.queue_sent {
+            self.queue_sent = true;
+            return Some(queue_message(&mut self.queue));
         }
         loop {
             tokio::select! {
@@ -133,8 +150,19 @@ impl Feed {
                     Ok(()) => return Some(torrents_message(&mut self.torrents, &mut self.swarm)),
                     Err(_) => self.torrents_open = false,
                 },
+                changed = self.queue.changed(), if self.queue_open => match changed {
+                    Ok(()) => return Some(queue_message(&mut self.queue)),
+                    Err(_) => self.queue_open = false,
+                },
             }
         }
+    }
+}
+
+/// The queue as it is now, marked as seen.
+fn queue_message(queue: &mut watch::Receiver<QueueView>) -> LiveMessage {
+    LiveMessage::Queue {
+        queue: queue_view(&queue.borrow_and_update()),
     }
 }
 
@@ -162,10 +190,9 @@ fn torrents_message(
 pub(super) async fn upgrade(
     ws: WebSocketUpgrade,
     State(table): State<LinkTable>,
-    State(downloads): State<Downloads>,
-    State(torrents): State<Torrents>,
+    State(queue): State<Queue>,
 ) -> Response {
-    let feed = Feed::new(table, &downloads, &torrents);
+    let feed = Feed::new(table, &queue);
     ws.on_upgrade(move |socket| stream(socket, feed))
 }
 
@@ -231,7 +258,15 @@ mod tests {
         let (counts, counted) = watch::channel(Vec::new());
         let (_torrents, torrents) = watch::channel(Vec::new());
         let (_swarm, swarm) = watch::channel(Swarm::default());
-        let mut feed = Feed::from_parts(LinkTable::of(table), statuses, counted, torrents, swarm);
+        let (_queue, queued) = watch::channel(QueueView::default());
+        let mut feed = Feed::from_parts(
+            LinkTable::of(table),
+            statuses,
+            counted,
+            torrents,
+            swarm,
+            queued,
+        );
         let Some(LiveMessage::Table { .. }) = feed.next().await else {
             panic!("expected the table first");
         };
@@ -240,7 +275,10 @@ mod tests {
         };
         assert_eq!(downloads.used, []);
         let Some(LiveMessage::Torrents { .. }) = feed.next().await else {
-            panic!("expected the torrents last");
+            panic!("expected the torrents next");
+        };
+        let Some(LiveMessage::Queue { .. }) = feed.next().await else {
+            panic!("expected the queue last");
         };
 
         counts.send_replace(vec![used("Wi-Fi", 5_000)]);
@@ -295,8 +333,16 @@ mod tests {
         let (_counts, counted) = watch::channel(Vec::new());
         let (publish, torrents) = watch::channel(Vec::new());
         let (moved, swarm) = watch::channel(Swarm::default());
-        let mut feed = Feed::from_parts(LinkTable::of(table), statuses, counted, torrents, swarm);
-        for _ in 0..3 {
+        let (_queue, queued) = watch::channel(QueueView::default());
+        let mut feed = Feed::from_parts(
+            LinkTable::of(table),
+            statuses,
+            counted,
+            torrents,
+            swarm,
+            queued,
+        );
+        for _ in 0..4 {
             feed.next().await;
         }
         quiet(&mut feed).await;

@@ -10,13 +10,13 @@ export const FILTERS: Filter[] = ['all', 'active', 'torrents', 'stopped', 'done'
 
 /** Active is everything still under way: finding the file, waiting for a cable, or fetching. */
 export function filterOf(state: DownloadState): Exclude<Filter, 'all' | 'torrents'> {
-  if (state === 'starting' || state === 'waiting' || state === 'downloading') return 'active'
+  if (state === 'queued' || state === 'starting' || state === 'waiting' || state === 'downloading') return 'active'
   return state
 }
 
 /** A torrent falls under the same filters, and Torrents as well. */
 export function torrentFilterOf(phase: TorrentPhase): Exclude<Filter, 'all' | 'torrents'> {
-  return phase === 'finding' || phase === 'downloading' ? 'active' : phase
+  return phase === 'queued' || phase === 'finding' || phase === 'downloading' ? 'active' : phase
 }
 
 /** How many downloads and torrents each filter would show. */
@@ -39,6 +39,7 @@ export function countByFilter(
 
 /** What the time-left figure says in each state that is not fetching. */
 const ETA_WORDS: Record<Exclude<DownloadState, 'downloading'>, string> = {
+  queued: 'Queued',
   starting: 'Waiting',
   waiting: 'Waiting',
   stopped: 'Stopped',
@@ -59,6 +60,7 @@ export function etaText(d: DownloadView): string {
 
 /** What the time-left figure says of a torrent that is not fetching. */
 const TORRENT_ETA_WORDS: Record<Exclude<TorrentPhase, 'downloading'>, string> = {
+  queued: 'Queued',
   finding: 'Finding',
   stopped: 'Stopped',
   done: 'Complete',

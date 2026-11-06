@@ -643,6 +643,11 @@ impl Downloads {
         self.inner.used.subscribe()
     }
 
+    /// Start counting the data used from nothing.
+    pub fn reset_used(&self) {
+        self.inner.used.reset();
+    }
+
     /// Stop download `id`: its connections stop and report what they wrote,
     /// and its progress is saved, so resuming it carries on from there.
     /// Returns once it has stopped, the progress on disk; or, if it finished
