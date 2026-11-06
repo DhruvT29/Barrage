@@ -16,6 +16,7 @@ pub mod bt;
 pub mod fetch;
 pub mod links;
 pub mod logging;
+pub mod record;
 pub mod transfer;
 
 pub use links::LinkHandle;

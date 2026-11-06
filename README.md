@@ -66,7 +66,8 @@ read what a newer engine sends.
 http://127.0.0.1:7700, reachable from this machine only. `--port N` picks
 another port, `--no-open` skips the browser, `--log FILE` records every change,
 `--downloads DIR` names the folder downloads go to (otherwise the Downloads
-folder). `cargo run --bin brg-links` shows the same links as a table in the
+folder), `--state DIR` names the folder the engine keeps its own state in
+(otherwise `%LOCALAPPDATA%\BARRAGE`). `cargo run --bin brg-links` shows the same links as a table in the
 terminal.
 
 The dashboard has two tabs. **Links** shows a card per connection (Wi-Fi, a

@@ -52,6 +52,7 @@ pub use disk::downloads_folder;
 pub use name::{file_name, free_name};
 pub use ranges::Ranges;
 pub use remote::{MAX_REDIRECTS, PROBE_BYTES, Refused, Remote, Validator, find, retry_after};
+pub(crate) use saved::replace;
 pub use used::Usage;
 
 /// Every download the engine runs, and what each is doing. Cheap to clone:
