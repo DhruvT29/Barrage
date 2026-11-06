@@ -184,7 +184,7 @@ export function RadarDetail({
           id="used"
           label="Data used"
           value={cable.used > 0 ? formatBytes(cable.used) : '-'}
-          sub="since start"
+          sub="since last reset"
           fraction={usedTotal > 0 ? cable.used / usedTotal : null}
           color={color}
         />

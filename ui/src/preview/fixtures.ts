@@ -1,7 +1,7 @@
 // Made-up engine messages for the preview page (preview.html), never built
 // into the engine's page. Addresses are documentation ranges only
 // (192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::): the repository is public.
-import type { DownloadsView, DownloadView, LinkView, TableView, TorrentsView, TorrentView } from '../api/types'
+import type { DownloadsView, DownloadView, LinkView, QueueView, TableView, TorrentsView, TorrentView } from '../api/types'
 
 const MB = 8e6
 
@@ -35,6 +35,21 @@ export function previewTable(t: number): TableView {
   }
 }
 
+/** The queue beside the downloads and torrents below: two in line, one of each kind. */
+export function previewQueue(notice: boolean): QueueView {
+  return {
+    limit: 3,
+    most: 20,
+    holding: 3,
+    places: [
+      { kind: 'web', id: 90, place: 1 },
+      { kind: 'torrent', id: 91, place: 2 },
+    ],
+    notice: notice ? 'The saved list could not be read, so the engine started with an empty one. It was kept as state.broken-1700000000.json.' : null,
+    used_since: 1_700_000_000,
+  }
+}
+
 /** The downloads at second `t`: two downloading, one stopped, one done, one failed, one waiting. */
 export function previewDownloads(t: number): DownloadsView {
   const wifi = wiggle(11 * MB, t, 0)
@@ -46,6 +61,11 @@ export function previewDownloads(t: number): DownloadsView {
   const isoDone = Math.min(iso, 1.1e9 + (t * phone) / 8)
 
   const list: DownloadView[] = [
+    {
+      priority: 'high',
+      id: 90, url: 'https://releases.example.com/fedora.iso', name: null,
+      state: 'queued', length: null, done: 0, bps: 0, note: null, cables: [],
+    },
     {
       priority: 'normal',
       id: 1, url: 'https://releases.example.com/linux/distro-24.04-desktop-amd64.iso', name: 'distro-24.04-desktop-amd64.iso',
@@ -162,6 +182,11 @@ export function previewTorrents(t: number): TorrentsView {
   const fromPhone = Math.min(whole * 0.3, 0.42e9 + (t * phone) / 8)
   const done = Math.floor(fromWifi + fromPhone)
   const list: TorrentView[] = [
+    {
+      priority: 'low',
+      id: 91, name: 'archlinux.iso', info_hash: 'b'.repeat(40), phase: 'queued',
+      length: null, done: 0, down_bps: 0, up_bps: 0, peers: 0, note: null, cables: [],
+    },
     {
       priority: 'normal',
       id: 1, name: 'a-distribution-netinst-amd64.iso', info_hash: 'a'.repeat(40), phase: 'done', length: 660e6, done: 660e6,

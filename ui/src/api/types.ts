@@ -63,12 +63,12 @@ export type DownloadState = 'queued' | 'starting' | 'waiting' | 'downloading' | 
 /** Who goes next: high first, then the earliest added. */
 export type Priority = 'high' | 'normal' | 'low'
 
-/** Every download since the engine started, and the speed they make together. */
+/** Every download on the engine's list, and the speed they make together. */
 export interface DownloadsView {
   live: LiveSpeed
   /** In the order they were added. */
   list: DownloadView[]
-  /** What each cable has moved for every download and torrent since the engine started, in the order cables first carried. */
+  /** What each cable has moved for every download and torrent since the data used was last zeroed, in the order cables first carried. */
   used: UseView[]
 }
 
@@ -129,7 +129,7 @@ export interface CableShare {
 /** A torrent's phase words. `done` and `stopped` share nothing. */
 export type TorrentPhase = 'queued' | 'finding' | 'downloading' | 'done' | 'stopped' | 'failed'
 
-/** Every torrent since the engine started, and what the session does apart from any one of them. */
+/** Every torrent on the engine's list, and what the session does apart from any one of them. */
 export interface TorrentsView {
   /** In the order they were added. */
   list: TorrentView[]

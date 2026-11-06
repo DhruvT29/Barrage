@@ -42,6 +42,15 @@ export function PauseIcon() {
   )
 }
 
+/** Remove: a cross. */
+export function RemoveIcon() {
+  return (
+    <Icon>
+      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.6" fill="none" />
+    </Icon>
+  )
+}
+
 /** Resume: a triangle. */
 export function PlayIcon() {
   return (

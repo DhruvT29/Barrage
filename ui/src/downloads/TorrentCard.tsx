@@ -2,18 +2,19 @@ import { useId, useState, type CSSProperties } from 'react'
 
 import type { TorrentCableView, TorrentPhase, TorrentsView, TorrentView } from '../api/types'
 import { mbps } from '../links/cables'
-import { controlTorrent } from '../overview/control'
+import { controlTorrent, setPriority } from '../overview/control'
 import { PieceBar, Stat } from './DownloadCard'
 import { formatBytes, percentText } from './format'
 import { ChevronIcon, ClockIcon, ConnectionsIcon, DriveIcon, GaugeIcon, PauseIcon, PlayIcon, UploadIcon } from './icons'
 import { torrentBar, torrentEta } from './queue'
+import { TransferControls } from './TransferControls'
 import { useAction } from './useAction'
 
 import './downloads.css'
 
-/** What a torrent in this phase can be asked: Stop while it runs, Resume once stopped. */
+/** What a torrent in this phase can be asked: Stop while it runs or waits in line, Resume once stopped. */
 function actionFor(phase: TorrentPhase): 'stop' | 'resume' | null {
-  if (phase === 'finding' || phase === 'downloading') return 'stop'
+  if (phase === 'queued' || phase === 'finding' || phase === 'downloading') return 'stop'
   return phase === 'stopped' ? 'resume' : null
 }
 
@@ -30,6 +31,8 @@ type CardProps = {
   expanded?: boolean
   /** Told the user's choice to open (true) or close the list of cables. */
   onToggle?: (open: boolean) => void
+  /** Its place in line, while it waits for one. */
+  place?: number
 }
 
 /**
@@ -41,7 +44,7 @@ type CardProps = {
  * and sent, its connections, and whether it may upload. Every note is the
  * engine's own words.
  */
-export function TorrentCard({ torrent: t, colors = {}, expanded, onToggle }: CardProps) {
+export function TorrentCard({ torrent: t, colors = {}, expanded, onToggle, place }: CardProps) {
   const title = t.name ?? t.info_hash
   const moving = t.phase === 'downloading'
   const { action, sending, refused, press } = useAction(t.id, t.phase, actionFor(t.phase), controlTorrent)
@@ -69,8 +72,15 @@ export function TorrentCard({ torrent: t, colors = {}, expanded, onToggle }: Car
           </div>
           <h3 className={t.name === null ? 'tq-name hash' : 'tq-name'}>{title}</h3>
         </div>
-        {action !== null && (
-          <div className="tq-actions">
+        <div className="tq-actions">
+          <TransferControls
+            priority={t.priority}
+            ended={t.phase === 'done' || t.phase === 'failed'}
+            running={t.phase === 'finding' || t.phase === 'downloading'}
+            onPriority={(priority) => setPriority('torrent', t.id, priority)}
+            onRemove={() => controlTorrent(t.id, 'remove')}
+          />
+          {action !== null && (
             <button
               type="button"
               className={`tq-act tq-${action}`}
@@ -81,8 +91,8 @@ export function TorrentCard({ torrent: t, colors = {}, expanded, onToggle }: Car
             >
               {action === 'stop' ? <PauseIcon /> : <PlayIcon />}
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       <div className="tq-progress">
@@ -95,7 +105,7 @@ export function TorrentCard({ torrent: t, colors = {}, expanded, onToggle }: Car
         </span>
       </div>
 
-      <Stats torrent={t} />
+      <Stats torrent={t} place={place} />
 
       {t.phase === 'finding' && (
         <p className="tq-words" data-testid="words">
@@ -119,7 +129,7 @@ export function TorrentCard({ torrent: t, colors = {}, expanded, onToggle }: Car
 }
 
 /** The five figures under the bar. Speeds only while downloading, as the engine sends 0 otherwise. */
-function Stats({ torrent: t }: { torrent: TorrentView }) {
+function Stats({ torrent: t, place }: { torrent: TorrentView; place?: number }) {
   const moving = t.phase === 'downloading'
   const speed = (bps: number) => {
     const [figure, unit] = mbps(bps).split(' ')
@@ -156,7 +166,7 @@ function Stats({ torrent: t }: { torrent: TorrentView }) {
         {t.peers > 0 ? t.peers : '-'}
       </Stat>
       <Stat icon={<ClockIcon />} label="ETA" id="eta">
-        {torrentEta(t)}
+        {torrentEta(t, place)}
       </Stat>
     </dl>
   )

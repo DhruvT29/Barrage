@@ -123,7 +123,7 @@ export function averagePing(table: TableView | null): number | null {
   return Math.round(rtts.reduce((a, b) => a + b, 0) / rtts.length)
 }
 
-/** Every byte the cables have received for the downloads and torrents since the engine started; null before the first downloads. */
+/** Every byte the cables have received for the downloads and torrents since the data used was last zeroed; null before the first downloads. */
 export function fetched(downloads: DownloadsView | null): number | null {
   if (!downloads) return null
   return downloads.used.reduce((sum, u) => sum + u.bytes, 0)
@@ -179,14 +179,16 @@ export function clock(ms: number): string {
   return `${two(Math.floor(total / 3600))}:${two(Math.floor((total % 3600) / 60))}:${two(total % 60)}`
 }
 
-/** The downloads Stop all asks: the ones a card's Stop would (starting, waiting, downloading). */
+/** The downloads Stop all asks: the ones a card's Stop would (queued, starting, waiting, downloading). */
 export function stoppable(downloads: DownloadsView | null): DownloadView[] {
-  return downloads?.list.filter((d) => d.state === 'starting' || d.state === 'waiting' || d.state === 'downloading') ?? []
+  const running = ['queued', 'starting', 'waiting', 'downloading']
+  return downloads?.list.filter((d) => running.includes(d.state)) ?? []
 }
 
-/** The torrents Stop all asks: the ones a card's Stop would (finding, downloading). */
+/** The torrents Stop all asks: the ones a card's Stop would (queued, finding, downloading). */
 export function stoppableTorrents(torrents: TorrentsView | null | undefined): TorrentView[] {
-  return torrents?.list.filter((t) => t.phase === 'finding' || t.phase === 'downloading') ?? []
+  const running = ['queued', 'finding', 'downloading']
+  return torrents?.list.filter((t) => running.includes(t.phase)) ?? []
 }
 
 /** "57.6": a speed's figure without its unit, for chips and tiles. */

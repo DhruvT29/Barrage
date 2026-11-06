@@ -73,7 +73,7 @@ terminal.
 The dashboard has two tabs. **Links** shows a card per connection (Wi-Fi, a
 USB-tethered phone, Ethernet) with its state, delay, measured speed and
 addresses, a "metered" mark when Windows calls the connection metered, how
-much BARRAGE has downloaded through it since it started (its speed tests
+much BARRAGE has downloaded through it since the data used was last reset (its speed tests
 included: 30 to 60 MB each time a phone is measured), and a notice when two
 connections reach the internet through the same one. **Downloads** takes a
 link to a file, which then comes down through every working connection at

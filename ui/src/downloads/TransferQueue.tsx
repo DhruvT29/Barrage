@@ -3,7 +3,8 @@ import { useReducer, useState } from 'react'
 import type { PageProps } from '../links/Dashboard'
 import { DownloadCard } from './DownloadCard'
 import { TrayIcon } from './icons'
-import { countByFilter, FILTERS, filterOf, openChoice, rememberOpen, torrentFilterOf, type Filter } from './queue'
+import { countByFilter, FILTERS, filterOf, openChoice, placeOf, rememberOpen, torrentFilterOf, type Filter } from './queue'
+import { QueueBar, QueueNotice } from './QueueBar'
 import { SwarmLine, TorrentCard } from './TorrentCard'
 
 import './downloads.css'
@@ -28,9 +29,10 @@ const EMPTY_WORDS: Record<Exclude<Filter, 'all'>, string> = {
 
 /**
  * The transfer queue, the download manager's right column: every torrent
- * and download since the engine started, the newest first, torrents above
+ * and download on the engine's list, the newest first, torrents above
  * downloads, one card each, under a heading with how many there are and a
- * filter by state, with the line on DHT and the port once there is a
+ * filter by state, the line on how many run and the limit, any notice about
+ * the saved list, and the line on DHT and the port once there is a
  * torrent. A filter with
  * nothing in it is left out, except All, Active and the one chosen, so the
  * row never offers an empty view nor takes the chosen one away.
@@ -39,7 +41,7 @@ const EMPTY_WORDS: Record<Exclude<Filter, 'all'>, string> = {
  * rather than a moment of "nothing downloaded yet" that is not so. An empty
  * queue offers to add a download (`onAdd` opens the add window).
  */
-export function TransferQueue({ downloads, torrents, colors, onAdd }: PageProps & { onAdd: () => void }) {
+export function TransferQueue({ downloads, torrents, queue, colors, onAdd }: PageProps & { onAdd: () => void }) {
   const [filter, setFilter] = useState<Filter>('all')
   // The choices to open or close a card's cables live in queue.ts, for as
   // long as the page is open; this only redraws when one changes.
@@ -85,6 +87,9 @@ export function TransferQueue({ downloads, torrents, colors, onAdd }: PageProps 
         )}
       </div>
 
+      {queue && <QueueBar queue={queue} />}
+      {queue && <QueueNotice notice={queue.notice} />}
+
       {torrents && swarm.length > 0 && <SwarmLine torrents={torrents} />}
 
       {downloads !== null && counts.all === 0 && (
@@ -109,6 +114,7 @@ export function TransferQueue({ downloads, torrents, colors, onAdd }: PageProps 
             key={`t${t.id}`}
             torrent={t}
             colors={colors}
+            place={placeOf(queue, 'torrent', t.id)}
             expanded={openChoice(`t${t.id}`)}
             onToggle={(open) => {
               rememberOpen(`t${t.id}`, open)
@@ -121,6 +127,7 @@ export function TransferQueue({ downloads, torrents, colors, onAdd }: PageProps 
             key={d.id}
             download={d}
             colors={colors}
+            place={placeOf(queue, 'web', d.id)}
             expanded={openChoice(d.id)}
             onToggle={(open) => {
               rememberOpen(d.id, open)
