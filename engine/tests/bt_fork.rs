@@ -7,19 +7,23 @@ mod scratch;
 mod torrent;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use librqbit::dht::Id20;
+use librqbit::storage::filesystem::FilesystemStorageFactory;
+use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ConnectionOptions, PeerConnector, PeerSocket, Session,
+    AddTorrent, AddTorrentOptions, ConnectionOptions, ManagedTorrentShared, PeerConnector,
+    PeerSocket, Session, SessionOptions, TorrentMetadata,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpSocket;
 
-use torrent::{downloaded, fresh_dir, listening_on, pattern, quiet_options, seeds_with};
+use torrent::{FILE, downloaded, fresh_dir, listening_on, pattern, quiet_options, seeds_with};
 
 /// Opens each connection from the next of `from` in turn, and remembers
 /// which torrent and peer each was for.
@@ -410,4 +414,238 @@ async fn udp_sockets_bind_to_the_chosen_address() {
         Some(ip),
         "the listener moves to the chosen address too"
     );
+}
+
+/// The filesystem, counting the bytes read from it: a full check reads the
+/// whole file, and fast resume only a sample of its pieces.
+#[derive(Clone, Default)]
+struct CountingReads(Arc<AtomicU64>);
+
+struct Counted {
+    inner: Box<dyn TorrentStorage>,
+    read: Arc<AtomicU64>,
+}
+
+impl StorageFactory for CountingReads {
+    type Storage = Counted;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<Counted> {
+        Ok(Counted {
+            inner: Box::new(FilesystemStorageFactory::default().create(shared, metadata)?),
+            read: Arc::clone(&self.0),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for Counted {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.read.fetch_add(buf.len() as u64, Ordering::SeqCst);
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(Counted {
+            inner: self.inner.take()?,
+            read: Arc::clone(&self.read),
+        }))
+    }
+}
+
+/// A session keeping its fast resume data in `resume`.
+async fn resuming_session(dir: &std::path::Path, resume: &std::path::Path) -> Arc<Session> {
+    Session::new_with_opts(
+        dir.to_path_buf(),
+        SessionOptions {
+            fastresume_folder: Some(resume.to_path_buf()),
+            ..quiet_options()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Whether `resume` says every one of `pieces` pieces is here, flushed.
+fn all_pieces_saved(resume: &std::path::Path, pieces: usize) -> bool {
+    std::fs::read_dir(resume).is_ok_and(|files| {
+        files.flatten().any(|file| {
+            let ones: u32 = std::fs::read(file.path())
+                .map_or(0, |bytes| bytes.iter().map(|byte| byte.count_ones()).sum());
+            ones as usize == pieces
+        })
+    })
+}
+
+/// A session given `torrent` again, in the folder that already has its file:
+/// how much it read before it knew it had the whole of it.
+async fn read_to_be_sure(
+    session: &Arc<Session>,
+    torrent: &[u8],
+    dir: &std::path::Path,
+    read: CountingReads,
+) -> u64 {
+    let added = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.to_vec()),
+            Some(AddTorrentOptions {
+                output_folder: Some(dir.to_string_lossy().into_owned()),
+                overwrite: true,
+                storage_factory: Some(read.clone().boxed()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let handle = added.into_handle().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle.wait_until_completed())
+        .await
+        .expect("it knows it has the whole file, from no peer at all")
+        .unwrap();
+    read.0.load(Ordering::SeqCst)
+}
+
+/// A session that fetched `seeds`' file from them, kept for fast resume, and
+/// stopped: its folder, and the fast resume folder.
+async fn fetched_once(name: &str, seeds: &torrent::Seeds, pieces: usize) -> (PathBuf, PathBuf) {
+    let dir = fresh_dir(&format!("{name}-leech"));
+    let resume = fresh_dir(&format!("{name}-resume"));
+    let session = resuming_session(&dir, &resume).await;
+    let added = session
+        .add_torrent(
+            AddTorrent::from_bytes(seeds.torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(dir.to_string_lossy().into_owned()),
+                initial_peers: Some(seeds.addrs.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let handle = added.into_handle().unwrap();
+    tokio::time::timeout(Duration::from_secs(60), handle.wait_until_completed())
+        .await
+        .expect("the download finishes")
+        .unwrap();
+    session.stop().await;
+    drop(handle);
+    drop(session);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !all_pieces_saved(&resume, pieces) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the bitfield never reached the disk"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (dir, resume)
+}
+
+const RESUME_LEN: usize = 3 << 20;
+const RESUME_PIECE: u32 = 64 << 10;
+const RESUME_PIECES: usize = RESUME_LEN / RESUME_PIECE as usize;
+
+#[tokio::test]
+async fn a_second_session_skips_the_full_check() {
+    let seeds = seeds_with("skips", 1, &pattern(RESUME_LEN), RESUME_PIECE, || {
+        listening_on("127.0.0.1")
+    })
+    .await;
+    let (dir, resume) = fetched_once("skips", &seeds, RESUME_PIECES).await;
+
+    let session = resuming_session(&dir, &resume).await;
+    let read = read_to_be_sure(&session, &seeds.torrent, &dir, CountingReads::default()).await;
+    session.stop().await;
+    assert!(
+        read < RESUME_LEN as u64 / 2,
+        "read {read} of {RESUME_LEN} with fast resume"
+    );
+
+    // The same without it, which shows the count counts: the whole file.
+    let plain = Session::new_with_opts(dir.clone(), quiet_options())
+        .await
+        .unwrap();
+    let read = read_to_be_sure(&plain, &seeds.torrent, &dir, CountingReads::default()).await;
+    assert!(read >= RESUME_LEN as u64, "read {read} of {RESUME_LEN}");
+    assert_eq!(downloaded(&dir), seeds.bytes);
+}
+
+/// The first piece of each file is always among those checked, so a change
+/// there is always seen. Anywhere else it is seen only if that piece is
+/// drawn: fast resume trusts the rest.
+#[tokio::test]
+async fn a_changed_file_falls_back_to_a_full_check() {
+    let seeds = seeds_with("falls", 1, &pattern(RESUME_LEN), RESUME_PIECE, || {
+        listening_on("127.0.0.1")
+    })
+    .await;
+    let (dir, resume) = fetched_once("falls", &seeds, RESUME_PIECES).await;
+    let file = dir.join(FILE);
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[10] ^= 0xff;
+    std::fs::write(&file, &bytes).unwrap();
+
+    let session = resuming_session(&dir, &resume).await;
+    let added = session
+        .add_torrent(
+            AddTorrent::from_bytes(seeds.torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(dir.to_string_lossy().into_owned()),
+                overwrite: true,
+                initial_peers: Some(seeds.addrs.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let handle = added.into_handle().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle.wait_until_completed())
+        .await
+        .expect("the changed piece comes again")
+        .unwrap();
+
+    assert_eq!(downloaded(&dir), seeds.bytes, "whole again");
+}
+
+#[tokio::test]
+async fn no_torrent_comes_back_by_itself() {
+    let seeds = seeds_with("by-itself", 1, &pattern(RESUME_LEN), RESUME_PIECE, || {
+        listening_on("127.0.0.1")
+    })
+    .await;
+    let (dir, resume) = fetched_once("by-itself", &seeds, RESUME_PIECES).await;
+
+    let session = resuming_session(&dir, &resume).await;
+
+    assert_eq!(session.with_torrents(|all| all.count()), 0);
 }
