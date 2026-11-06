@@ -687,6 +687,22 @@ impl Downloads {
         Ok(())
     }
 
+    /// Take download `id` off the list, in any state. One running is stopped
+    /// first, its progress saved, so adding its URL again carries on. Its
+    /// files stay where they are.
+    pub async fn forget(&self, id: DownloadId) -> Result<(), ControlError> {
+        // Anything else means it has stopped or ended: all it needs is to go.
+        if let Err(ControlError::NoSuchDownload) = self.stop(id).await {
+            return Err(ControlError::NoSuchDownload);
+        }
+        let mut controls = self.inner.controls.lock().unwrap();
+        controls.remove(&id);
+        self.inner
+            .status
+            .send_modify(|all| all.retain(|s| s.id != id));
+        Ok(())
+    }
+
     /// Give download `id` this priority. One running stays running.
     pub fn set_priority(&self, id: DownloadId, priority: Priority) -> Result<(), ControlError> {
         let mut outcome = Err(ControlError::NoSuchDownload);
@@ -879,6 +895,10 @@ impl crate::transfer::TransferEngine for Downloads {
 
     async fn requeue(&self, id: DownloadId) -> Result<(), ControlError> {
         Downloads::requeue(self, id)
+    }
+
+    async fn forget(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::forget(self, id).await
     }
 
     async fn set_priority(&self, id: DownloadId, priority: Priority) -> Result<(), ControlError> {

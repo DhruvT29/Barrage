@@ -579,3 +579,78 @@ async fn ids_and_order_carry_on_past_the_highest() {
     assert_eq!(id.as_u64(), 7);
     assert_eq!(status(&next.torrents, id).seq, 42);
 }
+
+#[tokio::test]
+async fn a_removed_torrent_stays_gone_and_can_be_added_again() {
+    let seeds = slow_seeds("r-remove", 256).await;
+    let cables = one_cable().await;
+    let (state, dir) = (fresh_dir("r-remove-state"), fresh_dir("r-remove"));
+    let first = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    let id = first
+        .torrents
+        .add(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+    wait_for(&first.torrents, id, 30, "a quarter done", |t| {
+        t.done * 4 >= LEN as u64
+    })
+    .await;
+
+    // Still running: it stops and leaves the list, its file kept.
+    first.torrents.forget(id).await.unwrap();
+
+    assert!(first.torrents.status().borrow().is_empty());
+    assert!(dir.join(FILE).exists());
+    let leftovers = |folder: &str| std::fs::read_dir(state.join(folder)).unwrap().count();
+    assert_eq!(leftovers("torrents"), 0, "its saved .torrent has gone");
+    assert_eq!(leftovers("resume"), 0, "and its fast resume data");
+    assert_eq!(
+        first.torrents.forget(id).await,
+        Err(barrage::bt::TorrentControlError::NoSuchTorrent)
+    );
+
+    let again = first
+        .torrents
+        .add(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+    assert_eq!(again.as_u64(), id.as_u64() + 1, "ids are not used twice");
+    wait_for(&first.torrents, again, 60, "done", |t| {
+        t.phase == TorrentPhase::Done
+    })
+    .await;
+    assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), seeds.bytes);
+    first.close().await;
+
+    let next = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    let list = next.torrents.status().borrow().clone();
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0].id, again);
+}
+
+/// A failed torrent's info hash used to block it for good.
+#[tokio::test]
+async fn a_failed_torrent_can_be_removed_and_added_again() {
+    let seeds = quick_seeds("r-failed").await;
+    let cables = one_cable().await;
+    let (state, dir) = (fresh_dir("r-failed-state"), fresh_dir("r-failed"));
+    let hash = seeds.info_hash.as_string();
+    left_behind(
+        &state,
+        vec![row(1, &hash, dir.clone(), KeptState::Failed, None)],
+    );
+
+    let next = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    let id = next.torrents.status().borrow()[0].id;
+    next.torrents.forget(id).await.unwrap();
+
+    let again = next
+        .torrents
+        .add(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+    wait_for(&next.torrents, again, 30, "done", |t| {
+        t.phase == TorrentPhase::Done
+    })
+    .await;
+}

@@ -59,6 +59,10 @@ pub trait TransferEngine {
     /// Send a stopped one to the back of the line.
     fn requeue(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
 
+    /// Take one off the list and out of the line, in any state: one running
+    /// is stopped first. What it has written stays on disk.
+    fn forget(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
     /// Change who goes next. One already running stays running.
     fn set_priority(
         &self,

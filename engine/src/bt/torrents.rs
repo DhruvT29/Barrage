@@ -468,7 +468,7 @@ impl Inner {
                         .with_metadata(|m| m.torrent_bytes.to_vec())
                         .ok()
                         .filter(|bytes| !bytes.is_empty());
-                    let wanted = giving.entry(id, |e| {
+                    let listed = giving.entry(id, |e| {
                         current(e).then(|| {
                             e.handle = Some(Arc::clone(&handle));
                             e.output = Some(handle.output_folder().to_path_buf());
@@ -479,12 +479,17 @@ impl Inner {
                             e.wanted
                         })
                     });
+                    if listed.is_none() {
+                        // Removed while it was being given.
+                        let _ = session.delete(handle.id().into(), false).await;
+                        return;
+                    }
                     // Stopped or resumed while it was being given.
-                    match wanted.flatten() {
+                    match listed.flatten() {
                         Some(Wanted::Running) if paused => {
                             let _ = session.unpause(&handle).await;
                         }
-                        Some(Wanted::Stopped | Wanted::Done) if !paused => {
+                        Some(Wanted::Stopped | Wanted::Done | Wanted::Queued) if !paused => {
                             let _ = session.pause(&handle).await;
                         }
                         _ => {}
@@ -821,6 +826,28 @@ impl TransferEngine for Torrents {
             inner.give(id, source, generation, false);
         } else if let Some(handle) = handle {
             let _ = inner.session().unpause(&handle).await;
+        }
+        inner.publish().await;
+        Ok(())
+    }
+
+    async fn forget(&self, id: TorrentId) -> Result<(), TorrentControlError> {
+        let inner = &self.inner;
+        let entry = {
+            let mut list = inner.list.lock().unwrap();
+            let at = list
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or(TorrentControlError::NoSuchTorrent)?;
+            list.remove(at)
+        };
+        if let Some(handle) = &entry.handle {
+            let _ = inner.session().delete(handle.id().into(), false).await;
+        }
+        if let Some(state) = inner.config.state.as_deref() {
+            let _ = std::fs::remove_file(torrent_file(state, &entry.info_hash));
+            let bitfield = format!("{}.bitv", entry.info_hash);
+            let _ = std::fs::remove_file(state.join("resume").join(bitfield));
         }
         inner.publish().await;
         Ok(())

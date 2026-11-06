@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicU64;
 
 use barrage::LinkHandle;
 use barrage::bt::{TorrentConfig, Torrents};
-use barrage::fetch::{CableUse, DownloadConfig, Downloads, Phase, Usage};
+use barrage::fetch::{CableUse, ControlError, DownloadConfig, Downloads, Phase, Usage};
 use barrage::keeper::{Engines, Keeper};
 use barrage::links::watch::LinkTable;
 use barrage::queue::Queue;
@@ -545,4 +545,89 @@ async fn a_save_that_fails_tells_the_page_and_the_engine_carries_on() {
     assert!(said.contains("could not be saved"), "{said}");
     assert_eq!(ended(&engine.downloads, id).await.phase, Phase::Done);
     std::fs::remove_dir(state.0.join("state.json")).unwrap();
+}
+
+#[tokio::test]
+async fn a_removed_download_stays_gone_and_its_file_stays_on_disk() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/kept.bin", Answer::File(whole()));
+    let (state, dir) = (Folder::new("remove-state"), Folder::new("remove"));
+    let first = open(&links, &state, &dir).await;
+    let id = first
+        .downloads
+        .add(request(&server.url("/kept.bin")))
+        .await
+        .unwrap();
+    ended(&first.downloads, id).await;
+
+    first.downloads.forget(id).await.unwrap();
+
+    assert!(first.downloads.status().borrow().is_empty());
+    assert_eq!(
+        first.downloads.forget(id).await,
+        Err(ControlError::NoSuchDownload)
+    );
+    first.close().await;
+    assert_same(&dir.read("kept.bin"), LENGTH);
+
+    let next = open(&links, &state, &dir).await;
+    assert!(next.downloads.status().borrow().is_empty());
+}
+
+#[tokio::test]
+async fn adding_a_removed_url_again_carries_on() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/again.bin", Answer::File(held()));
+    let (state, dir) = (Folder::new("again-state"), Folder::new("again"));
+    let url = server.url("/again.bin");
+    let first = open(&links, &state, &dir).await;
+    let id = first.downloads.add(request(&url)).await.unwrap();
+    wait_for(&first.downloads, id, "parts under way", |s| {
+        s.done > FINISHED
+    })
+    .await;
+
+    // Still running: it stops, its progress saved, and leaves the list.
+    first.downloads.forget(id).await.unwrap();
+    assert!(first.downloads.status().borrow().is_empty());
+    let had = progress_done(&dir, "again.bin");
+    assert!(had > FINISHED, "{had}");
+
+    server.at("/again.bin", Answer::File(whole()));
+    let before = server.seen().len();
+    let again = first.downloads.add(request(&url)).await.unwrap();
+    let end = ended(&first.downloads, again).await;
+
+    assert_eq!(end.phase, Phase::Done, "{end:?}");
+    assert_eq!(asked(&server.seen()[before..]).covered(), LENGTH - had);
+    assert_same(&dir.read("again.bin"), LENGTH);
+}
+
+#[tokio::test]
+async fn removing_keeps_ids_from_being_used_again() {
+    let links = both();
+    let server = Server::start().await;
+    server.at("/a.bin", Answer::File(whole()));
+    server.at("/b.bin", Answer::File(whole()));
+    let (state, dir) = (Folder::new("reuse-state"), Folder::new("reuse"));
+    let first = open(&links, &state, &dir).await;
+    let id = first
+        .downloads
+        .add(request(&server.url("/a.bin")))
+        .await
+        .unwrap();
+    ended(&first.downloads, id).await;
+    first.downloads.forget(id).await.unwrap();
+    first.close().await;
+
+    let next = open(&links, &state, &dir).await;
+    let later = next
+        .downloads
+        .add(request(&server.url("/b.bin")))
+        .await
+        .unwrap();
+
+    assert_eq!(later.as_u64(), id.as_u64() + 1);
 }

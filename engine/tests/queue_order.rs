@@ -568,3 +568,61 @@ async fn a_done_transfer_has_no_priority_to_change() {
 
     assert_eq!(refused, Err(ControlError::Finished));
 }
+
+#[tokio::test]
+async fn a_queued_one_leaves_the_line_and_never_starts() {
+    let links = both();
+    let files = server().await;
+    let e = engine(&links, "q-remove", 1, Vec::new()).await;
+    let first = add(&e, &files, "/one.bin").await;
+    until("the first running", || running(phase(&e, first))).await;
+    let second = add(&e, &files, "/two.bin").await;
+    let third = add(&e, &files, "/three.bin").await;
+
+    e.downloads.forget(second).await.unwrap();
+
+    let view = e.queue.view();
+    until("the line closing up", || {
+        places(&view.borrow()) == [(Key::Web(third), 1)]
+    })
+    .await;
+    e.downloads.stop(first).await.unwrap();
+    until("the next running", || running(phase(&e, third))).await;
+    let asked = files.url("/two.bin");
+    assert!(
+        !files.seen().iter().any(|s| s.path == asked.path()),
+        "no request reached the server"
+    );
+}
+
+#[tokio::test]
+async fn a_running_one_stops_and_its_place_goes_to_the_next() {
+    let links = both();
+    let files = server().await;
+    let e = engine(&links, "q-remove-run", 1, Vec::new()).await;
+    let first = add(&e, &files, "/one.bin").await;
+    until("the first running", || running(phase(&e, first))).await;
+    let second = add(&e, &files, "/two.bin").await;
+
+    e.downloads.forget(first).await.unwrap();
+
+    until("the next running", || running(phase(&e, second))).await;
+    assert_eq!(e.downloads.status().borrow().len(), 1);
+}
+
+/// Review Focus 3's way out: a magnet nobody answers can simply go.
+#[tokio::test]
+async fn a_finding_torrent_can_be_removed() {
+    let links = both();
+    let files = server().await;
+    let e = engine(&links, "q-remove-dead", 1, Vec::new()).await;
+    let dead = format!("magnet:?xt=urn:btih:{}&dn=dead.iso", "cd".repeat(20));
+    let id = e.queue.add_torrent(Source::Magnet(dead)).await.unwrap();
+    until("finding", || torrent_phase(&e, id) == TorrentPhase::Finding).await;
+    let waiting = add(&e, &files, "/one.bin").await;
+
+    e.torrents.forget(id).await.unwrap();
+
+    assert!(e.torrents.status().borrow().is_empty());
+    until("the next running", || running(phase(&e, waiting))).await;
+}

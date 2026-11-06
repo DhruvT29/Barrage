@@ -1896,10 +1896,8 @@ impl Download {
                     }
                     changed
                 }
-                None => {
-                    all.push(status);
-                    true
-                }
+                // Removed from the list: it stays removed.
+                None => false,
             });
     }
 }
