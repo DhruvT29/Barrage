@@ -142,10 +142,12 @@ impl std::error::Error for AddError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
     NoSuchDownload,
-    /// Stopping: it is not starting, waiting or downloading.
+    /// Stopping: it is not queued, starting, waiting or downloading.
     NotRunning,
     /// Resuming: it is not stopped.
     NotStopped,
+    /// Releasing: it is not queued.
+    NotQueued,
 }
 
 impl fmt::Display for ControlError {
@@ -154,6 +156,7 @@ impl fmt::Display for ControlError {
             Self::NoSuchDownload => f.write_str("no such download"),
             Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
             Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
+            Self::NotQueued => f.write_str("it is not queued, so there is nothing to start"),
         }
     }
 }
@@ -247,6 +250,8 @@ impl DownloadId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// In line for a place: it has no connection, and holds no place.
+    Queued,
     /// Finding the file.
     Starting,
     /// No usable link to fetch it through yet.
@@ -369,13 +374,22 @@ impl Downloads {
     /// taken from under it. Once it is done or has failed, adding it again
     /// starts a new download.
     pub async fn add(&self, request: AddRequest) -> Result<DownloadId, AddError> {
+        let id = self.enqueue(request)?;
+        // Just listed as queued, unless a stop has come already.
+        let _ = self.release(id);
+        Ok(id)
+    }
+
+    /// List `request.url` as queued, starting nothing until [`Downloads::release`].
+    /// Refused as [`Downloads::add`] is; a stopped download of the file goes
+    /// back in line under its own id, through the cables asked for now.
+    pub fn enqueue(&self, request: AddRequest) -> Result<DownloadId, AddError> {
         let url = web_address(&request.url)?;
         if request.cables.as_ref().is_some_and(Vec::is_empty) {
             return Err(AddError::NoCables);
         }
-        // Checked and started under the controls' lock, then the status's,
-        // as resuming is: the same URL posted twice at once still starts
-        // once, and a stop that comes meanwhile waits for the new download.
+        // Checked and listed under the controls' lock, then the status's,
+        // as resuming is: the same URL posted twice at once is listed once.
         let mut controls = self.inner.controls.lock().unwrap();
         let mut added = None;
         self.inner.status.send_if_modified(|all| {
@@ -385,37 +399,102 @@ impl Downloads {
                 added = Some(Err(AddError::AlreadyRunning(running.id)));
                 return false;
             }
+            let seq = self.inner.seq.fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(at) = all
                 .iter()
                 .position(|s| s.phase == Phase::Stopped && same(s))
             {
-                let (id, had) = (all[at].id, all[at].done);
-                all[at] = starting(id, &request.url, all[at].seq, all[at].priority);
-                added = Some(Ok((id, had)));
+                all[at].url.clone_from(&request.url);
+                back_in_line(&mut all[at], seq);
+                added = Some(Ok(all[at].id));
                 return true;
             }
             let id = DownloadId::new(self.inner.next.fetch_add(1, Ordering::SeqCst) + 1);
-            let seq = self.inner.seq.fetch_add(1, Ordering::SeqCst) + 1;
-            all.push(starting(id, &request.url, seq, Priority::default()));
-            added = Some(Ok((id, 0)));
+            all.push(DownloadStatus {
+                phase: Phase::Queued,
+                ..starting(id, &request.url, seq, Priority::default())
+            });
+            added = Some(Ok(id));
             true
         });
-        let (id, had) = added.expect("the status closure always runs")?;
+        let id = added.expect("the status closure always runs")?;
         let dir = controls
             .get(&id)
             .map_or_else(|| self.inner.dir.clone(), |c| c.origin.dir.clone());
-        let origin = Origin {
-            given: request.url,
-            url,
-            cables: request.cables,
-            dir,
-        };
-        self.launch(&mut controls, id, origin, had);
+        controls.insert(
+            id,
+            Control {
+                origin: Origin {
+                    given: request.url,
+                    url,
+                    cables: request.cables,
+                    dir,
+                },
+                stop: watch::channel(false).0,
+                task: None,
+            },
+        );
         Ok(id)
     }
 
+    /// Start download `id`, queued.
+    pub fn release(&self, id: DownloadId) -> Result<(), ControlError> {
+        let mut controls = self.inner.controls.lock().unwrap();
+        let origin = controls
+            .get(&id)
+            .ok_or(ControlError::NoSuchDownload)?
+            .origin
+            .clone();
+        let mut outcome = Err(ControlError::NoSuchDownload);
+        self.inner.status.send_if_modified(|all| {
+            let Some(at) = all.iter().position(|s| s.id == id) else {
+                return false;
+            };
+            if all[at].phase != Phase::Queued {
+                outcome = Err(ControlError::NotQueued);
+                return false;
+            }
+            let had = all[at].done;
+            all[at] = starting(id, &origin.given, all[at].seq, all[at].priority);
+            outcome = Ok(had);
+            true
+        });
+        let had = outcome?;
+        self.launch(&mut controls, id, origin, had);
+        Ok(())
+    }
+
+    /// Send download `id`, stopped, to the back of the line, with what it had.
+    pub fn requeue(&self, id: DownloadId) -> Result<(), ControlError> {
+        // Under the controls' lock, as adding is: a stop that comes meanwhile
+        // finds it queued.
+        let controls = self.inner.controls.lock().unwrap();
+        if !controls.contains_key(&id) {
+            return Err(ControlError::NoSuchDownload);
+        }
+        let mut outcome = Err(ControlError::NoSuchDownload);
+        self.inner.status.send_if_modified(|all| {
+            let Some(at) = all.iter().position(|s| s.id == id) else {
+                return false;
+            };
+            // Its file cannot be running as another download: adding the URL
+            // of a stopped download resumes that one rather than start a
+            // second.
+            if all[at].phase != Phase::Stopped {
+                outcome = Err(ControlError::NotStopped);
+                return false;
+            }
+            let seq = self.inner.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            back_in_line(&mut all[at], seq);
+            outcome = Ok(());
+            true
+        });
+        outcome
+    }
+
     /// Put every web download of `kept`, from an earlier engine, back on the
-    /// list with its id. What should run starts; the rest stay as they were.
+    /// list with its id. What should run goes in line, in its old place; the
+    /// rest stay as they were.
     /// `next` is the highest id that engine ever gave.
     pub fn restore(&self, kept: Vec<Kept>, next: u64) {
         let mut controls = self.inner.controls.lock().unwrap();
@@ -464,11 +543,8 @@ impl Downloads {
                     row.done = kept.length.unwrap_or(kept.done);
                 }
                 KeptState::Run => {
-                    let had = kept.done;
-                    let start = starting(id, &origin.given, kept.seq, kept.priority);
-                    self.inner.status.send_modify(|all| all.push(start));
-                    self.launch(&mut controls, id, origin, had);
-                    continue;
+                    row.phase = Phase::Queued;
+                    row.note = None;
                 }
             }
             self.inner.status.send_modify(|all| all.push(row));
@@ -572,6 +648,16 @@ impl Downloads {
         {
             let controls = self.inner.controls.lock().unwrap();
             let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
+            if self.phase(id) == Some(Phase::Queued) {
+                // No coordinator to wait for, and the lock keeps a release out.
+                self.inner.status.send_modify(|all| {
+                    if let Some(row) = all.iter_mut().find(|s| s.id == id) {
+                        row.phase = Phase::Stopped;
+                        row.note = Some(stopped_in_line(row.done).to_string());
+                    }
+                });
+                return Ok(());
+            }
             if !self.phase(id).is_some_and(running) {
                 return Err(ControlError::NotRunning);
             }
@@ -592,32 +678,9 @@ impl Downloads {
     /// picks up from the progress it saved, as a download added again would.
     /// Returns once it has started.
     pub async fn resume(&self, id: DownloadId) -> Result<(), ControlError> {
-        // Checked and started under the controls' lock, then the status's,
-        // as adding is: a URL added at the same moment still runs once, and
-        // a stop that comes meanwhile waits for the new coordinator rather
-        // than signal the one that has ended.
-        let mut controls = self.inner.controls.lock().unwrap();
-        let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
-        let origin = control.origin.clone();
-        let mut outcome = Err(ControlError::NoSuchDownload);
-        self.inner.status.send_if_modified(|all| {
-            let Some(at) = all.iter().position(|s| s.id == id) else {
-                return false;
-            };
-            // Its file cannot be running as another download: adding the URL
-            // of a stopped download resumes that one rather than start a
-            // second.
-            if all[at].phase != Phase::Stopped {
-                outcome = Err(ControlError::NotStopped);
-                return false;
-            }
-            let had = all[at].done;
-            all[at] = starting(id, &origin.given, all[at].seq, all[at].priority);
-            outcome = Ok(had);
-            true
-        });
-        let had = outcome?;
-        self.launch(&mut controls, id, origin, had);
+        self.requeue(id)?;
+        // Just queued, unless a stop has come already.
+        let _ = self.release(id);
         Ok(())
     }
 
@@ -688,7 +751,26 @@ fn web_address(given: &str) -> Result<Url, AddError> {
 
 /// Whether a download in this phase still holds its URL.
 fn running(phase: Phase) -> bool {
-    matches!(phase, Phase::Starting | Phase::Waiting | Phase::Downloading)
+    matches!(
+        phase,
+        Phase::Queued | Phase::Starting | Phase::Waiting | Phase::Downloading
+    )
+}
+
+/// `row`, stopped, as queued at the back of the line, with what it had.
+fn back_in_line(row: &mut DownloadStatus, seq: u64) {
+    row.phase = Phase::Queued;
+    row.seq = seq;
+    row.note = None;
+}
+
+/// A download's note when it is stopped before it got a place.
+fn stopped_in_line(done: u64) -> &'static str {
+    if done > 0 {
+        "stopped; resuming carries on from here"
+    } else {
+        "stopped before it started"
+    }
 }
 
 /// Whether two addresses fetch the same file. Both are parsed, so the host's
@@ -763,6 +845,18 @@ impl crate::transfer::TransferEngine for Downloads {
 
     async fn resume(&self, id: DownloadId) -> Result<(), ControlError> {
         Downloads::resume(self, id).await
+    }
+
+    async fn enqueue(&self, request: AddRequest) -> Result<DownloadId, AddError> {
+        Downloads::enqueue(self, request)
+    }
+
+    async fn release(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::release(self, id)
+    }
+
+    async fn requeue(&self, id: DownloadId) -> Result<(), ControlError> {
+        Downloads::requeue(self, id)
     }
 
     async fn shutdown(&self) {

@@ -17,6 +17,7 @@ pub mod fetch;
 pub mod keeper;
 pub mod links;
 pub mod logging;
+pub mod queue;
 pub mod record;
 pub mod transfer;
 

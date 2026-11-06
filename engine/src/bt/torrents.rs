@@ -37,6 +37,10 @@ use crate::links::watch::LinkTable;
 use crate::record::{self, KeptState, Priority, What};
 use crate::transfer::TransferEngine;
 
+/// The note on a magnet nobody has given the details of.
+const STILL_FINDING: &str = "no peer has given this torrent's details yet. It is holding a place \
+                             in the queue; stop it to let the next start";
+
 /// The note on a torrent brought back without what it takes to start it.
 const LOST_FILE: &str = "its saved .torrent file has gone: remove it and add it again";
 
@@ -63,6 +67,9 @@ pub struct TorrentConfig {
     /// The engine's own folder, where each `.torrent` and its fast resume
     /// data are kept. `None`: neither is.
     pub state: Option<PathBuf>,
+    /// How long a magnet may go without its details before it says it is
+    /// holding a place in the queue.
+    pub finding_note_after: Duration,
 }
 
 impl Default for TorrentConfig {
@@ -75,6 +82,7 @@ impl Default for TorrentConfig {
             peers: Vec::new(),
             seq: Arc::new(AtomicU64::new(0)),
             state: None,
+            finding_note_after: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -83,6 +91,8 @@ impl Default for TorrentConfig {
 /// say: a paused torrent may be stopped or done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wanted {
+    /// In line: not yet told to run.
+    Queued,
     Running,
     Stopped,
     Done,
@@ -109,6 +119,8 @@ struct Entry {
     /// Whether it has been given to a session. One brought back stopped or
     /// done has not, and needs none until it runs again.
     given: bool,
+    /// When it was given to a session, to tell a magnet nobody answers.
+    given_at: Option<Instant>,
     info_hash: String,
     /// What to give librqbit again after a rebuild: once its metadata is
     /// known, the .torrent file's bytes, even for a magnet.
@@ -247,14 +259,13 @@ impl Torrents {
     }
 
     /// Put every torrent of `kept`, from an earlier engine, back on the list
-    /// with its id. What should run is given to the session; a stopped or
-    /// done one waits as a row, and one whose `.torrent` has gone says so.
+    /// with its id. What should run goes in line; a stopped or done one waits
+    /// as a row, and one whose `.torrent` has gone says so.
     /// `next` is the highest id that engine ever gave.
     pub async fn restore(&self, kept: Vec<record::Kept>, next: u64) {
         let inner = &self.inner;
         inner.next.fetch_max(next, Ordering::SeqCst);
         let generation = inner.generation.load(Ordering::SeqCst);
-        let mut start = Vec::new();
         for kept in kept {
             let What::Torrent {
                 id,
@@ -273,15 +284,14 @@ impl Torrents {
                 (None, None) => None,
             };
             let id = TorrentId(id);
-            let run = kept.state == KeptState::Run;
-            let lost = saved.is_none() && run;
+            let lost = saved.is_none() && kept.state == KeptState::Run;
             let name = kept.name.or_else(|| match &saved {
                 Some(Source::Magnet(link)) => {
                     librqbit::Magnet::parse(link).ok().and_then(|m| m.name)
                 }
                 _ => None,
             });
-            let source = saved.clone().unwrap_or(Source::File(Vec::new()));
+            let source = saved.unwrap_or(Source::File(Vec::new()));
             inner.list.lock().unwrap().push(Entry {
                 id,
                 seq: kept.seq,
@@ -289,6 +299,7 @@ impl Torrents {
                 dir: kept.dir,
                 output,
                 given: false,
+                given_at: None,
                 info_hash,
                 source,
                 name,
@@ -301,7 +312,8 @@ impl Torrents {
                 wanted: match kept.state {
                     KeptState::Stopped => Wanted::Stopped,
                     KeptState::Done => Wanted::Done,
-                    _ => Wanted::Running,
+                    KeptState::Failed => Wanted::Running,
+                    KeptState::Run => Wanted::Queued,
                 },
                 failed: match kept.state {
                     KeptState::Failed => Some(kept.note.unwrap_or_else(|| "it failed".into())),
@@ -309,12 +321,6 @@ impl Torrents {
                     _ => None,
                 },
             });
-            if let (true, false, Some(source)) = (run, lost, saved) {
-                start.push((id, source));
-            }
-        }
-        for (id, source) in start {
-            inner.give(id, source, generation, false);
         }
         inner.publish().await;
     }
@@ -431,6 +437,7 @@ impl Inner {
         let giving = Arc::clone(self);
         let output = self.entry(id, |e| {
             e.given = true;
+            e.given_at.get_or_insert_with(Instant::now);
             e.output.clone()
         });
         tokio::spawn(async move {
@@ -630,8 +637,16 @@ impl Inner {
             let mut list = self.list.lock().unwrap();
             list.iter_mut()
                 .map(|entry| {
-                    let status =
+                    let mut status =
                         status_of(entry, self.connector.cables_of(&entry.info_hash, &links));
+                    if status.phase == TorrentPhase::Finding
+                        && status.note.is_none()
+                        && entry
+                            .given_at
+                            .is_some_and(|at| at.elapsed() >= self.config.finding_note_after)
+                    {
+                        status.note = Some(STILL_FINDING.to_string());
+                    }
                     if entry.wanted == Wanted::Running && status.phase == TorrentPhase::Done {
                         entry.wanted = Wanted::Done;
                         if let Some(handle) = &entry.handle {
@@ -671,6 +686,7 @@ fn torrent_file(state: &Path, hash: &str) -> PathBuf {
 /// asked.
 fn phase_asked(wanted: Wanted) -> TorrentPhase {
     match wanted {
+        Wanted::Queued => TorrentPhase::Queued,
         Wanted::Running => TorrentPhase::Downloading,
         Wanted::Stopped => TorrentPhase::Stopped,
         Wanted::Done => TorrentPhase::Done,
@@ -700,11 +716,9 @@ fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
         return status;
     }
     let Some(handle) = &entry.handle else {
-        if kept.is_some() {
-            // Being given to a rebuilt session.
+        // With what it had: brought back, or being given to a rebuilt session.
+        if kept.is_some() || matches!(entry.wanted, Wanted::Stopped | Wanted::Queued) {
             status.phase = phase_asked(entry.wanted);
-        } else if entry.wanted == Wanted::Stopped {
-            status.phase = TorrentPhase::Stopped;
         }
         return status;
     };
@@ -739,12 +753,19 @@ impl TransferEngine for Torrents {
     type ControlError = TorrentControlError;
 
     async fn add(&self, source: Source) -> Result<TorrentId, TorrentAddError> {
+        let id = self.enqueue(source).await?;
+        // Just listed as queued, unless a stop has come already.
+        let _ = self.release(id).await;
+        Ok(id)
+    }
+
+    async fn enqueue(&self, source: Source) -> Result<TorrentId, TorrentAddError> {
         let inner = &self.inner;
         if inner.stopping.load(Ordering::SeqCst) {
             return Err(TorrentAddError::Stopped);
         }
         let hash = info_hash(&source)?;
-        let (id, generation) = {
+        let id = {
             let mut list = inner.list.lock().unwrap();
             if let Some(same) = list.iter().find(|e| e.info_hash == hash) {
                 return Err(TorrentAddError::AlreadyAdded(same.id));
@@ -767,20 +788,58 @@ impl TransferEngine for Torrents {
                 dir: inner.dir.clone(),
                 output: None,
                 given: false,
+                given_at: None,
                 info_hash: hash,
                 source: source.clone(),
                 name,
                 handle: None,
                 generation,
                 kept: None,
-                wanted: Wanted::Running,
+                wanted: Wanted::Queued,
                 failed: None,
             });
-            (id, generation)
+            id
         };
-        inner.give(id, source, generation, false);
         inner.publish().await;
         Ok(id)
+    }
+
+    async fn release(&self, id: TorrentId) -> Result<(), TorrentControlError> {
+        let inner = &self.inner;
+        let (handle, source) = inner
+            .entry(id, |e| {
+                if e.wanted != Wanted::Queued {
+                    return Err(TorrentControlError::NotQueued);
+                }
+                e.wanted = Wanted::Running;
+                e.generation = inner.generation.load(Ordering::SeqCst);
+                let source = (!e.given).then(|| (e.source.clone(), e.generation));
+                Ok((e.handle.clone(), source))
+            })
+            .ok_or(TorrentControlError::NoSuchTorrent)??;
+        if let Some((source, generation)) = source {
+            inner.give(id, source, generation, false);
+        } else if let Some(handle) = handle {
+            let _ = inner.session().unpause(&handle).await;
+        }
+        inner.publish().await;
+        Ok(())
+    }
+
+    async fn requeue(&self, id: TorrentId) -> Result<(), TorrentControlError> {
+        let inner = &self.inner;
+        inner
+            .entry(id, |e| {
+                if e.wanted != Wanted::Stopped {
+                    return Err(TorrentControlError::NotStopped);
+                }
+                e.wanted = Wanted::Queued;
+                e.seq = inner.config.seq.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(())
+            })
+            .ok_or(TorrentControlError::NoSuchTorrent)??;
+        inner.publish().await;
+        Ok(())
     }
 
     fn status(&self) -> watch::Receiver<Vec<TorrentStatus>> {
@@ -791,7 +850,8 @@ impl TransferEngine for Torrents {
         let inner = &self.inner;
         let handle = inner
             .entry(id, |e| {
-                if e.wanted != Wanted::Running || e.failed.is_some() {
+                let running = matches!(e.wanted, Wanted::Running | Wanted::Queued);
+                if !running || e.failed.is_some() {
                     return Err(TorrentControlError::NotRunning);
                 }
                 e.wanted = Wanted::Stopped;
@@ -806,25 +866,9 @@ impl TransferEngine for Torrents {
     }
 
     async fn resume(&self, id: TorrentId) -> Result<(), TorrentControlError> {
-        let inner = &self.inner;
-        let (handle, source) = inner
-            .entry(id, |e| {
-                if e.wanted != Wanted::Stopped {
-                    return Err(TorrentControlError::NotStopped);
-                }
-                e.wanted = Wanted::Running;
-                e.generation = inner.generation.load(Ordering::SeqCst);
-                let source = (!e.given).then(|| (e.source.clone(), e.generation));
-                Ok((e.handle.clone(), source))
-            })
-            .ok_or(TorrentControlError::NoSuchTorrent)??;
-        if let Some((source, generation)) = source {
-            // Brought back stopped: no session has it yet.
-            inner.give(id, source, generation, false);
-        } else if let Some(handle) = handle {
-            let _ = inner.session().unpause(&handle).await;
-        }
-        inner.publish().await;
+        self.requeue(id).await?;
+        // Just queued, unless a stop has come already.
+        let _ = self.release(id).await;
         Ok(())
     }
 

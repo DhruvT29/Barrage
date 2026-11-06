@@ -20,7 +20,8 @@ use barrage::bt::{
     Source, TorrentAddError, TorrentConfig, TorrentId, TorrentPhase, TorrentStatus, Torrents,
 };
 use barrage::fetch::{DownloadConfig, Downloads, Usage};
-use barrage::keeper::Keeper;
+use barrage::keeper::{Engines, Keeper};
+use barrage::queue::Queue;
 use barrage::record::{Kept, KeptState, Priority, Record, Store, What};
 use barrage::transfer::TransferEngine;
 use fetching::{ethernet, links};
@@ -93,13 +94,15 @@ async fn open(cables: &LinkHandle, state: &Path, dir: &Path, peers: Vec<SocketAd
     torrents
         .restore(record.transfers.clone(), record.next_torrent)
         .await;
+    let queue = Queue::start(downloads.clone(), torrents.clone(), record.limit);
     let keeper = Keeper::start(
-        store,
-        record,
-        note,
-        downloads.clone(),
-        torrents.clone(),
-        Arc::clone(&usage),
+        (store, record, note),
+        Engines {
+            downloads: downloads.clone(),
+            torrents: torrents.clone(),
+            queue,
+            usage: Arc::clone(&usage),
+        },
         Duration::from_millis(50),
     );
     Engine {
@@ -153,6 +156,18 @@ async fn wait_for(
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// How many pieces the fast resume data on disk says are here.
+fn pieces_flushed(state: &Path) -> u64 {
+    let Ok(files) = std::fs::read_dir(state.join("resume")) else {
+        return 0;
+    };
+    files
+        .flatten()
+        .filter_map(|file| std::fs::read(file.path()).ok())
+        .map(|bytes| bytes.iter().map(|b| u64::from(b.count_ones())).sum::<u64>())
+        .sum()
 }
 
 /// What state.json says of its first transfer.
@@ -217,7 +232,6 @@ async fn a_torrent_cut_by_a_restart_finishes_every_piece_checked() {
     let shown = status(&next.torrents, id);
     assert_eq!(shown.id, id, "the same torrent, under the same id");
     assert_eq!(shown.info_hash, had.info_hash);
-    assert_eq!(shown.phase, TorrentPhase::Downloading, "{shown:?}");
     assert!(shown.done >= had.done, "its progress shows at once");
 
     wait_for(&next.torrents, id, 60, "done", |t| {
@@ -234,7 +248,7 @@ async fn a_torrent_cut_by_a_restart_finishes_every_piece_checked() {
 
 #[tokio::test]
 async fn a_killed_engine_brings_its_torrent_back() {
-    let seeds = slow_seeds("r-killed", 256).await;
+    let seeds = slow_seeds("r-killed", 128).await;
     let cables = one_cable().await;
     let (state, dir) = (fresh_dir("r-killed-state"), fresh_dir("r-killed"));
 
@@ -267,13 +281,15 @@ async fn a_killed_engine_brings_its_torrent_back() {
                     .await
                     .unwrap();
                 let id = torrents.add(Source::File(torrent)).await.unwrap();
+                let queue = Queue::start(downloads.clone(), torrents.clone(), record.limit);
                 let keeper = Keeper::start(
-                    store,
-                    record,
-                    note,
-                    downloads,
-                    torrents.clone(),
-                    usage,
+                    (store, record, note),
+                    Engines {
+                        downloads,
+                        torrents: torrents.clone(),
+                        queue,
+                        usage,
+                    },
                     Duration::from_millis(50),
                 );
                 ((torrents, keeper), id)
@@ -291,8 +307,24 @@ async fn a_killed_engine_brings_its_torrent_back() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // A kill loses what came since the last flush, so wait for one.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while pieces_flushed(&state) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pieces never reached the disk while it ran"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Part of the file: finishing flushes anyway, which proves nothing.
+    assert!(
+        pieces_flushed(&state) < LEN as u64 / (64 << 10),
+        "killed mid-way, with pieces already flushed"
+    );
     doomed.shutdown_background();
     drop(first);
+    let kept = pieces_flushed(&state) * (64 << 10);
 
     let next = open(&cables, &state, &dir, seeds.addrs.clone()).await;
     wait_for(&next.torrents, id, 60, "done", |t| {
@@ -300,6 +332,11 @@ async fn a_killed_engine_brings_its_torrent_back() {
     })
     .await;
     assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), seeds.bytes);
+    let fetched: u64 = next.usage.kept().iter().map(|u| u.bytes).sum();
+    assert!(
+        fetched < 2 * LEN as u64 - kept,
+        "both runs fetched {fetched} of {LEN}, with {kept} kept through the kill"
+    );
 }
 
 #[tokio::test]
@@ -357,10 +394,12 @@ async fn a_magnet_with_no_metadata_comes_back_as_a_magnet() {
 
     let next = open(&cables, &state, &dir, Vec::new()).await;
 
-    let back = status(&next.torrents, id);
+    let back = wait_for(&next.torrents, id, 10, "finding", |t| {
+        t.phase == TorrentPhase::Finding
+    })
+    .await;
     assert_eq!(back.info_hash, hash);
     assert_eq!(back.name.as_deref(), Some("never.iso"));
-    assert_eq!(back.phase, TorrentPhase::Finding, "{back:?}");
 }
 
 #[tokio::test]

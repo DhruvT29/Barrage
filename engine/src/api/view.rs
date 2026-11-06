@@ -431,6 +431,7 @@ fn torrent_cable_view(cable: &TorrentCable) -> TorrentCableView {
 
 fn torrent_phase_word(phase: TorrentPhase) -> &'static str {
     match phase {
+        TorrentPhase::Queued => "queued",
         TorrentPhase::Finding => "finding",
         TorrentPhase::Downloading => "downloading",
         TorrentPhase::Done => "done",
@@ -476,6 +477,7 @@ fn download_view(status: &DownloadStatus) -> DownloadView {
 
 fn phase_word(phase: Phase) -> &'static str {
     match phase {
+        Phase::Queued => "queued",
         Phase::Starting => "starting",
         Phase::Waiting => "waiting",
         Phase::Downloading => "downloading",

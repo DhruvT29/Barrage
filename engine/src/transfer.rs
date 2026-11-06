@@ -46,6 +46,18 @@ pub trait TransferEngine {
     /// Carry on from what a stopped one has.
     fn resume(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
 
+    /// List it without starting it: queued, until it is released.
+    fn enqueue(
+        &self,
+        request: Self::Request,
+    ) -> impl Future<Output = Result<Self::Id, Self::AddError>> + Send;
+
+    /// Start a queued one.
+    fn release(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
+    /// Send a stopped one to the back of the line.
+    fn requeue(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
     /// Stop everything, saving what can be saved.
     fn shutdown(&self) -> impl Future<Output = ()> + Send;
 }

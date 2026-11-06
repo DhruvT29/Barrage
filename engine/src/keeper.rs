@@ -18,8 +18,17 @@ use tokio::time::MissedTickBehavior;
 
 use crate::bt::{TorrentId, Torrents};
 use crate::fetch::{Downloads, Usage};
-use crate::record::{KeptState, Record, Store, What};
+use crate::queue::Queue;
+use crate::record::{KeptState, Opened, Record, Store, What};
 use crate::transfer::Key;
+
+/// What the record is read from.
+pub struct Engines {
+    pub downloads: Downloads,
+    pub torrents: Torrents,
+    pub queue: Queue,
+    pub usage: Arc<Usage>,
+}
 
 /// Saves the record. Dropping it stops the saving, and frees the folder.
 pub struct Keeper {
@@ -35,9 +44,7 @@ struct Inner {
     /// Why the record was set aside at the start, if it was.
     opened: Option<String>,
     notice: watch::Sender<Option<String>>,
-    downloads: Downloads,
-    torrents: Torrents,
-    usage: Arc<Usage>,
+    engines: Engines,
 }
 
 /// The key of a saved transfer.
@@ -49,26 +56,17 @@ fn key_of(what: &What) -> Key {
 }
 
 impl Keeper {
-    /// Start saving `record`, as read from `store`, at most once per `every`
-    /// and only when something has changed. `note` is what opening it said.
-    pub fn start(
-        store: Store,
-        record: Record,
-        note: Option<String>,
-        downloads: Downloads,
-        torrents: Torrents,
-        usage: Arc<Usage>,
-        every: Duration,
-    ) -> Self {
+    /// Start saving the record `opened` holds, at most once per `every` and
+    /// only when something has changed.
+    pub fn start(opened: Opened, engines: Engines, every: Duration) -> Self {
+        let (store, record, note) = opened;
         let inner = Arc::new(Inner {
             store: Mutex::new(Some(store)),
             base: record,
             last: Mutex::new(None),
             notice: watch::channel(note.clone()).0,
             opened: note,
-            downloads,
-            torrents,
-            usage,
+            engines,
         });
         tokio::spawn(run(Arc::downgrade(&inner), every));
         Self { inner }
@@ -109,13 +107,15 @@ impl Keeper {
 
 impl Inner {
     fn record(&self) -> Record {
-        let mut transfers = self.downloads.kept();
-        transfers.extend(self.torrents.kept());
+        let engines = &self.engines;
+        let mut transfers = engines.downloads.kept();
+        transfers.extend(engines.torrents.kept());
         transfers.sort_by_key(|k| k.seq);
         Record {
-            used: self.usage.kept(),
-            next_download: self.downloads.last_id(),
-            next_torrent: self.torrents.last_id(),
+            limit: engines.queue.limit(),
+            used: engines.usage.kept(),
+            next_download: engines.downloads.last_id(),
+            next_torrent: engines.torrents.last_id(),
             transfers,
             ..self.base.clone()
         }

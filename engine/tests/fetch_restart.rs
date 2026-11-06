@@ -15,8 +15,9 @@ use std::sync::atomic::AtomicU64;
 use barrage::LinkHandle;
 use barrage::bt::{TorrentConfig, Torrents};
 use barrage::fetch::{CableUse, DownloadConfig, Downloads, Phase, Usage};
-use barrage::keeper::Keeper;
+use barrage::keeper::{Engines, Keeper};
 use barrage::links::watch::LinkTable;
+use barrage::queue::Queue;
 use barrage::record::{Kept, KeptState, Priority, Record, Store, What};
 use fake::ms;
 use fetching::*;
@@ -75,13 +76,15 @@ async fn open(links: &LinkHandle, state: &Folder, dir: &Folder) -> Engine {
     );
     downloads.restore(record.transfers.clone(), record.next_download);
     let torrents = no_torrents(links.table(), dir.0.clone(), Arc::clone(&usage)).await;
+    let queue = Queue::start(downloads.clone(), torrents.clone(), record.limit);
     let keeper = Keeper::start(
-        store,
-        record,
-        note,
-        downloads.clone(),
-        torrents,
-        usage,
+        (store, record, note),
+        Engines {
+            downloads: downloads.clone(),
+            torrents,
+            queue,
+            usage,
+        },
         ms(50),
     );
     Engine { downloads, keeper }
@@ -217,13 +220,15 @@ async fn a_killed_engine_comes_back_from_its_last_save() {
                     Downloads::sharing(links, dir.clone(), saving(), Arc::clone(&usage), seq);
                 let id = downloads.add(request(&url)).await.unwrap();
                 let torrents = no_torrents(table, dir, Arc::clone(&usage)).await;
+                let queue = Queue::start(downloads.clone(), torrents.clone(), record.limit);
                 let keeper = Keeper::start(
-                    store,
-                    record,
-                    note,
-                    downloads.clone(),
-                    torrents,
-                    usage,
+                    (store, record, note),
+                    Engines {
+                        downloads: downloads.clone(),
+                        torrents,
+                        queue,
+                        usage,
+                    },
                     ms(50),
                 );
                 ((downloads, keeper), id)

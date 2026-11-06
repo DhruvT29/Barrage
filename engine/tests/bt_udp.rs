@@ -606,3 +606,30 @@ async fn fast_resume_data_is_kept_through_a_rebuild() {
     let kept: Vec<_> = std::fs::read_dir(state.join("resume")).unwrap().collect();
     assert_eq!(kept.len(), 1, "its fast resume data");
 }
+
+/// Review Focus 4: a torrent in line is given to no session, by a rebuild
+/// or otherwise, until it has a place.
+#[tokio::test]
+async fn a_rebuild_starts_no_queued_torrent() {
+    let seeds = slow_seeds("u-queued", 1, 1 << 20, 1024).await;
+    let (links, live) = cables(vec![eth2(false), eth3(false)], &[(ETH2, 10), (ETH3, 30)]).await;
+    let state = fresh_dir("u-queued-state");
+    let (torrents, _dir) =
+        torrents_keeping("u-queued-leech", &links, &state, seeds.addrs.clone()).await;
+    udp_moves_to(&torrents, "Ethernet 3", ETH3, 5).await;
+    let id = torrents
+        .enqueue(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+
+    live.set(vec![eth2(false)]);
+    udp_moves_to(&torrents, "Ethernet 2", ETH2, 10).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(status(&torrents, id).phase, TorrentPhase::Queued);
+    let told = torrents.kept().remove(0).what;
+    assert!(
+        matches!(told, What::Torrent { output: None, .. }),
+        "given to the rebuilt session: {told:?}"
+    );
+}

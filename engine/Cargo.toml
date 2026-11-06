@@ -17,7 +17,7 @@ if-addrs = "0.15.0"
 # itself (librqbit 9.1 cannot bind one to a chosen address on Windows).
 # Pinned by commit: github.com/DhruvT29/rqbit, branch `barrage`. rustls,
 # as reqwest here; the default TLS would add a second stack.
-librqbit = { git = "https://github.com/DhruvT29/rqbit", rev = "19ee74795fa717f69e2ac738d498902ca89ca6ef", default-features = false, features = ["rust-tls"] }
+librqbit = { git = "https://github.com/DhruvT29/rqbit", rev = "cb35d6b8f69d72cdfd3c7dc0d908acd237237aa6", default-features = false, features = ["rust-tls"] }
 open = "5.4.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }

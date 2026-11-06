@@ -19,6 +19,8 @@ impl TorrentId {
 /// Where a torrent is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentPhase {
+    /// In line for a place: no session has been told to run it.
+    Queued,
     /// Fetching its metadata (a magnet link), before its files are known.
     Finding,
     Downloading,
@@ -82,10 +84,12 @@ pub struct Swarm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorrentControlError {
     NoSuchTorrent,
-    /// Stopping: it is not finding or downloading.
+    /// Stopping: it is not queued, finding or downloading.
     NotRunning,
     /// Resuming: it is not stopped.
     NotStopped,
+    /// Releasing: it is not queued.
+    NotQueued,
 }
 
 impl fmt::Display for TorrentControlError {
@@ -94,6 +98,7 @@ impl fmt::Display for TorrentControlError {
             Self::NoSuchTorrent => f.write_str("no such torrent"),
             Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
             Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
+            Self::NotQueued => f.write_str("it is not queued, so there is nothing to start"),
         }
     }
 }

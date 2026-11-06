@@ -22,6 +22,7 @@ use barrage::bt::{TorrentConfig, Torrents};
 use barrage::fetch::{DownloadConfig, Downloads, Usage};
 use barrage::links::LinkState;
 use barrage::links::watch::{LinkTable, WatchConfig};
+use barrage::queue::{MOST_LIMIT, Queue};
 use barrage::record::{KeptState, Store};
 use fake::{Fake, SAMPLED_BPS, cand, cand_idx, ms};
 use futures_util::StreamExt;
@@ -94,9 +95,8 @@ async fn serve_with(table: LinkTable, downloads: Downloads) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let torrents = torrents_on(&table).await;
     tokio::spawn(async move {
-        axum::serve(listener, router(table, downloads, torrents))
-            .await
-            .unwrap()
+        let queue = Queue::start(downloads, torrents, MOST_LIMIT);
+        axum::serve(listener, router(table, queue)).await.unwrap()
     });
     addr
 }
@@ -471,7 +471,8 @@ async fn serve_app(table: LinkTable, dir: &Folder) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let downloads = downloads_in(&table, &std::env::temp_dir());
     let torrents = torrents_on(&table).await;
-    let app = app(table, downloads, torrents, dir.0.clone());
+    let queue = Queue::start(downloads, torrents, MOST_LIMIT);
+    let app = app(table, queue, dir.0.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     addr
 }
