@@ -6,6 +6,7 @@
 //! (127.0.0.3); every peer is a local session on 127.0.0.1.
 
 mod fake;
+mod scratch;
 mod torrent;
 
 use std::net::{IpAddr, SocketAddr};

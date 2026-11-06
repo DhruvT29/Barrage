@@ -7,6 +7,7 @@
 
 mod fake;
 mod fetching;
+mod scratch;
 mod serve;
 
 use barrage::fetch::{AddRequest, DownloadConfig, Downloads, Phase};

@@ -83,10 +83,7 @@ mod tests {
 
     /// A folder of its own for one test, emptied first.
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("barrage-saved-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::scratch::folder(&format!("saved-{name}"))
     }
 
     fn sample() -> Saved {

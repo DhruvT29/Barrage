@@ -5,6 +5,7 @@
 
 mod fake;
 mod fetching;
+mod scratch;
 mod serve;
 mod torrent;
 

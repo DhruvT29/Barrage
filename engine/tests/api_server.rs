@@ -4,6 +4,7 @@
 //! test here touches the internet.
 
 mod fake;
+mod scratch;
 mod serve;
 mod torrent;
 
@@ -446,10 +447,7 @@ struct Folder(PathBuf);
 
 impl Folder {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("barrage-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(scratch::folder(&format!("test-{name}")))
     }
 
     fn write(&self, file: &str, text: &str) {

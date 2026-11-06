@@ -19,3 +19,7 @@ pub mod logging;
 pub mod transfer;
 
 pub use links::LinkHandle;
+
+#[cfg(test)]
+#[path = "../tests/scratch/mod.rs"]
+mod scratch;

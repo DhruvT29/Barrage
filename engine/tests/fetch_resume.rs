@@ -6,6 +6,7 @@
 
 mod fake;
 mod fetching;
+mod scratch;
 mod serve;
 
 use std::time::Duration;

@@ -5,6 +5,7 @@
 //! its connections with it. Every peer is a local session on 127.0.0.1.
 
 mod fake;
+mod scratch;
 mod torrent;
 
 use std::net::SocketAddr;

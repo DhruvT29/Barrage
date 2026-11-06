@@ -3,6 +3,7 @@
 //! types. Every peer is a local seed on 127.0.0.1; the leecher's connections
 //! leave from 127.0.0.2 and 127.0.0.3, two addresses standing for two cables.
 
+mod scratch;
 mod torrent;
 
 use std::net::{IpAddr, SocketAddr};
