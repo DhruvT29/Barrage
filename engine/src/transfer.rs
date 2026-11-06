@@ -13,6 +13,16 @@ use std::future::Future;
 
 use tokio::sync::watch;
 
+use crate::bt::TorrentId;
+use crate::fetch::DownloadId;
+
+/// One transfer of either kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Key {
+    Web(DownloadId),
+    Torrent(TorrentId),
+}
+
 pub trait TransferEngine {
     /// What to fetch: a URL, a magnet link or a .torrent file.
     type Request;

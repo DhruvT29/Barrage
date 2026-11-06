@@ -531,6 +531,7 @@ mod tests {
     use crate::links::model::{Addr, LinkId};
     use crate::links::render::changes;
     use crate::links::{Link, LinkState};
+    use crate::record::Priority;
 
     fn link(id: u64, name: &str, addr: &str, state: LinkState) -> Link {
         Link {
@@ -987,6 +988,8 @@ mod tests {
     /// A download whose totals are its links' shares, as the engine sends.
     fn download(id: u64, phase: Phase, links: Vec<LinkShare>) -> DownloadStatus {
         DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(id),
             url: format!("https://example.com/{id}.iso"),
             name: Some(format!("{id}.iso")),
@@ -1225,6 +1228,8 @@ mod tests {
     #[test]
     fn a_download_becomes_the_json_the_ui_reads() {
         let starting = DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(7),
             url: "https://example.com/a.iso".to_string(),
             name: None,
@@ -1530,6 +1535,8 @@ mod tests {
         (failed.name, failed.length, failed.note) = (None, None, Some(not_found.clone()));
 
         let waiting = DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(4),
             url: "https://example.com/files/notes.pdf".to_string(),
             name: None,
@@ -1541,6 +1548,8 @@ mod tests {
             note: None,
         };
         let starting = DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(5),
             url: "https://example.com/files/video.mp4".to_string(),
             phase: Phase::Starting,

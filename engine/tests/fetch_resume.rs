@@ -133,7 +133,7 @@ async fn stopping_saves_progress_and_adding_again_resumes() {
     assert_eq!(stopped.phase, Phase::Stopped, "{stopped:?}");
     assert_eq!(
         stopped.note.as_deref(),
-        Some("stopped with barrage; adding it again carries on from here")
+        Some("stopped with barrage; it carries on at the next start")
     );
     // Every byte written is saved, those of the chunks under way too.
     let saved = progress(&dir, "resume.bin").expect("no progress file");
@@ -286,7 +286,7 @@ async fn a_file_with_no_version_starts_over() {
     // Nothing to tell the file by, so it says it will start over.
     assert_eq!(
         status_of(&first, id).note.as_deref(),
-        Some("stopped with barrage; adding it again starts it over")
+        Some("stopped with barrage; it starts over at the next start")
     );
     let saved = progress(&dir, "unnamed.bin").expect("no progress file");
     assert_eq!(saved["validator"], Value::Null);
@@ -357,7 +357,7 @@ async fn a_whole_download_starts_over() {
     assert_eq!(stopped.phase, Phase::Stopped, "{stopped:?}");
     assert_eq!(
         stopped.note.as_deref(),
-        Some("stopped with barrage; adding it again starts it over")
+        Some("stopped with barrage; it starts over at the next start")
     );
     assert!(progress(&dir, "whole.bin").is_none());
 

@@ -135,6 +135,10 @@ pub fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
+/// What [`Store::open`] gives: the hold on the folder, what it held, and why
+/// that was set aside if it was.
+pub type Opened = (Store, Record, Option<String>);
+
 /// The engine's hold on its folder. Only one lives per folder at a time.
 #[derive(Debug)]
 pub struct Store {
@@ -149,7 +153,7 @@ impl Store {
     ///
     /// An error means this engine cannot go on: the folder cannot be used, or
     /// another engine is using it. A record that cannot be read is no error.
-    pub fn open(dir: &Path) -> anyhow::Result<(Store, Record, Option<String>)> {
+    pub fn open(dir: &Path) -> anyhow::Result<Opened> {
         fs::create_dir_all(dir)
             .with_context(|| format!("cannot make the state folder {}", dir.display()))?;
         let lock = File::options()

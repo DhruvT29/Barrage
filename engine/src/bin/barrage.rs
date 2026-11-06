@@ -29,6 +29,7 @@ use barrage::bt::TorrentConfig;
 use barrage::fetch::downloads_folder;
 use barrage::links::render::changes;
 use barrage::links::watch::LinkTable;
+use barrage::record::Store;
 
 const USAGE: &str = "usage: barrage [--port N] [--no-open] [--log FILE] [--static DIR] \
                      [--downloads DIR] [--state DIR]";
@@ -60,10 +61,11 @@ async fn run() -> anyhow::Result<()> {
         barrage::logging::to_file(path, &[])?;
     }
     let downloads = downloads_dir(options.downloads)?;
-    let state = state_dir(options.state)?;
-    // The port first: a taken one stops here, before any probe or speed test
-    // has spent data.
+    let state_folder = state_dir(options.state)?;
+    // The port and the state folder first: either taken stops here, before
+    // any probe or speed test has spent data.
     let listener = bind(options.port).await?;
+    let state = Store::open(&state_folder)?;
     let handle = LinkHandle::start(Duration::from_secs(1))?;
     tracing::info!("started");
     tokio::spawn(log_changes(handle.table()));
@@ -71,7 +73,10 @@ async fn run() -> anyhow::Result<()> {
     let url = format!("http://{}", listener.local_addr()?);
     println!("BARRAGE on {url}. Ctrl+C to stop.");
     println!("Downloads go to {}.", downloads.display());
-    println!("The engine keeps its own state in {}.", state.display());
+    println!(
+        "The engine keeps its own state in {}.",
+        state_folder.display()
+    );
     if !options.static_dir.join("index.html").is_file() {
         println!("The page is not built yet: run `pnpm --dir ui build`, then reload it.");
     }
@@ -86,6 +91,7 @@ async fn run() -> anyhow::Result<()> {
         listener,
         handle,
         downloads,
+        state,
         options.static_dir,
         torrents,
         async {

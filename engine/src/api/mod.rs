@@ -14,6 +14,7 @@ pub mod view;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -34,7 +35,9 @@ use crate::bt::{Source, TorrentAddError, TorrentConfig, TorrentControlError, Tor
 use crate::fetch::{
     AddError, AddRequest, ControlError, DownloadConfig, DownloadId, Downloads, Usage,
 };
+use crate::keeper::Keeper;
 use crate::links::watch::LinkTable;
+use crate::record::Opened;
 use crate::transfer::TransferEngine;
 
 pub use view::{
@@ -124,14 +127,18 @@ const CLOSE_GRACE: Duration = Duration::from_millis(250);
 /// engine stops.
 const SAVE_GRACE: Duration = Duration::from_secs(2);
 
+/// How often the saved record is brought up to date.
+const SAVE_EVERY: Duration = Duration::from_secs(1);
+
 /// Serve [`app`] on `listener` until `stop` completes, then stop the engine.
 /// Downloads and torrents go to `downloads_dir`, and add to one count of the
-/// data each cable has used.
+/// data each cable has used. `state` is the saved record, which is brought
+/// back and kept up to date.
 ///
 /// When `stop` fires, the downloads and torrents stop first, the downloads
 /// saving their progress, for at most [`SAVE_GRACE`]: with the links gone
-/// first, each would see its links vanish and fail. Then the handle is
-/// dropped, while the server
+/// first, each would see its links vanish and fail. The record is saved one
+/// last time. Then the handle is dropped, while the server
 /// finishes. That stops the watcher, which ends every live stream with a
 /// close frame. Dropping it after the server returns works too with axum
 /// 0.8.9, whose graceful shutdown does not wait for connections that became
@@ -141,20 +148,25 @@ pub async fn serve(
     listener: TcpListener,
     links: LinkHandle,
     downloads_dir: PathBuf,
+    state: Opened,
     static_dir: PathBuf,
     torrents: TorrentConfig,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let usage = Usage::counting_speed_tests(links.table());
-    let downloads = Downloads::with_usage(
+    let (store, record, note) = state;
+    let usage = Usage::restored(links.table(), &record.used);
+    let downloads = Downloads::sharing(
         links.table(),
         downloads_dir.clone(),
         DownloadConfig::default(),
         Arc::clone(&usage),
+        Arc::new(AtomicU64::new(0)),
     );
-    let torrents = Torrents::start(links.table(), downloads_dir, usage, torrents)
+    downloads.restore(record.transfers.clone(), record.next_download);
+    let torrents = Torrents::start(links.table(), downloads_dir, Arc::clone(&usage), torrents)
         .await
         .context("the torrents did not start")?;
+    let keeper = Keeper::start(store, record, note, downloads.clone(), usage, SAVE_EVERY);
     let app = app(
         links.table(),
         downloads.clone(),
@@ -164,8 +176,10 @@ pub async fn serve(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             stop.await;
+            let ran = keeper.running();
             let stopping = async { tokio::join!(downloads.shutdown(), torrents.shutdown()) };
             let _ = tokio::time::timeout(SAVE_GRACE, stopping).await;
+            keeper.finish(&ran);
             drop(links);
         })
         .await

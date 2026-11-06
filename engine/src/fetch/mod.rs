@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 
 use crate::links::LinkId;
 use crate::links::watch::LinkTable;
+use crate::record::{Kept, KeptState, Priority, What};
 
 pub use disk::downloads_folder;
 pub use name::{file_name, free_name};
@@ -67,6 +68,8 @@ struct Inner {
     dir: PathBuf,
     config: DownloadConfig,
     next: AtomicU64,
+    /// The order of adding, shared with the torrents.
+    seq: Arc<AtomicU64>,
     status: Arc<watch::Sender<Vec<DownloadStatus>>>,
     /// Becomes true when the engine stops: every download stops and saves
     /// its progress.
@@ -77,12 +80,20 @@ struct Inner {
     used: Arc<used::Usage>,
 }
 
-/// One download's way to be stopped, and started again.
-struct Control {
+/// What it takes to start a download.
+#[derive(Clone)]
+struct Origin {
     /// The URL as given, and parsed.
     given: String,
     url: Url,
     cables: Option<Vec<String>>,
+    /// The folder it saves to.
+    dir: PathBuf,
+}
+
+/// One download's way to be stopped, and started again.
+struct Control {
+    origin: Origin,
     /// Becomes true when [`Downloads::stop`] asks it to stop.
     stop: watch::Sender<bool>,
     /// Its coordinator, until the engine stopping waits for it.
@@ -265,6 +276,9 @@ pub struct DownloadStatus {
     pub bps: u64,
     pub links: Vec<LinkShare>,
     pub note: Option<String>,
+    /// Its place in the order of adding, across downloads and torrents.
+    pub seq: u64,
+    pub priority: Priority,
 }
 
 /// The data one cable has carried for the engine: every download and
@@ -316,6 +330,18 @@ impl Downloads {
         config: DownloadConfig,
         used: Arc<Usage>,
     ) -> Self {
+        Self::sharing(table, dir, config, used, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// As [`Downloads::with_usage`], sharing `seq`, the engine's one order
+    /// of adding, with the torrents.
+    pub fn sharing(
+        table: LinkTable,
+        dir: PathBuf,
+        config: DownloadConfig,
+        used: Arc<Usage>,
+        seq: Arc<AtomicU64>,
+    ) -> Self {
         let (status, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(Inner {
@@ -323,6 +349,7 @@ impl Downloads {
                 dir,
                 config,
                 next: AtomicU64::new(0),
+                seq,
                 status: Arc::new(status),
                 stopping: watch::channel(false).0,
                 controls: Mutex::new(HashMap::new()),
@@ -362,19 +389,134 @@ impl Downloads {
                 .iter()
                 .position(|s| s.phase == Phase::Stopped && same(s))
             {
-                let id = all[at].id;
-                all[at] = starting(id, &request.url);
-                added = Some(Ok(id));
+                let (id, had) = (all[at].id, all[at].done);
+                all[at] = starting(id, &request.url, all[at].seq, all[at].priority);
+                added = Some(Ok((id, had)));
                 return true;
             }
             let id = DownloadId::new(self.inner.next.fetch_add(1, Ordering::SeqCst) + 1);
-            all.push(starting(id, &request.url));
-            added = Some(Ok(id));
+            let seq = self.inner.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            all.push(starting(id, &request.url, seq, Priority::default()));
+            added = Some(Ok((id, 0)));
             true
         });
-        let id = added.expect("the status closure always runs")?;
-        self.launch(&mut controls, id, request.url, url, request.cables);
+        let (id, had) = added.expect("the status closure always runs")?;
+        let dir = controls
+            .get(&id)
+            .map_or_else(|| self.inner.dir.clone(), |c| c.origin.dir.clone());
+        let origin = Origin {
+            given: request.url,
+            url,
+            cables: request.cables,
+            dir,
+        };
+        self.launch(&mut controls, id, origin, had);
         Ok(id)
+    }
+
+    /// Put every web download of `kept`, from an earlier engine, back on the
+    /// list with its id. What should run starts; the rest stay as they were.
+    /// `next` is the highest id that engine ever gave.
+    pub fn restore(&self, kept: Vec<Kept>, next: u64) {
+        let mut controls = self.inner.controls.lock().unwrap();
+        self.inner.next.fetch_max(next, Ordering::SeqCst);
+        let mut rows: Vec<(Kept, u64, String, Option<Vec<String>>)> = kept
+            .into_iter()
+            .filter_map(|k| match k.what.clone() {
+                What::Web { id, url, cables } => Some((k, id, url, cables)),
+                What::Torrent { .. } => None,
+            })
+            .collect();
+        rows.sort_by_key(|(_, id, _, _)| *id);
+        for (kept, id, given, cables) in rows {
+            self.inner.next.fetch_max(id, Ordering::SeqCst);
+            self.inner.seq.fetch_max(kept.seq, Ordering::SeqCst);
+            let Ok(url) = web_address(&given) else {
+                tracing::warn!("a saved download has no usable address, so it was left out");
+                continue;
+            };
+            let id = DownloadId::new(id);
+            let origin = Origin {
+                given,
+                url,
+                cables,
+                dir: kept.dir.clone(),
+            };
+            let mut row = DownloadStatus {
+                id,
+                url: origin.given.clone(),
+                name: kept.name.clone(),
+                phase: Phase::Stopped,
+                length: kept.length,
+                done: kept.done,
+                bps: 0,
+                links: Vec::new(),
+                note: kept.note.clone(),
+                seq: kept.seq,
+                priority: kept.priority,
+            };
+            match kept.state {
+                KeptState::Stopped => {}
+                KeptState::Done => row.phase = Phase::Done,
+                KeptState::Failed => row.phase = Phase::Failed,
+                KeptState::Run if finished_already(&kept) => {
+                    row.phase = Phase::Done;
+                    row.done = kept.length.unwrap_or(kept.done);
+                }
+                KeptState::Run => {
+                    let had = kept.done;
+                    let start = starting(id, &origin.given, kept.seq, kept.priority);
+                    self.inner.status.send_modify(|all| all.push(start));
+                    self.launch(&mut controls, id, origin, had);
+                    continue;
+                }
+            }
+            self.inner.status.send_modify(|all| all.push(row));
+            controls.insert(
+                id,
+                Control {
+                    origin,
+                    stop: watch::channel(false).0,
+                    task: None,
+                },
+            );
+        }
+    }
+
+    /// Every download as saved.
+    pub fn kept(&self) -> Vec<Kept> {
+        let controls = self.inner.controls.lock().unwrap();
+        let all = self.inner.status.borrow();
+        all.iter()
+            .filter_map(|s| {
+                let origin = &controls.get(&s.id)?.origin;
+                Some(Kept {
+                    seq: s.seq,
+                    priority: s.priority,
+                    state: match s.phase {
+                        Phase::Done => KeptState::Done,
+                        Phase::Failed => KeptState::Failed,
+                        Phase::Stopped => KeptState::Stopped,
+                        _ => KeptState::Run,
+                    },
+                    dir: origin.dir.clone(),
+                    name: s.name.clone(),
+                    length: s.length,
+                    done: s.done,
+                    note: s.note.clone(),
+                    what: What::Web {
+                        id: s.id.as_u64(),
+                        url: origin.given.clone(),
+                        cables: origin.cables.clone(),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// The highest id given so far.
+    pub fn last_id(&self) -> u64 {
+        self.inner.next.load(Ordering::SeqCst)
     }
 
     /// Start download `id`'s coordinator, with its own way to be stopped.
@@ -384,28 +526,26 @@ impl Downloads {
         &self,
         controls: &mut HashMap<DownloadId, Control>,
         id: DownloadId,
-        given: String,
-        url: Url,
-        cables: Option<Vec<String>>,
+        origin: Origin,
+        earlier: u64,
     ) {
         let (stop, asked) = watch::channel(false);
         let task = tokio::spawn(download::run(download::Job {
             id,
-            given: given.clone(),
-            url: url.clone(),
-            cables: cables.clone(),
+            given: origin.given.clone(),
+            url: origin.url.clone(),
+            cables: origin.cables.clone(),
             table: self.inner.table.clone(),
-            dir: self.inner.dir.clone(),
+            dir: origin.dir.clone(),
             config: self.inner.config.clone(),
             status: self.inner.status.clone(),
             used: self.inner.used.clone(),
+            earlier,
             stopping: self.inner.stopping.subscribe(),
             stop: asked,
         }));
         let control = Control {
-            given,
-            url,
-            cables,
+            origin,
             stop,
             task: Some(task),
         };
@@ -458,11 +598,7 @@ impl Downloads {
         // than signal the one that has ended.
         let mut controls = self.inner.controls.lock().unwrap();
         let control = controls.get(&id).ok_or(ControlError::NoSuchDownload)?;
-        let (given, url, cables) = (
-            control.given.clone(),
-            control.url.clone(),
-            control.cables.clone(),
-        );
+        let origin = control.origin.clone();
         let mut outcome = Err(ControlError::NoSuchDownload);
         self.inner.status.send_if_modified(|all| {
             let Some(at) = all.iter().position(|s| s.id == id) else {
@@ -475,12 +611,13 @@ impl Downloads {
                 outcome = Err(ControlError::NotStopped);
                 return false;
             }
-            all[at] = starting(id, &given);
-            outcome = Ok(());
+            let had = all[at].done;
+            all[at] = starting(id, &origin.given, all[at].seq, all[at].priority);
+            outcome = Ok(had);
             true
         });
-        outcome?;
-        self.launch(&mut controls, id, given, url, cables);
+        let had = outcome?;
+        self.launch(&mut controls, id, origin, had);
         Ok(())
     }
 
@@ -509,7 +646,7 @@ impl Downloads {
 }
 
 /// A download's status as it starts, before anything is known of the file.
-fn starting(id: DownloadId, given: &str) -> DownloadStatus {
+fn starting(id: DownloadId, given: &str, seq: u64, priority: Priority) -> DownloadStatus {
     DownloadStatus {
         id,
         url: given.to_string(),
@@ -520,7 +657,20 @@ fn starting(id: DownloadId, given: &str) -> DownloadStatus {
         bps: 0,
         links: Vec::new(),
         note: None,
+        seq,
+        priority,
     }
+}
+
+/// Whether a download saved as running in fact finished, in the moment
+/// before an engine was killed: its `.part` has gone and the file is there,
+/// whole. Review Focus 1.
+fn finished_already(kept: &Kept) -> bool {
+    let (Some(name), Some(length)) = (&kept.name, kept.length) else {
+        return false;
+    };
+    !kept.dir.join(format!("{name}.part")).exists()
+        && std::fs::metadata(kept.dir.join(name)).is_ok_and(|file| file.len() == length)
 }
 
 /// `given` as an address to download from: `http` or `https`. Either always

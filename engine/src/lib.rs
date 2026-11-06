@@ -14,6 +14,7 @@
 pub mod api;
 pub mod bt;
 pub mod fetch;
+pub mod keeper;
 pub mod links;
 pub mod logging;
 pub mod record;

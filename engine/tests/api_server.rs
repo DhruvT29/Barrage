@@ -22,6 +22,7 @@ use barrage::bt::{TorrentConfig, Torrents};
 use barrage::fetch::{DownloadConfig, Downloads, Usage};
 use barrage::links::LinkState;
 use barrage::links::watch::{LinkTable, WatchConfig};
+use barrage::record::{KeptState, Store};
 use fake::{Fake, SAMPLED_BPS, cand, cand_idx, ms};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -540,6 +541,7 @@ async fn stopping_closes_every_page_and_returns() {
         listener,
         h,
         dir.0.clone(),
+        Store::open(&dir.0.join("state")).unwrap(),
         dir.0.clone(),
         quiet_torrents(Vec::new()),
         async {
@@ -587,6 +589,7 @@ async fn stopping_saves_each_downloads_progress() {
         listener,
         wifi_to_the_file_server(),
         dir.0.clone(),
+        Store::open(&dir.0.join("state")).unwrap(),
         dir.0.clone(),
         quiet_torrents(Vec::new()),
         async {
@@ -1515,6 +1518,7 @@ async fn stopping_ends_a_running_torrents_connections() {
         listener,
         links,
         dir.0.clone(),
+        Store::open(&dir.0.join("state")).unwrap(),
         dir.0.clone(),
         quiet_torrents(seeds.addrs.clone()),
         async {
@@ -1534,6 +1538,67 @@ async fn stopping_ends_a_running_torrents_connections() {
     assert_eq!(seeds.peers(), 0, "still connected when it returned");
 }
 
+/// The status cannot tell an engine stopping from a user stopping: both show
+/// stopped. Only the second may stay stopped at the next start.
+#[tokio::test]
+async fn the_engine_stopping_keeps_running_downloads_running() {
+    let files = Server::start().await;
+    let file = || File::new(32 << 20).stall_after(1 << 20).etag("\"v1\"");
+    files.at("/running.bin", Answer::File(file()));
+    files.at("/stopped.bin", Answer::File(file()));
+    let dir = Folder::new("keeps-running");
+    let state = dir.0.join("state");
+    let listener = bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let links = wifi_to_the_file_server();
+    wait_until("Wi-Fi usable", || !links.usable().is_empty()).await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        links,
+        dir.0.clone(),
+        Store::open(&state).unwrap(),
+        dir.0.clone(),
+        quiet_torrents(Vec::new()),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let (status, _) = post(addr, json!({"url": files.url("/running.bin").as_str()})).await;
+    assert_eq!(status, 201);
+    let (status, _) = post(addr, json!({"url": files.url("/stopped.bin").as_str()})).await;
+    assert_eq!(status, 201);
+    listed_where(addr, "both downloading", |list| {
+        let all = list["list"].as_array().unwrap();
+        all.len() == 2 && all.iter().all(|d| d["state"] == "downloading")
+    })
+    .await;
+    let (status, _) = control(addr, "2", "stop", "application/json", "{}").await;
+    assert_eq!(status, 200);
+
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(4), server)
+        .await
+        .expect("the server returns")
+        .unwrap()
+        .unwrap();
+
+    let (_store, record, _) = Store::open(&state).expect("the folder is free again");
+    let states: Vec<(String, KeptState)> = record
+        .transfers
+        .iter()
+        .map(|k| (k.name.clone().unwrap_or_default(), k.state))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("running.bin".to_string(), KeptState::Run),
+            ("stopped.bin".to_string(), KeptState::Stopped)
+        ]
+    );
+}
+
 /// What `barrage` runs: a torrent through a cable shows in the one count of
 /// data used the downloads report, both ways.
 #[tokio::test]
@@ -1550,6 +1615,7 @@ async fn serve_keeps_one_count_of_the_data_used() {
         listener,
         links,
         dir.0.clone(),
+        Store::open(&dir.0.join("state")).unwrap(),
         dir.0.clone(),
         quiet_torrents(seeds.addrs.clone()),
         async {
