@@ -284,7 +284,8 @@ impl Torrents {
                 (None, None) => None,
             };
             let id = TorrentId(id);
-            let lost = saved.is_none() && kept.state == KeptState::Run;
+            // A done torrent is never given again, so only the others need it.
+            let lost = saved.is_none() && matches!(kept.state, KeptState::Run | KeptState::Stopped);
             let name = kept.name.or_else(|| match &saved {
                 Some(Source::Magnet(link)) => {
                     librqbit::Magnet::parse(link).ok().and_then(|m| m.name)
@@ -892,6 +893,11 @@ impl TransferEngine for Torrents {
             .entry(id, |e| {
                 if e.wanted != Wanted::Stopped {
                     return Err(TorrentControlError::NotStopped);
+                }
+                // Never hand librqbit empty bytes: note it as lost instead.
+                if matches!(&e.source, Source::File(bytes) if bytes.is_empty()) {
+                    e.failed = Some(LOST_FILE.to_string());
+                    return Err(TorrentControlError::Finished);
                 }
                 e.wanted = Wanted::Queued;
                 e.seq = inner.config.seq.fetch_add(1, Ordering::SeqCst) + 1;

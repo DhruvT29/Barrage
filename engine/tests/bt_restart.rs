@@ -533,6 +533,45 @@ async fn a_saved_torrent_file_gone_is_noted_and_the_others_run() {
 }
 
 #[tokio::test]
+async fn a_stopped_torrent_whose_saved_file_is_gone_is_noted_and_stays_so_on_resume() {
+    let seeds = quick_seeds("r-gone-stopped").await;
+    let cables = one_cable().await;
+    let (state, dir) = (
+        fresh_dir("r-gone-stopped-state"),
+        fresh_dir("r-gone-stopped"),
+    );
+    let first = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    first.close().await;
+    let (store, mut record, _) = Store::open(&state).unwrap();
+    record.transfers.insert(
+        0,
+        row(9, &"ef".repeat(20), dir.clone(), KeptState::Stopped, None),
+    );
+    record.next_torrent = 9;
+    store.save(&record).unwrap();
+    drop(store);
+
+    let next = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    let note = |next: &Engine| {
+        let all = next.torrents.status().borrow().clone();
+        all.into_iter().find(|t| t.id.as_u64() == 9).unwrap()
+    };
+    let bad = note(&next);
+    assert_eq!(bad.phase, TorrentPhase::Failed, "{bad:?}");
+    assert!(
+        bad.note.as_deref().unwrap().contains("add it again"),
+        "{bad:?}"
+    );
+    // Refused or not, it is not queued and the note stays the same.
+    let _ = next.torrents.resume(bad.id).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = note(&next);
+    assert_eq!(after.phase, TorrentPhase::Failed, "{after:?}");
+    assert_eq!(after.note, bad.note, "{after:?}");
+    assert_eq!(after.peers, 0);
+}
+
+#[tokio::test]
 async fn adding_a_torrent_already_back_is_refused_as_before() {
     let seeds = quick_seeds("r-twice").await;
     let cables = one_cable().await;
