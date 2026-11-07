@@ -14,6 +14,7 @@ pub mod view;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -25,6 +26,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router, middleware};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
@@ -34,12 +36,15 @@ use crate::bt::{Source, TorrentAddError, TorrentConfig, TorrentControlError, Tor
 use crate::fetch::{
     AddError, AddRequest, ControlError, DownloadConfig, DownloadId, Downloads, Usage,
 };
+use crate::keeper::{Engines, Keeper};
 use crate::links::watch::LinkTable;
+use crate::queue::Queue;
+use crate::record::{Opened, Priority};
 use crate::transfer::TransferEngine;
 
 pub use view::{
-    DownloadsView, LinkView, LiveMessage, TableView, TorrentsView, change_message, downloads_view,
-    table_view, torrents_view,
+    DownloadsView, LinkView, LiveMessage, QueueWire, TableView, TorrentsView, change_message,
+    downloads_view, queue_view, table_view, torrents_view,
 };
 
 /// The port `barrage` listens on unless told otherwise.
@@ -90,29 +95,36 @@ pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
 /// - `POST /api/torrents/{id}/stop` and `POST /api/torrents/{id}/resume`: as
 ///   a download's.
 ///
+/// - `GET /api/queue`: the limit and the line, as [`QueueWire`].
+/// - `POST /api/queue/limit`, `{"limit": n}`: `200 {"limit"}`, `400 {"error"}`
+///   for a number out of range.
+/// - `POST /api/downloads/{id}/priority` and the same for torrents,
+///   `{"priority": "high" | "normal" | "low"}`: `200 {"id"}`, `400 {"error"}`
+///   for another word, `404 {"error"}`, and `409 {"error"}` for one that has
+///   ended.
+/// - `POST /api/downloads/{id}/remove` and the same for torrents, `{}`: takes
+///   it off the list, in any state, its files kept. `200 {"id"}` once it has
+///   gone, `404 {"error"}`.
+/// - `POST /api/used/reset`, `{}`: zeroes the data used. `200 {"used_since"}`.
+///
+/// Every POST takes JSON alone, for the reason above, and answers `415`
+/// otherwise; a field it does not know is refused.
+///
 /// Any other address under `/api` answers `404`. Every route answers only
 /// this machine's own pages, and none may be framed ([`guard`]).
 ///
 /// It holds a copy of the table, never the [`LinkHandle`]. A reader does not
 /// keep the watcher alive, so stopping the engine ends every live stream,
 /// instead of each open page keeping the engine running.
-pub fn router(table: LinkTable, downloads: Downloads, torrents: Torrents) -> Router {
-    guarded(api(table, downloads, torrents))
+pub fn router(table: LinkTable, queue: Queue) -> Router {
+    guarded(api(table, queue))
 }
 
 /// What `barrage` serves: the API, as [`router`], and the built page from
 /// `static_dir` at every other address, all under the same [`guard`].
-pub fn app(
-    table: LinkTable,
-    downloads: Downloads,
-    torrents: Torrents,
-    static_dir: PathBuf,
-) -> Router {
+pub fn app(table: LinkTable, queue: Queue, static_dir: PathBuf) -> Router {
     let dir = Arc::new(static_dir);
-    guarded(
-        api(table, downloads, torrents)
-            .fallback(move |request: Request| page(Arc::clone(&dir), request)),
-    )
+    guarded(api(table, queue).fallback(move |request: Request| page(Arc::clone(&dir), request)))
 }
 
 /// How long the live streams get to send their close frames once the
@@ -124,14 +136,18 @@ const CLOSE_GRACE: Duration = Duration::from_millis(250);
 /// engine stops.
 const SAVE_GRACE: Duration = Duration::from_secs(2);
 
+/// How often the saved record is brought up to date.
+const SAVE_EVERY: Duration = Duration::from_secs(1);
+
 /// Serve [`app`] on `listener` until `stop` completes, then stop the engine.
 /// Downloads and torrents go to `downloads_dir`, and add to one count of the
-/// data each cable has used.
+/// data each cable has used. `state` is the saved record, which is brought
+/// back and kept up to date.
 ///
 /// When `stop` fires, the downloads and torrents stop first, the downloads
 /// saving their progress, for at most [`SAVE_GRACE`]: with the links gone
-/// first, each would see its links vanish and fail. Then the handle is
-/// dropped, while the server
+/// first, each would see its links vanish and fail. The record is saved one
+/// last time. Then the handle is dropped, while the server
 /// finishes. That stops the watcher, which ends every live stream with a
 /// close frame. Dropping it after the server returns works too with axum
 /// 0.8.9, whose graceful shutdown does not wait for connections that became
@@ -141,31 +157,58 @@ pub async fn serve(
     listener: TcpListener,
     links: LinkHandle,
     downloads_dir: PathBuf,
+    state: Opened,
     static_dir: PathBuf,
     torrents: TorrentConfig,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let usage = Usage::counting_speed_tests(links.table());
-    let downloads = Downloads::with_usage(
+    let (store, record, note) = state;
+    let usage = Usage::restored(links.table(), &record.used);
+    let seq = Arc::new(AtomicU64::new(0));
+    let downloads = Downloads::sharing(
         links.table(),
         downloads_dir.clone(),
         DownloadConfig::default(),
         Arc::clone(&usage),
+        Arc::clone(&seq),
     );
-    let torrents = Torrents::start(links.table(), downloads_dir, usage, torrents)
-        .await
-        .context("the torrents did not start")?;
-    let app = app(
+    downloads.restore(record.transfers.clone(), record.next_download);
+    let torrent_config = TorrentConfig {
+        seq,
+        state: Some(store.folder().to_path_buf()),
+        ..torrents
+    };
+    let torrents = Torrents::start(
         links.table(),
-        downloads.clone(),
-        torrents.clone(),
-        static_dir,
+        downloads_dir,
+        Arc::clone(&usage),
+        torrent_config,
+    )
+    .await
+    .context("the torrents did not start")?;
+    torrents
+        .restore(record.transfers.clone(), record.next_torrent)
+        .await;
+    let queue = Queue::start(downloads.clone(), torrents.clone(), record.limit);
+    let keeper = Keeper::start(
+        (store, record, note),
+        Engines {
+            downloads: downloads.clone(),
+            torrents: torrents.clone(),
+            queue: queue.clone(),
+            usage,
+        },
+        SAVE_EVERY,
     );
+    let app = app(links.table(), queue.clone(), static_dir);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             stop.await;
+            queue.freeze();
+            let ran = keeper.running();
             let stopping = async { tokio::join!(downloads.shutdown(), torrents.shutdown()) };
             let _ = tokio::time::timeout(SAVE_GRACE, stopping).await;
+            keeper.finish(&ran);
             drop(links);
         })
         .await
@@ -180,6 +223,7 @@ struct Engine {
     table: LinkTable,
     downloads: Downloads,
     torrents: Torrents,
+    queue: Queue,
 }
 
 impl FromRef<Engine> for LinkTable {
@@ -194,19 +238,27 @@ impl FromRef<Engine> for Downloads {
     }
 }
 
+impl FromRef<Engine> for Queue {
+    fn from_ref(engine: &Engine) -> Self {
+        engine.queue.clone()
+    }
+}
+
 impl FromRef<Engine> for Torrents {
     fn from_ref(engine: &Engine) -> Self {
         engine.torrents.clone()
     }
 }
 
-fn api(table: LinkTable, downloads: Downloads, torrents: Torrents) -> Router {
+fn api(table: LinkTable, queue: Queue) -> Router {
     Router::new()
         .route("/api/links", get(links))
         .route("/api/live", get(live::upgrade))
         .route("/api/downloads", get(list_downloads).post(add_download))
         .route("/api/downloads/{id}/stop", post(stop_download))
         .route("/api/downloads/{id}/resume", post(resume_download))
+        .route("/api/downloads/{id}/priority", post(prioritise_download))
+        .route("/api/downloads/{id}/remove", post(remove_download))
         .route(
             "/api/torrents",
             get(list_torrents)
@@ -215,6 +267,11 @@ fn api(table: LinkTable, downloads: Downloads, torrents: Torrents) -> Router {
         )
         .route("/api/torrents/{id}/stop", post(stop_torrent))
         .route("/api/torrents/{id}/resume", post(resume_torrent))
+        .route("/api/torrents/{id}/priority", post(prioritise_torrent))
+        .route("/api/torrents/{id}/remove", post(remove_torrent))
+        .route("/api/queue", get(queue_now))
+        .route("/api/queue/limit", post(set_limit))
+        .route("/api/used/reset", post(reset_used))
         // Any other address under /api is a route this engine does not have,
         // a typo or one a newer page expects. Left to the page's fallback it
         // would answer 200 with index.html, which a JSON client cannot read.
@@ -223,8 +280,9 @@ fn api(table: LinkTable, downloads: Downloads, torrents: Torrents) -> Router {
         .route("/api/{*rest}", any(no_such_route))
         .with_state(Engine {
             table,
-            downloads,
-            torrents,
+            downloads: queue.downloads().clone(),
+            torrents: queue.torrents().clone(),
+            queue,
         })
 }
 
@@ -248,7 +306,7 @@ struct AddBody {
 }
 
 async fn add_download(
-    State(downloads): State<Downloads>,
+    State(queue): State<Queue>,
     body: Result<Json<AddBody>, JsonRejection>,
 ) -> Response {
     let body = match body {
@@ -265,7 +323,7 @@ async fn add_download(
         url: body.url,
         cables: body.cables,
     };
-    match downloads.add(request).await {
+    match queue.add_download(request).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id.as_u64() }))).into_response(),
         Err(e @ AddError::AlreadyRunning(id)) => (
             StatusCode::CONFLICT,
@@ -297,14 +355,14 @@ async fn stop_download(
 }
 
 async fn resume_download(
-    State(downloads): State<Downloads>,
+    State(queue): State<Queue>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<NoFields>, JsonRejection>,
 ) -> Response {
     match asked(id, body, "no such download") {
         Ok(id) => {
             let id = DownloadId::new(id);
-            controlled(id, downloads.resume(id).await)
+            controlled(id, queue.resume_download(id).await)
         }
         Err(refused) => *refused,
     }
@@ -317,17 +375,130 @@ fn asked(
     body: Result<Json<NoFields>, JsonRejection>,
     none: &str,
 ) -> Result<u64, Box<Response>> {
+    asked_with(id, body, none).map(|(id, _)| id)
+}
+
+/// The id a route names and the body it was sent, or the refusal.
+fn asked_with<T: DeserializeOwned>(
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<T>, JsonRejection>,
+    none: &str,
+) -> Result<(u64, T), Box<Response>> {
     let Ok(Path(id)) = id else {
         return Err(Box::new(refuse(StatusCode::NOT_FOUND, none)));
     };
+    Ok((id, json_body(body)?))
+}
+
+/// The body sent, or the refusal.
+fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Box<Response>> {
     match body {
-        Ok(_) => Ok(id),
+        Ok(Json(body)) => Ok(body),
         Err(JsonRejection::MissingJsonContentType(_)) => Err(Box::new(refuse(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "send {} as JSON, with Content-Type: application/json",
+            "send it as JSON, with Content-Type: application/json",
         ))),
         Err(e) => Err(Box::new(refuse(StatusCode::BAD_REQUEST, &e.body_text()))),
     }
+}
+
+/// The body of a change of priority.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriorityBody {
+    priority: Priority,
+}
+
+async fn prioritise_download(
+    State(downloads): State<Downloads>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<PriorityBody>, JsonRejection>,
+) -> Response {
+    match asked_with(id, body, "no such download") {
+        Ok((id, body)) => {
+            let id = DownloadId::new(id);
+            controlled(id, downloads.set_priority(id, body.priority))
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn prioritise_torrent(
+    State(torrents): State<Torrents>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<PriorityBody>, JsonRejection>,
+) -> Response {
+    match asked_with(id, body, "no such torrent") {
+        Ok((id, body)) => {
+            let id = TorrentId(id);
+            torrent_controlled(id, torrents.set_priority(id, body.priority).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn remove_download(
+    State(downloads): State<Downloads>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body, "no such download") {
+        Ok(id) => {
+            let id = DownloadId::new(id);
+            controlled(id, downloads.forget(id).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn remove_torrent(
+    State(torrents): State<Torrents>,
+    id: Result<Path<u64>, PathRejection>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    match asked(id, body, "no such torrent") {
+        Ok(id) => {
+            let id = TorrentId(id);
+            torrent_controlled(id, torrents.forget(id).await)
+        }
+        Err(refused) => *refused,
+    }
+}
+
+async fn queue_now(State(queue): State<Queue>) -> Json<QueueWire> {
+    Json(queue_view(&queue.view().borrow()))
+}
+
+/// The body of a new limit.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitBody {
+    limit: u32,
+}
+
+async fn set_limit(
+    State(queue): State<Queue>,
+    body: Result<Json<LimitBody>, JsonRejection>,
+) -> Response {
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(refused) => return *refused,
+    };
+    match queue.set_limit(body.limit) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "limit": body.limit }))).into_response(),
+        Err(e) => refuse(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+async fn reset_used(
+    State(queue): State<Queue>,
+    body: Result<Json<NoFields>, JsonRejection>,
+) -> Response {
+    if let Err(refused) = json_body(body) {
+        return *refused;
+    }
+    let since = queue.reset_used();
+    (StatusCode::OK, Json(json!({ "used_since": since }))).into_response()
 }
 
 /// What a stop or resume of download `id` answers.
@@ -378,7 +549,7 @@ fn torrent_in(headers: &HeaderMap, body: &[u8]) -> Result<Source, Box<Response>>
 }
 
 async fn add_torrent(
-    State(torrents): State<Torrents>,
+    State(queue): State<Queue>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -390,7 +561,7 @@ async fn add_torrent(
         Ok(source) => source,
         Err(refused) => return *refused,
     };
-    match torrents.add(source).await {
+    match queue.add_torrent(source).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id.as_u64() }))).into_response(),
         Err(e @ TorrentAddError::AlreadyAdded(id)) => (
             StatusCode::CONFLICT,
@@ -416,14 +587,14 @@ async fn stop_torrent(
 }
 
 async fn resume_torrent(
-    State(torrents): State<Torrents>,
+    State(queue): State<Queue>,
     id: Result<Path<u64>, PathRejection>,
     body: Result<Json<NoFields>, JsonRejection>,
 ) -> Response {
     match asked(id, body, "no such torrent") {
         Ok(id) => {
             let id = TorrentId(id);
-            torrent_controlled(id, torrents.resume(id).await)
+            torrent_controlled(id, queue.resume_torrent(id).await)
         }
         Err(refused) => *refused,
     }

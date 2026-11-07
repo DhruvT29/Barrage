@@ -13,6 +13,17 @@ use std::future::Future;
 
 use tokio::sync::watch;
 
+use crate::bt::TorrentId;
+use crate::fetch::DownloadId;
+use crate::record::Priority;
+
+/// One transfer of either kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Key {
+    Web(DownloadId),
+    Torrent(TorrentId),
+}
+
 pub trait TransferEngine {
     /// What to fetch: a URL, a magnet link or a .torrent file.
     type Request;
@@ -35,6 +46,29 @@ pub trait TransferEngine {
 
     /// Carry on from what a stopped one has.
     fn resume(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
+    /// List it without starting it: queued, until it is released.
+    fn enqueue(
+        &self,
+        request: Self::Request,
+    ) -> impl Future<Output = Result<Self::Id, Self::AddError>> + Send;
+
+    /// Start a queued one.
+    fn release(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
+    /// Send a stopped one to the back of the line.
+    fn requeue(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
+    /// Take one off the list and out of the line, in any state: one running
+    /// is stopped first. What it has written stays on disk.
+    fn forget(&self, id: Self::Id) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
+
+    /// Change who goes next. One already running stays running.
+    fn set_priority(
+        &self,
+        id: Self::Id,
+        priority: Priority,
+    ) -> impl Future<Output = Result<(), Self::ControlError>> + Send;
 
     /// Stop everything, saving what can be saved.
     fn shutdown(&self) -> impl Future<Output = ()> + Send;

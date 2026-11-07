@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode,
 
 import type { CableShare, DownloadState, DownloadView } from '../api/types'
 import { mbps } from '../links/cables'
-import { controlDownload } from '../overview/control'
+import { controlDownload, setPriority } from '../overview/control'
 import { formatBytes, percent, percentText } from './format'
 import {
   CableIcon,
@@ -15,18 +15,25 @@ import {
   PlayIcon,
 } from './icons'
 import { blockCount, etaText, pieceBlocks, type Bar } from './queue'
+import { TransferControls } from './TransferControls'
 import { useAction } from './useAction'
 
 import './downloads.css'
 
-/** What a download in this state can be asked: Stop while it runs, Resume once stopped. */
+/** What a download in this state can be asked: Stop while it runs or waits in line, Resume once stopped. */
 function actionFor(state: DownloadState): 'stop' | 'resume' | null {
-  if (state === 'starting' || state === 'waiting' || state === 'downloading') return 'stop'
+  if (state === 'queued' || state === 'starting' || state === 'waiting' || state === 'downloading') return 'stop'
   return state === 'stopped' ? 'resume' : null
+}
+
+/** Whether removing it would stop something under way. */
+function running(state: DownloadState): boolean {
+  return state === 'starting' || state === 'waiting' || state === 'downloading'
 }
 
 /** What a card says while it has no speed to show and is still under way. */
 const WAITING_WORDS: Partial<Record<DownloadState, string>> = {
+  queued: 'waiting for a free place',
   starting: 'finding the file',
   waiting: 'no cable to fetch it through yet',
 }
@@ -48,6 +55,8 @@ type CardProps = {
   expanded?: boolean
   /** Told the user's choice to open (true) or close the list of cables. */
   onToggle?: (open: boolean) => void
+  /** Its place in line, while it waits for one. */
+  place?: number
 }
 
 /**
@@ -62,7 +71,7 @@ type CardProps = {
  * always written out. The list of cables starts open while downloading and
  * closed otherwise, until the user opens or closes it.
  */
-export function DownloadCard({ download: d, colors = {}, expanded, onToggle }: CardProps) {
+export function DownloadCard({ download: d, colors = {}, expanded, onToggle, place }: CardProps) {
   const title = d.name ?? d.url
   const host = d.name !== null ? hostOf(d.url) : null
   const moving = d.state === 'downloading'
@@ -103,8 +112,15 @@ export function DownloadCard({ download: d, colors = {}, expanded, onToggle }: C
             </span>
           )}
         </div>
-        {action !== null && (
-          <div className="tq-actions">
+        <div className="tq-actions">
+          <TransferControls
+            priority={d.priority}
+            ended={d.state === 'done' || d.state === 'failed'}
+            running={running(d.state)}
+            onPriority={(priority) => setPriority('web', d.id, priority)}
+            onRemove={() => controlDownload(d.id, 'remove')}
+          />
+          {action !== null && (
             <button
               type="button"
               className={`tq-act tq-${action}`}
@@ -115,8 +131,8 @@ export function DownloadCard({ download: d, colors = {}, expanded, onToggle }: C
             >
               {action === 'stop' ? <PauseIcon /> : <PlayIcon />}
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       <div className="tq-progress">
@@ -126,7 +142,7 @@ export function DownloadCard({ download: d, colors = {}, expanded, onToggle }: C
         </span>
       </div>
 
-      <Stats download={d} />
+      <Stats download={d} place={place} />
 
       {words && (
         <p className="tq-words" data-testid="words">
@@ -216,7 +232,7 @@ function fetched(d: DownloadView): ReactNode {
  * (only while downloading), the time left (or the state in a word), the
  * connections open on every cable, and how many cables carried it.
  */
-function Stats({ download: d }: { download: DownloadView }) {
+function Stats({ download: d, place }: { download: DownloadView; place?: number }) {
   const connections = d.cables.reduce((sum, c) => sum + c.connections, 0)
   const carrying = d.cables.filter((c) => c.bytes > 0 || c.connections > 0).length
   const [figure, unit] = mbps(d.bps).split(' ')
@@ -236,7 +252,7 @@ function Stats({ download: d }: { download: DownloadView }) {
         )}
       </Stat>
       <Stat icon={<ClockIcon />} label="ETA" id="eta">
-        {etaText(d)}
+        {etaText(d, place)}
       </Stat>
       <Stat icon={<ConnectionsIcon />} label="Connections" id="connections">
         {connections > 0 ? connections : '-'}

@@ -10,6 +10,7 @@ function cable(name: string, bytes: number): CableShare {
 
 function download(fields: Partial<DownloadView> = {}): DownloadView {
   return {
+    priority: 'normal',
     id: 1,
     url: 'https://example.com/a.iso',
     name: 'a.iso',
@@ -115,6 +116,7 @@ test('each state belongs to one filter, and the counts add up', () => {
 
 function torrent(fields: Partial<TorrentView> = {}): TorrentView {
   return {
+    priority: 'normal',
     id: 1,
     name: 'distro.iso',
     info_hash: 'ab'.repeat(20),

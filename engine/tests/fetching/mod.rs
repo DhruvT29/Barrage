@@ -3,7 +3,8 @@
 //! `serve/mod.rs` tells them apart by source address), a folder per test,
 //! the server's view of what it sent, and waiting on a download's status.
 //!
-//! Each test file that uses it also declares `mod fake` and `mod serve`.
+//! Each test file that uses it also declares `mod fake`, `mod scratch` and
+//! `mod serve`.
 #![allow(dead_code)]
 
 use std::net::IpAddr;
@@ -77,11 +78,7 @@ pub struct Folder(pub PathBuf);
 
 impl Folder {
     pub fn new(name: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("barrage-download-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(crate::scratch::folder(&format!("download-{name}")))
     }
 
     pub fn read(&self, name: &str) -> Vec<u8> {

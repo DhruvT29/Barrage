@@ -127,10 +127,14 @@ use super::{
 };
 use crate::links::watch::LinkTable;
 use crate::links::{Link, LinkId, LinkState};
+use crate::record::Priority;
 
 /// The download's note when the server sends the file only whole.
 const ONLY_WHOLE: &str = "the server sends this file only whole, not in pieces, so it comes \
                           through one cable, and cannot resume if that cable drops";
+
+/// The download's note when what an earlier run kept is not there any more.
+const STARTED_OVER: &str = "what the last run saved has gone; started over";
 
 /// Everything one download starts from.
 pub(crate) struct Job {
@@ -145,6 +149,9 @@ pub(crate) struct Job {
     pub status: Arc<watch::Sender<Vec<DownloadStatus>>>,
     /// What each cable has received, every download together.
     pub used: Arc<Usage>,
+    /// The bytes an earlier run says it had, 0 for a new download: if they
+    /// have gone, it is told.
+    pub earlier: u64,
     /// Becomes true when the engine stops.
     pub stopping: watch::Receiver<bool>,
     /// Becomes true when this download alone is asked to stop.
@@ -588,8 +595,8 @@ impl Download {
         let note = match (why, resumable) {
             (Stop::Asked, true) => "stopped; resuming carries on from here",
             (Stop::Asked, false) => "stopped; resuming starts it over",
-            (Stop::Engine, true) => "stopped with barrage; adding it again carries on from here",
-            (Stop::Engine, false) => "stopped with barrage; adding it again starts it over",
+            (Stop::Engine, true) => "stopped with barrage; it carries on at the next start",
+            (Stop::Engine, false) => "stopped with barrage; it starts over at the next start",
         };
         self.note = Some(note.to_string());
         self.ended = Some(Phase::Stopped);
@@ -891,6 +898,9 @@ impl Download {
             }
         }
         let (name, part, file) = create_part(&dir, &remote.name, length)?;
+        if self.job.earlier > 0 && self.note.is_none() {
+            self.note = Some(STARTED_OVER.to_string());
+        }
         Ok((name, part, file, Ranges::new()))
     }
 
@@ -1852,7 +1862,7 @@ impl Download {
                 note: m.note.clone(),
             })
             .collect();
-        let status = DownloadStatus {
+        let mut status = DownloadStatus {
             id: self.job.id,
             url: self.job.given.clone(),
             name: self.name.clone(),
@@ -1864,6 +1874,9 @@ impl Download {
             bps: links.iter().map(|l| l.bps).sum(),
             links,
             note: self.note.clone(),
+            // Its place and priority are the list's, below.
+            seq: 0,
+            priority: Priority::default(),
         };
         // The data used first, so a page woken by the status reads a count
         // no older than the bytes the status shows.
@@ -1874,15 +1887,17 @@ impl Download {
         self.job
             .status
             .send_if_modified(|all| match all.iter_mut().find(|s| s.id == status.id) {
-                Some(slot) if *slot == status => false,
                 Some(slot) => {
-                    *slot = status;
-                    true
+                    status.seq = slot.seq;
+                    status.priority = slot.priority;
+                    let changed = *slot != status;
+                    if changed {
+                        *slot = status;
+                    }
+                    changed
                 }
-                None => {
-                    all.push(status);
-                    true
-                }
+                // Removed from the list: it stays removed.
+                None => false,
             });
     }
 }

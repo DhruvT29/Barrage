@@ -107,6 +107,8 @@ function Start-Engine([switch]$Open) {
     $arguments = @("--no-open", "--port", "$Port", "--downloads", "`"$downloads`"")
     # A session that counts requests reads them from the engine's log.
     if ($script:EngineLog) { $arguments += @("--log", "`"$($script:EngineLog)`"") }
+    # A harness's state stays its own, never the user's.
+    if ($script:StateDir) { $arguments += @("--state", "`"$($script:StateDir)`"") }
     $proc = Start-Process -FilePath $Engine -PassThru -ArgumentList $arguments
     $deadline = (Get-Date).AddSeconds(15)
     while ($true) {

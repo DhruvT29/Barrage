@@ -1,5 +1,10 @@
+import type { Priority } from '../api/types'
+
 /** What the engine made of a stop or a resume: done, or why not, in its words. */
 export type Asked = { ok: true } | { refused: string }
+
+/** What a transfer can be asked by its address alone. */
+type Action = 'stop' | 'resume' | 'remove'
 
 /**
  * Asks the engine that served the page to stop download `id` (its progress
@@ -7,29 +12,45 @@ export type Asked = { ok: true } | { refused: string }
  * all do. The body is `{}` as JSON, which a form on another site cannot
  * send; the engine's refusals (404, 409) are passed on as they are.
  */
-export function controlDownload(id: number, action: 'stop' | 'resume'): Promise<Asked> {
+export function controlDownload(id: number, action: Action): Promise<Asked> {
   return control(`/api/downloads/${id}/${action}`)
 }
 
 /** The same for torrent `id`. */
-export function controlTorrent(id: number, action: 'stop' | 'resume'): Promise<Asked> {
+export function controlTorrent(id: number, action: Action): Promise<Asked> {
   return control(`/api/torrents/${id}/${action}`)
 }
 
-async function control(address: string): Promise<Asked> {
+/** Asks the engine to give a download or a torrent this priority. */
+export function setPriority(kind: 'web' | 'torrent', id: number, priority: Priority): Promise<Asked> {
+  const route = kind === 'web' ? 'downloads' : 'torrents'
+  return control(`/api/${route}/${id}/priority`, JSON.stringify({ priority }))
+}
+
+/** Asks the engine to run this many at once. */
+export function setLimit(limit: number): Promise<Asked> {
+  return control('/api/queue/limit', JSON.stringify({ limit }))
+}
+
+/** Asks the engine to zero the data used. */
+export function resetUsed(): Promise<Asked> {
+  return control('/api/used/reset')
+}
+
+async function control(address: string, body = '{}'): Promise<Asked> {
   let answer: Response
   try {
     answer = await fetch(address, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body,
     })
   } catch {
     return { refused: 'the engine is not answering' }
   }
   if (answer.ok) return { ok: true }
-  const body: unknown = await answer.json().catch(() => null)
-  const { error } = (body ?? {}) as { error?: unknown }
+  const said: unknown = await answer.json().catch(() => null)
+  const { error } = (said ?? {}) as { error?: unknown }
   return { refused: typeof error === 'string' ? error : `the engine answered ${answer.status}` }
 }
 

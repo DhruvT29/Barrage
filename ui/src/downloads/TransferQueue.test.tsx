@@ -14,6 +14,7 @@ const NOTHING: DownloadsView = { live: { bps: 0, parts: [] }, list: [], used: []
 
 function download(id: number, name: string, state: DownloadState = 'done'): DownloadView {
   return {
+    priority: 'normal',
     id,
     url: `https://example.com/${name}`,
     name,
@@ -28,6 +29,7 @@ function download(id: number, name: string, state: DownloadState = 'done'): Down
 
 function torrent(id: number, name: string, phase: TorrentPhase = 'done'): TorrentView {
   return {
+    priority: 'normal',
     id,
     name,
     info_hash: String(id).repeat(40).slice(0, 40),

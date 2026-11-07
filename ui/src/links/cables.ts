@@ -17,7 +17,7 @@ export type Cable = {
   sharedWith: string[]
   /** Whether Windows says the connection any of its addresses is on is metered. */
   metered: boolean
-  /** Bytes BARRAGE has downloaded through it since the engine started, written or not; 0 until it carries. */
+  /** Bytes BARRAGE has downloaded through it since the data used was last zeroed, written or not; 0 until it carries. */
   used: number
 }
 

@@ -14,8 +14,10 @@
 //! engine stopped mid-save leaves the last progress, never half of it.
 //!
 //! Its caller flushes the `.part` to disk first, so the progress never
-//! claims bytes the disk has not kept. The progress itself is not forced to
-//! disk: lost to a power cut, it is only the last progress, or none, and the
+//! claims bytes the disk has not kept. The progress file is forced to disk
+//! too, before the rename, so a power cut leaves the old progress or the new
+//! whole, never an empty file. The rename itself is not forced (the folder is
+//! not synced): lost to a power cut, it is only the last progress, and the
 //! download goes back a little, or starts over.
 
 use std::io::{self, Write};
@@ -48,11 +50,23 @@ pub(crate) fn progress_path(part: &Path) -> PathBuf {
 /// Save `saved` at `path`, replacing what was there in one step.
 pub(crate) fn save(path: &Path, saved: &Saved) -> io::Result<()> {
     let text = serde_json::to_vec(saved).map_err(io::Error::other)?;
+    replace(path, &text)
+}
+
+/// Put `bytes` at `path` in one step: written beside it, then renamed over
+/// it, so whoever is stopped halfway leaves the old file whole.
+///
+/// The bytes are forced to disk (`sync_all`) before the rename, so after a
+/// power cut or an OS crash `path` holds the old file or the new one whole,
+/// never an empty or zero-filled one. The rename itself is not forced: the
+/// folder is not synced, so a power cut can still leave the old file.
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut beside = path.as_os_str().to_owned();
     beside.push(".new");
     let beside = PathBuf::from(beside);
     let mut file = std::fs::File::create(&beside)?;
-    file.write_all(&text)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     drop(file);
     // Windows can refuse the rename for a moment while something else, an
     // antivirus scan or the search indexer, holds the file just written.
@@ -83,10 +97,7 @@ mod tests {
 
     /// A folder of its own for one test, emptied first.
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("barrage-saved-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::scratch::folder(&format!("saved-{name}"))
     }
 
     fn sample() -> Saved {

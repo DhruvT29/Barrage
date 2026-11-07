@@ -6,6 +6,7 @@
 //! (127.0.0.3); every peer is a local session on 127.0.0.1.
 
 mod fake;
+mod scratch;
 mod torrent;
 
 use std::net::{IpAddr, SocketAddr};
@@ -20,6 +21,7 @@ use barrage::bt::{
 use barrage::fetch::Usage;
 use barrage::links::Candidate;
 use barrage::links::watch::WatchConfig;
+use barrage::record::{Kept, KeptState, Priority, What};
 use barrage::transfer::TransferEngine;
 use fake::{Fake, Live, cand_idx, ms};
 use torrent::{FILE, Seeds, fresh_dir, listening_on, pattern, seeds_with};
@@ -494,5 +496,140 @@ async fn a_cable_that_will_not_bind_waits_on_this_machine() {
     assert!(
         addrs.iter().all(|a| a.ip() == IpAddr::from([127, 0, 0, 1])),
         "{addrs:?}"
+    );
+}
+
+/// Torrents as `barrage` runs them, keeping their state in `state`.
+async fn torrents_keeping(
+    name: &str,
+    links: &LinkHandle,
+    state: &std::path::Path,
+    peers: Vec<SocketAddr>,
+) -> (Torrents, std::path::PathBuf) {
+    let dir = fresh_dir(name);
+    let config = TorrentConfig {
+        network: false,
+        listen: false,
+        tick: ms(50),
+        peers,
+        state: Some(state.to_path_buf()),
+        ..TorrentConfig::default()
+    };
+    let usage = Usage::counting_speed_tests(links.table());
+    let torrents = Torrents::start(links.table(), dir.clone(), usage, config)
+        .await
+        .unwrap();
+    (torrents, dir)
+}
+
+/// Review Focus 4: a session rebuild gives every torrent to the new session,
+/// but one brought back stopped has never been given to any. A session that
+/// has a torrent says which folder it chose, so none said means none has it.
+#[tokio::test]
+async fn a_rebuild_keeps_a_stopped_restored_torrent_out_of_the_session() {
+    let seeds = slow_seeds("u-restored", 1, 1 << 20, 1024).await;
+    let (links, live) = cables(vec![eth2(false), eth3(false)], &[(ETH2, 10), (ETH3, 30)]).await;
+    let state = fresh_dir("u-restored-state");
+    let (torrents, dir) =
+        torrents_keeping("u-restored-leech", &links, &state, seeds.addrs.clone()).await;
+    udp_moves_to(&torrents, "Ethernet 3", ETH3, 5).await;
+    let hash = seeds.info_hash.as_string();
+    std::fs::create_dir_all(state.join("torrents")).unwrap();
+    std::fs::write(
+        state.join("torrents").join(format!("{hash}.torrent")),
+        &seeds.torrent,
+    )
+    .unwrap();
+    let row = Kept {
+        seq: 1,
+        priority: Priority::Normal,
+        state: KeptState::Stopped,
+        dir: dir.clone(),
+        name: Some(FILE.to_string()),
+        length: Some(1 << 20),
+        done: 0,
+        note: None,
+        what: What::Torrent {
+            id: 1,
+            info_hash: hash,
+            magnet: None,
+            output: None,
+        },
+    };
+    torrents.restore(vec![row], 1).await;
+
+    live.set(vec![eth2(false)]);
+    udp_moves_to(&torrents, "Ethernet 2", ETH2, 10).await;
+    // The cable shows as moved before the old session has stopped, and
+    // torrents are given to the new one after that.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let id = torrents.status().borrow()[0].id;
+    assert_eq!(status(&torrents, id).phase, TorrentPhase::Stopped);
+    let told = torrents.kept().remove(0).what;
+    assert!(
+        matches!(told, What::Torrent { output: None, .. }),
+        "given to the rebuilt session: {told:?}"
+    );
+
+    torrents.resume(id).await.unwrap();
+    wait_for(&torrents, id, 30, "done", |t| t.phase == TorrentPhase::Done).await;
+    assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), seeds.bytes);
+}
+
+/// A rebuild picks each running torrent up from its fast resume data.
+#[tokio::test]
+async fn fast_resume_data_is_kept_through_a_rebuild() {
+    let len: usize = 4 << 20;
+    let seeds = slow_seeds("u-resume", 4, len, 256).await;
+    let (links, live) = cables(vec![eth2(false), eth3(false)], &[(ETH2, 10), (ETH3, 30)]).await;
+    let state = fresh_dir("u-resume-state");
+    let (torrents, dir) =
+        torrents_keeping("u-resume-leech", &links, &state, seeds.addrs.clone()).await;
+    udp_moves_to(&torrents, "Ethernet 3", ETH3, 5).await;
+
+    let id = torrents
+        .add(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+    let had = wait_for(&torrents, id, 30, "a quarter done", |t| {
+        t.done * 4 >= len as u64
+    })
+    .await;
+    live.set(vec![eth2(false)]);
+    udp_moves_to(&torrents, "Ethernet 2", ETH2, 10).await;
+
+    let after = status(&torrents, id);
+    assert!(after.done >= had.done, "{} then {}", had.done, after.done);
+    wait_for(&torrents, id, 60, "done", |t| t.phase == TorrentPhase::Done).await;
+    assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), seeds.bytes);
+    let kept: Vec<_> = std::fs::read_dir(state.join("resume")).unwrap().collect();
+    assert_eq!(kept.len(), 1, "its fast resume data");
+}
+
+/// Review Focus 4: a torrent in line is given to no session, by a rebuild
+/// or otherwise, until it has a place.
+#[tokio::test]
+async fn a_rebuild_starts_no_queued_torrent() {
+    let seeds = slow_seeds("u-queued", 1, 1 << 20, 1024).await;
+    let (links, live) = cables(vec![eth2(false), eth3(false)], &[(ETH2, 10), (ETH3, 30)]).await;
+    let state = fresh_dir("u-queued-state");
+    let (torrents, _dir) =
+        torrents_keeping("u-queued-leech", &links, &state, seeds.addrs.clone()).await;
+    udp_moves_to(&torrents, "Ethernet 3", ETH3, 5).await;
+    let id = torrents
+        .enqueue(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+
+    live.set(vec![eth2(false)]);
+    udp_moves_to(&torrents, "Ethernet 2", ETH2, 10).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(status(&torrents, id).phase, TorrentPhase::Queued);
+    let told = torrents.kept().remove(0).what;
+    assert!(
+        matches!(told, What::Torrent { output: None, .. }),
+        "given to the rebuilt session: {told:?}"
     );
 }

@@ -1,7 +1,7 @@
 // Made-up engine messages for the preview page (preview.html), never built
 // into the engine's page. Addresses are documentation ranges only
 // (192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::): the repository is public.
-import type { DownloadsView, DownloadView, LinkView, TableView, TorrentsView, TorrentView } from '../api/types'
+import type { DownloadsView, DownloadView, LinkView, QueueView, TableView, TorrentsView, TorrentView } from '../api/types'
 
 const MB = 8e6
 
@@ -35,6 +35,21 @@ export function previewTable(t: number): TableView {
   }
 }
 
+/** The queue beside the downloads and torrents below: two in line, one of each kind. */
+export function previewQueue(notice: boolean): QueueView {
+  return {
+    limit: 3,
+    most: 20,
+    holding: 3,
+    places: [
+      { kind: 'web', id: 90, place: 1 },
+      { kind: 'torrent', id: 91, place: 2 },
+    ],
+    notice: notice ? 'The saved list could not be read, so the engine started with an empty one. It was kept as state.broken-1700000000.json.' : null,
+    used_since: 1_700_000_000,
+  }
+}
+
 /** The downloads at second `t`: two downloading, one stopped, one done, one failed, one waiting. */
 export function previewDownloads(t: number): DownloadsView {
   const wifi = wiggle(11 * MB, t, 0)
@@ -47,6 +62,12 @@ export function previewDownloads(t: number): DownloadsView {
 
   const list: DownloadView[] = [
     {
+      priority: 'high',
+      id: 90, url: 'https://releases.example.com/fedora.iso', name: null,
+      state: 'queued', length: null, done: 0, bps: 0, note: null, cables: [],
+    },
+    {
+      priority: 'normal',
       id: 1, url: 'https://releases.example.com/linux/distro-24.04-desktop-amd64.iso', name: 'distro-24.04-desktop-amd64.iso',
       state: 'done', length: 5.8e9, done: 5.8e9, bps: 0, note: null,
       cables: [
@@ -55,6 +76,7 @@ export function previewDownloads(t: number): DownloadsView {
       ],
     },
     {
+      priority: 'normal',
       id: 2, url: 'https://mirror.example.org/archive/OpenData_Spectra_Archive_2026.tar.gz', name: 'OpenData_Spectra_Archive_2026.tar.gz',
       state: 'downloading', length: big, done: bigDone, bps: wifi + eth,
       note: null,
@@ -64,6 +86,7 @@ export function previewDownloads(t: number): DownloadsView {
       ],
     },
     {
+      priority: 'normal',
       id: 3, url: 'https://cdn.example.net/builds/game-patch-v2.12.iso', name: 'game-patch-v2.12.iso',
       state: 'downloading', length: iso, done: isoDone, bps: phone, note: null,
       cables: [
@@ -71,16 +94,19 @@ export function previewDownloads(t: number): DownloadsView {
       ],
     },
     {
+      priority: 'normal',
       id: 4, url: 'https://downloads.example.com/netinst-amd64.iso', name: 'netinst-amd64.iso',
       state: 'stopped', length: 1.9e9, done: 1.4e9, bps: 0, note: null,
       cables: [{ name: 'Wi-Fi', bytes: 1.4e9, bps: 0, connections: 0, wanted: 0, notes: [] }],
     },
     {
+      priority: 'normal',
       id: 5, url: 'https://files.example.org/missing/dataset.zip', name: 'dataset.zip',
       state: 'failed', length: null, done: 0, bps: 0, note: 'the server answered 404 Not Found',
       cables: [],
     },
     {
+      priority: 'normal',
       id: 6, url: 'https://slow.example.com/firmware.bin', name: null,
       state: 'waiting', length: null, done: 0, bps: 0, note: null, cables: [],
     },
@@ -124,12 +150,14 @@ export function withLongWords(table: TableView, downloads: DownloadsView): [Tabl
   ]
   const long: DownloadView[] = [
     {
+      priority: 'normal',
       id: 7, url: 'https://very-long-subdomain-name-for-a-mirror.downloads.example.com/a/b/c/d/Supercalifragilistic_Expialidocious_Dataset_Export_2026-10-31T23-59-59_part-0001-of-0042.tar.zst',
       name: 'Supercalifragilistic_Expialidocious_Dataset_Export_2026-10-31T23-59-59_part-0001-of-0042.tar.zst',
       state: 'downloading', length: 912e9, done: 3.3e9, bps: 3 * MB, note: null,
       cables: [{ name, bytes: 3.3e9, bps: 3 * MB, connections: 1, wanted: 4, notes: ['new address: holding one connection until it proves itself on this download'] }],
     },
     {
+      priority: 'normal',
       id: 8, url: 'https://slow.example.com/firmware/builds/nightly/2026/10/31/device-firmware-image-without-any-spaces-at-all-0123456789abcdef0123456789abcdef.bin',
       name: null, state: 'starting', length: null, done: 0, bps: 0, note: null, cables: [],
     },
@@ -155,11 +183,18 @@ export function previewTorrents(t: number): TorrentsView {
   const done = Math.floor(fromWifi + fromPhone)
   const list: TorrentView[] = [
     {
+      priority: 'low',
+      id: 91, name: 'archlinux.iso', info_hash: 'b'.repeat(40), phase: 'queued',
+      length: null, done: 0, down_bps: 0, up_bps: 0, peers: 0, note: null, cables: [],
+    },
+    {
+      priority: 'normal',
       id: 1, name: 'a-distribution-netinst-amd64.iso', info_hash: 'a'.repeat(40), phase: 'done', length: 660e6, done: 660e6,
       down_bps: 0, up_bps: 0, peers: 0, note: null,
       cables: [{ name: 'Wi-Fi', received: 660e6, sent: 41e6, bps: 0, connections: 0, uploads: true }],
     },
     {
+      priority: 'normal',
       id: 2, name: 'open-movie-2160p.mkv', info_hash: 'b'.repeat(40), phase: 'stopped', length: 8.4e9, done: 2.9e9,
       down_bps: 0, up_bps: 0, peers: 0, note: null,
       cables: [
@@ -168,10 +203,12 @@ export function previewTorrents(t: number): TorrentsView {
       ],
     },
     {
+      priority: 'normal',
       id: 3, name: 'research-dataset-2026.tar', info_hash: 'c'.repeat(40), phase: 'failed', length: 21e9, done: 4e9,
       down_bps: 0, up_bps: 0, peers: 0, note: 'error writing to disk: there is not enough space on the disk', cables: [],
     },
     {
+      priority: 'normal',
       id: 4, name: 'distro-24.04-desktop-amd64.iso', info_hash: 'd'.repeat(40), phase: 'downloading', length: whole, done,
       down_bps: wifi + phone, up_bps: wiggle(1.4 * MB, t, 1.9), peers: 23, note: null,
       cables: [
@@ -180,6 +217,7 @@ export function previewTorrents(t: number): TorrentsView {
       ],
     },
     {
+      priority: 'normal',
       id: 5, name: null, info_hash: '0123456789abcdef0123456789abcdef01234567', phase: 'finding', length: null, done: 0,
       down_bps: 0, up_bps: 0, peers: 0, note: null, cables: [],
     },
