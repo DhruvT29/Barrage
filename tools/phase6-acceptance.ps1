@@ -29,7 +29,8 @@
 
     A YES PER ROW, as in phases 4 and 5: before each row the script waits for
     the file go-<Row> in -Work. Each cue says what to do. Every address
-    printed is masked.
+    printed is masked. With -Unattended it waits for no one, and sends the
+    Ctrl+C itself: a real one, through the engine's console.
 
     USAGE
       # Lists the rows and touches nothing, the network least of all:
@@ -54,7 +55,8 @@ param(
     [int]$Port = 7700,
     [string]$Engine = "",
     [string]$Work = "",
-    [switch]$Keep
+    [switch]$Keep,
+    [switch]$Unattended
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,6 +88,12 @@ $api = "http://127.0.0.1:$Port/api"
 $script:EngineLog = Join-Path $Work "engine-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:Proc = $null
 $script:Passed = [ordered]@{}
+# How much a restart may lose: the last moments, at a fast cable's speed.
+$MayFetchAgain = 100e6
+# How much must be here before each restart, so that a restart has something
+# to lose. Well above what it may lose, or the row proves nothing.
+$HeldBeforeClean = 800e6
+$HeldBeforeKill = 1600e6
 
 # ---------------------------------------------------------------- helpers
 
@@ -102,6 +110,7 @@ function Wait-For([string]$What, [scriptblock]$Check, [int]$Seconds = $Minutes *
 function Wait-Go([string]$Row, [string]$Cue) {
     Write-Output ""
     Write-Output "== ${Row}: $Cue"
+    if ($Unattended) { return }
     $go = Join-Path $Work "go-$Row"
     Remove-Item -LiteralPath $go -ErrorAction SilentlyContinue
     Write-Output "   When ready, create the file $go"
@@ -131,6 +140,52 @@ function Get-Shape {
 function Get-TotalReceived {
     $used = @((Invoke-RestMethod "$api/downloads").used)
     return ($used | Measure-Object -Property bytes -Sum).Sum
+}
+
+# Every byte held, of every transfer: what a restart must not lose.
+function Get-Held {
+    $held = @(Get-Webs) + @(Get-Swarm) | Measure-Object -Property done -Sum
+    return [double]$held.Sum
+}
+
+# What the engine's speed tests pulled, by its log. Data used counts them, as
+# it should, and each start of the engine runs them again.
+function Get-Tested {
+    $found = Select-String -LiteralPath $script:EngineLog -Pattern 'throughput sample .*bytes=(\d+)'
+    return [double](@($found | ForEach-Object { [double]$_.Matches[0].Groups[1].Value }) | Measure-Object -Sum).Sum
+}
+
+# How many transfers have some of their bytes, and not all.
+function Get-MidWay {
+    @(@(Get-Webs) + @(Get-Swarm) | Where-Object { $_.length -and $_.done -gt 0 -and $_.done -lt $_.length }).Count
+}
+
+# Waits until a restart has something to lose, and something still under way.
+function Wait-Held([double]$Bytes) {
+    Wait-For "$(MB $Bytes) MB here" { (Get-Held) -ge $Bytes } | Out-Null
+    $midway = Get-MidWay
+    Assert-That ($midway -ge 1) "$midway transfers mid-way, $(MB (Get-Held)) MB held"
+}
+
+# A real Ctrl+C, from a process of its own: it leaves its console for the
+# engine's, and ignores the signal it sends there.
+function Send-CtrlC([int]$Id) {
+    $code = @'
+$m = '[DllImport("kernel32.dll")] public static extern bool FreeConsole();
+[DllImport("kernel32.dll")] public static extern bool AttachConsole(uint id);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(IntPtr h, bool add);
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint group);'
+Add-Type -Name Console -Namespace Brg -MemberDefinition $m
+[Brg.Console]::FreeConsole() | Out-Null
+if (-not [Brg.Console]::AttachConsole(ENGINE_ID)) { exit 1 }
+[Brg.Console]::SetConsoleCtrlHandler([IntPtr]::Zero, $true) | Out-Null
+if (-not [Brg.Console]::GenerateConsoleCtrlEvent(0, 0)) { exit 2 }
+Start-Sleep -Milliseconds 500
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code.Replace("ENGINE_ID", "$Id")))
+    $sent = Start-Process powershell.exe -ArgumentList "-NoProfile -EncodedCommand $encoded" `
+        -WindowStyle Hidden -PassThru -Wait
+    if ($sent.ExitCode -ne 0) { throw "the Ctrl+C was not sent (exit $($sent.ExitCode))" }
 }
 
 function Assert-That([bool]$Ok, [string]$What) {
@@ -174,29 +229,44 @@ function Test-Priority {
     Assert-That ((Get-Queue).holding -eq $running) "nothing running was stopped for it"
 }
 
-function Test-Back([string]$Before, [double]$Received) {
+function Test-Back([string]$Before, [double]$Received, [double]$Held, [int]$Limit) {
     Wait-For "the engine answering" { try { Get-Queue } catch { $null } } 60 | Out-Null
     Assert-That ((Get-Shape) -eq $Before) "the list and the priorities are back"
+    Assert-That ((Get-Queue).limit -eq $Limit) "the limit is back: $Limit"
     $now = Get-TotalReceived
     Assert-That ($now -ge $Received) "data used carried over: $(MB $now) MB"
+    # A torrent says what it holds once its fast resume check is done.
+    Wait-For "what was held held again" { (Get-Held) -ge $Held - $MayFetchAgain } 120 | Out-Null
+    Assert-That $true "held before: $(MB $Held) MB, held now: $(MB (Get-Held)) MB"
     Wait-For "something running again" { (Get-Queue).holding -ge 1 } 120 | Out-Null
 }
 
 function Test-CleanRestart {
+    # Not the default, or a limit never saved would still come back.
+    Post "/queue/limit" '{"limit": 2}' | Out-Null
+    Wait-Held $HeldBeforeClean
     $before = Get-Shape
     $received = Get-TotalReceived
-    Write-Output "   Press Ctrl+C in the engine's window now."
+    $held = Get-Held
+    if ($Unattended) { Send-CtrlC $script:Proc.Id }
+    else { Write-Output "   Press Ctrl+C in the engine's window now." }
     Wait-For "the engine closing" { $script:Proc.HasExited } 300 | Out-Null
     $script:Proc = Start-Engine
-    Test-Back $before $received
+    Test-Back $before $received $held 2
 }
 
 function Test-Kill {
+    Wait-Held $HeldBeforeKill
     $before = Get-Shape
     $received = Get-TotalReceived
+    $held = Get-Held
+    $limit = (Get-Queue).limit
+    # What was counted just now is on disk a save later: the kill may take
+    # only what came after.
+    Start-Sleep -Seconds 2
     Stop-Engine $script:Proc
     $script:Proc = Start-Engine
-    Test-Back $before $received
+    Test-Back $before $received $held $limit
 }
 
 function Test-Check {
@@ -204,11 +274,31 @@ function Test-Check {
         @(Get-Webs | Where-Object { $_.state -notin @("done", "failed") }).Count -eq 0 -and
         @(Get-Swarm | Where-Object { $_.phase -notin @("done", "failed") }).Count -eq 0
     } | Out-Null
+    $failed = @(@(Get-Webs) + @(Get-Swarm) | Where-Object { $_.state -eq "failed" -or $_.phase -eq "failed" })
+    Assert-That ($failed.Count -eq 0) "nothing failed"
+    # Every byte fetched, restarts and all, beside the size of what came.
+    $size = (@(Get-Webs) + @(Get-Swarm) | Measure-Object -Property length -Sum).Sum
+    $received = Get-TotalReceived
+    $tested = Get-Tested
+    $fetched = $received - $tested
+    Write-Output "   data used $(MB $received) MB, of which speed tests $(MB $tested) MB"
+    Assert-That ($fetched -lt $size * 1.05) "$(MB $fetched) MB fetched for $(MB $size) MB of files"
+    # Whether what most programs ask for, a read that lets no one write, works
+    # on a finished torrent's file while the engine runs. Reported, not judged.
+    foreach ($t in @(Get-Swarm)) {
+        try {
+            [IO.File]::OpenRead((Join-Path $downloads $t.name)).Dispose()
+            Write-Output "   note: $($t.name) opens while the engine runs"
+        }
+        catch { Write-Output "   note: $($t.name) does NOT open while the engine runs" }
+    }
+    # Stopped first: the engine holds a finished torrent's file open.
+    Stop-Engine $script:Proc
+    $script:Proc.WaitForExit()
     foreach ($name in $Sha256.Keys) {
         $hash = (Get-FileHash -LiteralPath (Join-Path $downloads $name) -Algorithm SHA256).Hash
         Assert-That ($hash -eq "$($Sha256[$name])".ToUpper()) "$name matches its hash"
     }
-    Stop-Engine $script:Proc
     if (-not $Torrent) { return }
     # An empty state folder: no fast resume data, so every piece is read.
     $script:StateDir = Join-Path $Work "brg-phase6-check-state"
@@ -216,7 +306,8 @@ function Test-Check {
     $script:Proc = Start-Engine
     Add-Torrent $Torrent | Out-Null
     Wait-For "every piece checked" { @(Get-Swarm | Where-Object { $_.phase -eq "done" }).Count -eq 1 } | Out-Null
-    $fetched = Get-TotalReceived
+    # The torrent's own count: data used would include this engine's speed test.
+    $fetched = (@(@(Get-Swarm)[0].cables) | Measure-Object -Property received -Sum).Sum
     Assert-That ($fetched -lt 50e6) "every piece passed, $(MB $fetched) MB fetched"
 }
 
@@ -227,13 +318,28 @@ function Test-Resume {
         $t.length -gt 0 -and $t.done / $t.length -gt 0.3
     } | Out-Null
     Stop-Engine $script:Proc
+    $script:Proc.WaitForExit()
     $started = Get-Date
     $script:Proc = Start-Engine
     Wait-For "it back and running" {
         $t = @(Get-Swarm)[-1]
         $t -and $t.phase -eq "downloading" -and $t.peers -gt 0
     } | Out-Null
-    Write-Output "   Back in $([int]((Get-Date) - $started).TotalSeconds) s. Compare a full check of its size."
+    $back = [int]((Get-Date) - $started).TotalSeconds
+    Stop-Engine $script:Proc
+    $script:Proc.WaitForExit()
+    # The same, with no fast resume data: every piece read.
+    $script:StateDir = Join-Path $Work "brg-phase6-resume-state"
+    Remove-Item -LiteralPath $script:StateDir -Recurse -Force -ErrorAction SilentlyContinue
+    $script:Proc = Start-Engine
+    $started = Get-Date
+    Add-Torrent $LongTorrent | Out-Null
+    Wait-For "it running after a full check" {
+        $t = @(Get-Swarm)[-1]
+        $t -and $t.phase -eq "downloading" -and $t.peers -gt 0
+    } | Out-Null
+    $full = [int]((Get-Date) - $started).TotalSeconds
+    Write-Output "   Back in $back s with fast resume; $full s with a full check."
 }
 
 function Test-Damaged {
@@ -242,7 +348,7 @@ function Test-Damaged {
     $script:Proc = Start-Engine
     $queue = Wait-For "the engine answering" { try { Get-Queue } catch { $null } } 60
     Assert-That ($queue.notice -match "could not be read") "the page is told"
-    Assert-That (@(Get-Webs).Count -eq 0) "it started with an empty list"
+    Assert-That ((@(Get-Webs).Count + @(Get-Swarm).Count) -eq 0) "it started with an empty list"
     $aside = @(Get-ChildItem -LiteralPath $script:StateDir -Filter "state.broken-*.json")
     Assert-That ($aside.Count -eq 1) "the file was kept aside"
 }
