@@ -39,6 +39,7 @@ function table(links: LinkView[], combined: CombinedView = NOTHING): TableView {
 
 function download(id: number, state: DownloadState, fields: Partial<DownloadView> = {}): DownloadView {
   return {
+    priority: 'normal',
     id,
     url: `https://example.com/file-${id}.iso`,
     name: `file-${id}.iso`,
@@ -374,6 +375,7 @@ test('before the first table the chart does not claim a quiet minute: nothing ha
 const running: TorrentsView = {
   list: [
     {
+      priority: 'normal',
       id: 4,
       name: 'distro.iso',
       info_hash: 'ab'.repeat(20),

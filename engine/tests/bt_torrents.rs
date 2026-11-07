@@ -5,6 +5,7 @@
 
 mod fake;
 mod fetching;
+mod scratch;
 mod serve;
 mod torrent;
 
@@ -48,6 +49,7 @@ async fn torrents(
         try_for: barrage::bt::listen::TRY_FOR,
         tick: Duration::from_millis(50),
         peers,
+        ..TorrentConfig::default()
     };
     let usage = Usage::counting_speed_tests(cables.table());
     let torrents = Torrents::start(cables.table(), dir.clone(), usage, config)

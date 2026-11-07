@@ -1,6 +1,8 @@
 //! Local torrents for the tests: seeds are librqbit sessions on 127.0.0.1,
 //! reached by `initial_peers`, with DHT, trackers, local service discovery
 //! and UPnP off, so nothing leaves this machine.
+//!
+//! Each test file that uses it also declares `mod scratch`.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -95,10 +97,7 @@ impl Seeds {
 
 /// A folder of its own for one test, emptied first.
 pub fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("barrage-bt-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    crate::scratch::folder(&format!("bt-{name}"))
 }
 
 /// `bytes`, made a torrent with pieces of `piece_len` bytes, seeded by `n`

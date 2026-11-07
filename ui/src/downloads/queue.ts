@@ -1,6 +1,6 @@
 // The transfer queue's arithmetic, apart from its markup: which filter a
 // download falls under, its time left, and how its piece bar is coloured.
-import type { DownloadState, DownloadView, TorrentPhase, TorrentView } from '../api/types'
+import type { DownloadState, DownloadView, QueueView, TorrentPhase, TorrentView } from '../api/types'
 import { formatEta } from './format'
 
 /** What the queue can be narrowed to. Every state falls under exactly one, besides All. */
@@ -10,13 +10,13 @@ export const FILTERS: Filter[] = ['all', 'active', 'torrents', 'stopped', 'done'
 
 /** Active is everything still under way: finding the file, waiting for a cable, or fetching. */
 export function filterOf(state: DownloadState): Exclude<Filter, 'all' | 'torrents'> {
-  if (state === 'starting' || state === 'waiting' || state === 'downloading') return 'active'
+  if (state === 'queued' || state === 'starting' || state === 'waiting' || state === 'downloading') return 'active'
   return state
 }
 
 /** A torrent falls under the same filters, and Torrents as well. */
 export function torrentFilterOf(phase: TorrentPhase): Exclude<Filter, 'all' | 'torrents'> {
-  return phase === 'finding' || phase === 'downloading' ? 'active' : phase
+  return phase === 'queued' || phase === 'finding' || phase === 'downloading' ? 'active' : phase
 }
 
 /** How many downloads and torrents each filter would show. */
@@ -39,6 +39,7 @@ export function countByFilter(
 
 /** What the time-left figure says in each state that is not fetching. */
 const ETA_WORDS: Record<Exclude<DownloadState, 'downloading'>, string> = {
+  queued: 'Queued',
   starting: 'Waiting',
   waiting: 'Waiting',
   stopped: 'Stopped',
@@ -46,12 +47,27 @@ const ETA_WORDS: Record<Exclude<DownloadState, 'downloading'>, string> = {
   failed: 'Failed',
 }
 
+/** "3rd in line". */
+export function inLine(place: number): string {
+  const tens = place % 100
+  const units = place % 10
+  const teen = tens >= 11 && tens <= 13
+  const suffix = teen ? 'th' : units === 1 ? 'st' : units === 2 ? 'nd' : units === 3 ? 'rd' : 'th'
+  return `${place}${suffix} in line`
+}
+
+/** A transfer's place in line, by kind and id; undefined if it has none. */
+export function placeOf(queue: QueueView | null | undefined, kind: 'web' | 'torrent', id: number): number | undefined {
+  return queue?.places.find((p) => p.kind === kind && p.id === id)?.place
+}
+
 /**
  * The time left: the bytes left at the speed right now, while downloading;
- * "-" without a speed or a length to work it from; otherwise the state, in a
- * word.
+ * "-" without a speed or a length to work it from; its place while it waits
+ * in line; otherwise the state, in a word.
  */
-export function etaText(d: DownloadView): string {
+export function etaText(d: DownloadView, place?: number): string {
+  if (d.state === 'queued' && place !== undefined) return inLine(place)
   if (d.state !== 'downloading') return ETA_WORDS[d.state]
   if (d.length === null || d.bps <= 0) return '-'
   return formatEta((Math.max(0, d.length - d.done) * 8) / d.bps)
@@ -59,6 +75,7 @@ export function etaText(d: DownloadView): string {
 
 /** What the time-left figure says of a torrent that is not fetching. */
 const TORRENT_ETA_WORDS: Record<Exclude<TorrentPhase, 'downloading'>, string> = {
+  queued: 'Queued',
   finding: 'Finding',
   stopped: 'Stopped',
   done: 'Complete',
@@ -66,7 +83,8 @@ const TORRENT_ETA_WORDS: Record<Exclude<TorrentPhase, 'downloading'>, string> = 
 }
 
 /** A torrent's time left, as `etaText`. */
-export function torrentEta(t: TorrentView): string {
+export function torrentEta(t: TorrentView, place?: number): string {
+  if (t.phase === 'queued' && place !== undefined) return inLine(place)
   if (t.phase !== 'downloading') return TORRENT_ETA_WORDS[t.phase]
   if (t.length === null || t.down_bps <= 0) return '-'
   return formatEta((Math.max(0, t.length - t.done) * 8) / t.down_bps)

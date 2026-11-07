@@ -8,6 +8,7 @@
 //   /preview.html?disconnected    the engine stopped answering (the last table dimmed)
 //   /preview.html?connecting      before the first table
 //   /preview.html?long            the longest words a card can be given
+//   /preview.html?notice          the notice about the saved list
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 
@@ -20,7 +21,7 @@ import type { DownloadsView, TableView, TorrentsView } from '../api/types'
 import type { FeedLine, Status } from '../api/useLive'
 import { Dashboard } from '../links/Dashboard'
 import { useTab } from '../tabs'
-import { PREVIEW_FEED, previewDownloads, previewTable, previewTorrents, withLongWords } from './fixtures'
+import { PREVIEW_FEED, previewDownloads, previewQueue, previewTable, previewTorrents, withLongWords } from './fixtures'
 
 const query = new URLSearchParams(window.location.search)
 
@@ -59,6 +60,7 @@ function Preview() {
       feed={feed}
       downloads={downloads}
       torrents={torrents}
+      queue={query.has('empty') || status === 'connecting' ? null : previewQueue(query.has('notice'))}
       history={history}
       tab={tab}
       onTab={setTab}

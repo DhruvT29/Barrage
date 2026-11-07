@@ -190,7 +190,116 @@
 .tq-actions {
   display: flex;
   flex: none;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: flex-end;
   gap: 6px;
+  max-width: 100%;
+}
+
+/* A card's priority and Remove, with what they have to say under them. */
+.tq-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tq-control-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tq-select {
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: inherit;
+  font: 500 11px/1 var(--mono);
+  cursor: pointer;
+}
+
+.tq-select:disabled {
+  opacity: 0.45;
+  cursor: progress;
+}
+
+.tq-remove {
+  color: var(--dim);
+}
+
+.tq-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 8px;
+  max-width: 260px;
+  font: 500 11px/1.4 var(--mono);
+}
+
+.tq-confirm p {
+  margin: 0;
+  text-align: right;
+}
+
+/* A control written out, for what should not be pressed by accident. */
+.tq-word {
+  padding: 2px 6px;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: inherit;
+  font: 500 11px/1.4 var(--mono);
+  cursor: pointer;
+}
+
+.tq-word.danger {
+  color: var(--amber);
+}
+
+/* The queue's own line: how many run, the limit, the data used. */
+.tq-bar {
+  margin-bottom: 14px;
+  font: 500 11px/1.45 var(--mono);
+  color: var(--dim);
+}
+
+.tq-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+
+.tq-limit,
+.tq-used {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.tq-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--amber);
+  border-radius: 3px;
+  font: 500 12px/1.45 var(--mono);
+}
+
+.tq-notice p {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Stop and Resume: small square icon buttons, named for screen readers. */
@@ -227,6 +336,8 @@
 }
 
 .tq-act:focus-visible,
+.tq-select:focus-visible,
+.tq-word:focus-visible,
 .tq-filter:focus-visible,
 .tq-dist-toggle:focus-visible,
 .tq-add:focus-visible {
@@ -266,6 +377,7 @@
 /* Stopped or failed partway: the blocks keep their colours, quieter. */
 .tq-stopped .tq-piece.on,
 .tq-failed .tq-piece.on,
+.tq-queued .tq-piece.on,
 .tq-waiting .tq-piece.on,
 .tq-starting .tq-piece.on {
   filter: saturate(0.7) brightness(0.62);
@@ -281,6 +393,7 @@
 
 /* No length yet, still under way: a shimmer runs along the dim blocks. */
 .tq-downloading .tq-pieces.unknown::after,
+.tq-queued .tq-pieces.unknown::after,
 .tq-starting .tq-pieces.unknown::after,
 .tq-waiting .tq-pieces.unknown::after {
   content: '';
@@ -699,4 +812,33 @@
 
 .tq-swarm-why {
   opacity: 0.75;
+}
+
+/* On a phone the card's controls take a row of their own, under its name. */
+@media (max-width: 520px) {
+  .tq-head {
+    flex-wrap: wrap;
+  }
+
+  .tq-ident {
+    flex: 1 1 100%;
+  }
+
+  .tq-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .tq-controls {
+    align-items: flex-start;
+  }
+
+  .tq-confirm {
+    justify-content: flex-start;
+    max-width: none;
+  }
+
+  .tq-confirm p {
+    text-align: left;
+  }
 }

@@ -66,13 +66,14 @@ read what a newer engine sends.
 http://127.0.0.1:7700, reachable from this machine only. `--port N` picks
 another port, `--no-open` skips the browser, `--log FILE` records every change,
 `--downloads DIR` names the folder downloads go to (otherwise the Downloads
-folder). `cargo run --bin brg-links` shows the same links as a table in the
+folder), `--state DIR` names the folder the engine keeps its own state in
+(otherwise `%LOCALAPPDATA%\BARRAGE`). `cargo run --bin brg-links` shows the same links as a table in the
 terminal.
 
 The dashboard has two tabs. **Links** shows a card per connection (Wi-Fi, a
 USB-tethered phone, Ethernet) with its state, delay, measured speed and
 addresses, a "metered" mark when Windows calls the connection metered, how
-much BARRAGE has downloaded through it since it started (its speed tests
+much BARRAGE has downloaded through it since the data used was last reset (its speed tests
 included: 30 to 60 MB each time a phone is measured), and a notice when two
 connections reach the internet through the same one. **Downloads** takes a
 link to a file, which then comes down through every working connection at

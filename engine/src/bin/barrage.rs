@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! barrage [--port N] [--no-open] [--log FILE] [--static DIR] [--downloads DIR]
+//!         [--state DIR]
 //! ```
 //!
 //! Starts the link watcher, serves the page and its API at this machine's
@@ -13,7 +14,9 @@
 //! The page is read from `engine/static`, where `pnpm --dir ui build` puts
 //! it, or from `--static DIR`. Until it is built, the browser gets a note
 //! saying how. Downloads go to the user's Downloads folder, or to
-//! `--downloads DIR`, which must already exist.
+//! `--downloads DIR`, which must already exist. What the engine saves of its
+//! own, so a restart loses nothing, goes to `%LOCALAPPDATA%\BARRAGE`, or to
+//! `--state DIR`, made if it is missing.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,9 +29,10 @@ use barrage::bt::TorrentConfig;
 use barrage::fetch::downloads_folder;
 use barrage::links::render::changes;
 use barrage::links::watch::LinkTable;
+use barrage::record::Store;
 
-const USAGE: &str =
-    "usage: barrage [--port N] [--no-open] [--log FILE] [--static DIR] [--downloads DIR]";
+const USAGE: &str = "usage: barrage [--port N] [--no-open] [--log FILE] [--static DIR] \
+                     [--downloads DIR] [--state DIR]";
 
 /// Where the built page is unless `--static` says otherwise: `engine/static`,
 /// fixed when this program is compiled.
@@ -57,9 +61,11 @@ async fn run() -> anyhow::Result<()> {
         barrage::logging::to_file(path, &[])?;
     }
     let downloads = downloads_dir(options.downloads)?;
-    // The port first: a taken one stops here, before any probe or speed test
-    // has spent data.
+    let state_folder = state_dir(options.state)?;
+    // The port and the state folder first: either taken stops here, before
+    // any probe or speed test has spent data.
     let listener = bind(options.port).await?;
+    let state = Store::open(&state_folder)?;
     let handle = LinkHandle::start(Duration::from_secs(1))?;
     tracing::info!("started");
     tokio::spawn(log_changes(handle.table()));
@@ -67,6 +73,10 @@ async fn run() -> anyhow::Result<()> {
     let url = format!("http://{}", listener.local_addr()?);
     println!("BARRAGE on {url}. Ctrl+C to stop.");
     println!("Downloads go to {}.", downloads.display());
+    println!(
+        "The engine keeps its own state in {}.",
+        state_folder.display()
+    );
     if !options.static_dir.join("index.html").is_file() {
         println!("The page is not built yet: run `pnpm --dir ui build`, then reload it.");
     }
@@ -81,6 +91,7 @@ async fn run() -> anyhow::Result<()> {
         listener,
         handle,
         downloads,
+        state,
         options.static_dir,
         torrents,
         async {
@@ -112,6 +123,19 @@ fn downloads_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// The folder the engine keeps its own state in: `--state DIR`, else
+/// `%LOCALAPPDATA%\BARRAGE`, as a full path. It need not exist yet.
+fn state_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let dir = match given {
+        Some(dir) => dir,
+        None => std::env::var_os("LOCALAPPDATA")
+            .map(|local| PathBuf::from(local).join("BARRAGE"))
+            .context("cannot find the local app data folder. Name one with --state DIR")?,
+    };
+    std::path::absolute(&dir)
+        .with_context(|| format!("cannot use {} as the state folder", dir.display()))
+}
+
 /// Log each change to the links, as `brg-links --log` does. Nothing is
 /// written without `--log`.
 async fn log_changes(mut table: LinkTable) {
@@ -137,6 +161,8 @@ struct Options {
     static_dir: PathBuf,
     /// `None`: the user's Downloads folder.
     downloads: Option<PathBuf>,
+    /// `None`: `%LOCALAPPDATA%\BARRAGE`.
+    state: Option<PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -146,6 +172,7 @@ fn parse_args() -> anyhow::Result<Args> {
         log: None,
         static_dir: PathBuf::from(STATIC_DIR),
         downloads: None,
+        state: None,
     };
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -169,6 +196,10 @@ fn parse_args() -> anyhow::Result<Args> {
             Some("--downloads") => {
                 let dir = args.next().context("--downloads needs a folder")?;
                 options.downloads = Some(PathBuf::from(dir));
+            }
+            Some("--state") => {
+                let dir = args.next().context("--state needs a folder")?;
+                options.state = Some(PathBuf::from(dir));
             }
             Some("-h" | "--help") => return Ok(Args::Help),
             _ => anyhow::bail!("unexpected argument {arg:?}\n{USAGE}"),

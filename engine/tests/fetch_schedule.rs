@@ -5,6 +5,7 @@
 
 mod fake;
 mod fetching;
+mod scratch;
 mod serve;
 
 use std::sync::Arc;

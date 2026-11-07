@@ -48,11 +48,17 @@ pub(crate) fn progress_path(part: &Path) -> PathBuf {
 /// Save `saved` at `path`, replacing what was there in one step.
 pub(crate) fn save(path: &Path, saved: &Saved) -> io::Result<()> {
     let text = serde_json::to_vec(saved).map_err(io::Error::other)?;
+    replace(path, &text)
+}
+
+/// Put `bytes` at `path` in one step: written beside it, then renamed over
+/// it, so whoever is stopped halfway leaves the old file whole.
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut beside = path.as_os_str().to_owned();
     beside.push(".new");
     let beside = PathBuf::from(beside);
     let mut file = std::fs::File::create(&beside)?;
-    file.write_all(&text)?;
+    file.write_all(bytes)?;
     drop(file);
     // Windows can refuse the rename for a moment while something else, an
     // antivirus scan or the search indexer, holds the file just written.
@@ -83,10 +89,7 @@ mod tests {
 
     /// A folder of its own for one test, emptied first.
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("barrage-saved-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::scratch::folder(&format!("saved-{name}"))
     }
 
     fn sample() -> Saved {

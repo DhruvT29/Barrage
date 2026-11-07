@@ -45,6 +45,7 @@ function show(status: Status, t: TableView | null, feed: FeedLine[] = [], more: 
 
 function download(id: number, state: DownloadState): DownloadView {
   return {
+    priority: 'normal',
     id,
     url: `https://example.com/file-${id}.iso`,
     name: `file-${id}.iso`,

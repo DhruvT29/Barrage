@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use super::CableUse;
 use crate::links::LinkId;
 use crate::links::watch::LinkTable;
+use crate::record::KeptUse;
 
 /// Add what each cable's speed tests pull (`Link::tested`) to its count as
 /// it grows, until the link watcher stops. A speed test comes out of a
@@ -93,7 +94,19 @@ impl Usage {
     /// watcher behind `table` reports them (outside a runtime there is no
     /// watcher, so nothing to add).
     pub fn counting_speed_tests(table: LinkTable) -> Arc<Self> {
+        Self::restored(table, &[])
+    }
+
+    /// As [`Usage::counting_speed_tests`], carrying on from what an earlier
+    /// engine saved, in the order the cables first carried.
+    pub fn restored(table: LinkTable, kept: &[KeptUse]) -> Arc<Self> {
         let usage = Arc::new(Self::new());
+        for one in kept {
+            let counter = usage.cable(&one.cable);
+            counter.add(one.bytes);
+            counter.add_sent(one.sent);
+        }
+        usage.publish();
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(count_speed_tests(table, Arc::clone(&usage)));
         }
@@ -156,6 +169,30 @@ impl Usage {
     pub fn subscribe(&self) -> watch::Receiver<Vec<CableUse>> {
         self.sender.subscribe()
     }
+
+    /// Every cable that has carried, as saved.
+    pub fn kept(&self) -> Vec<KeptUse> {
+        self.publish();
+        let used = self.sender.borrow();
+        used.iter()
+            .map(|u| KeptUse {
+                cable: u.cable.clone(),
+                bytes: u.bytes,
+                sent: u.sent,
+            })
+            .collect()
+    }
+
+    /// Start counting from nothing. A cable shows again once it next carries.
+    pub fn reset(&self) {
+        for (_, counter) in self.cables.lock().unwrap().iter() {
+            counter.bytes.store(0, Ordering::SeqCst);
+            counter.sent.store(0, Ordering::SeqCst);
+            counter.first.store(0, Ordering::SeqCst);
+        }
+        self.order.store(0, Ordering::SeqCst);
+        self.publish();
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +253,47 @@ mod tests {
         let names: Vec<&str> = used.iter().map(|u| u.cable.as_str()).collect();
         assert_eq!(names, ["Ethernet 3", "Wi-Fi"]);
         assert_eq!((used[0].bytes, used[0].sent), (0, 7));
+    }
+
+    fn table() -> LinkTable {
+        LinkTable::of(watch::channel(Vec::new()).1)
+    }
+
+    #[test]
+    fn a_cable_keeps_its_place_in_the_order() {
+        let usage = Usage::new();
+        usage.cable("Ethernet 3").add(10);
+        usage.cable("Wi-Fi").add(5);
+        usage.cable("Wi-Fi").add_sent(2);
+
+        let back = Usage::restored(table(), &usage.kept());
+
+        assert_eq!(
+            shown(&back),
+            [("Ethernet 3".to_string(), 10), ("Wi-Fi".to_string(), 5)]
+        );
+        assert_eq!(back.kept(), usage.kept());
+        back.cable("Wi-Fi").add(1);
+        assert_eq!(shown(&back)[1].1, 6, "and carries on counting");
+    }
+
+    #[test]
+    fn reset_zeroes_it() {
+        let usage = Usage::new();
+        usage.cable("Ethernet 3").add(10);
+        usage.cable("Wi-Fi").add(5);
+
+        usage.reset();
+
+        assert_eq!(shown(&usage), []);
+        assert!(usage.kept().is_empty());
+        usage.cable("Wi-Fi").add(1);
+        usage.cable("Ethernet 3").add(2);
+        assert_eq!(
+            shown(&usage),
+            [("Wi-Fi".to_string(), 1), ("Ethernet 3".to_string(), 2)],
+            "first to carry again is first"
+        );
     }
 
     #[test]

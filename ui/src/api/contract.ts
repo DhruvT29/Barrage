@@ -220,7 +220,8 @@ export const messages = [
                 "sits out: it reaches the internet through the same connection as Wi-Fi, so using both gains nothing"
               ]
             }
-          ]
+          ],
+          "priority": "normal"
         },
         {
           "id": 2,
@@ -240,7 +241,8 @@ export const messages = [
               "wanted": 0,
               "notes": []
             }
-          ]
+          ],
+          "priority": "normal"
         },
         {
           "id": 3,
@@ -262,7 +264,8 @@ export const messages = [
                 "finding https://example.com/files/gone.zip through 192.0.2.10: https://example.com/files/gone.zip answered 404 Not Found"
               ]
             }
-          ]
+          ],
+          "priority": "normal"
         },
         {
           "id": 4,
@@ -273,7 +276,8 @@ export const messages = [
           "done": 0,
           "bps": 0,
           "note": null,
-          "cables": []
+          "cables": [],
+          "priority": "normal"
         },
         {
           "id": 5,
@@ -284,7 +288,8 @@ export const messages = [
           "done": 0,
           "bps": 0,
           "note": null,
-          "cables": []
+          "cables": [],
+          "priority": "normal"
         },
         {
           "id": 6,
@@ -312,7 +317,20 @@ export const messages = [
               "wanted": 0,
               "notes": []
             }
-          ]
+          ],
+          "priority": "normal"
+        },
+        {
+          "id": 9,
+          "url": "https://example.com/files/next.iso",
+          "name": "9.iso",
+          "state": "queued",
+          "length": 400000000,
+          "done": 0,
+          "bps": 0,
+          "note": null,
+          "cables": [],
+          "priority": "high"
         }
       ],
       "used": [
@@ -334,6 +352,20 @@ export const messages = [
     "torrents": {
       "list": [
         {
+          "id": 7,
+          "name": "queued.iso",
+          "info_hash": "9999999999999999999999999999999999999999",
+          "phase": "queued",
+          "length": 700000000,
+          "done": 350000000,
+          "down_bps": 0,
+          "up_bps": 0,
+          "peers": 0,
+          "note": null,
+          "cables": [],
+          "priority": "low"
+        },
+        {
           "id": 1,
           "name": null,
           "info_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -344,7 +376,8 @@ export const messages = [
           "up_bps": 0,
           "peers": 0,
           "note": null,
-          "cables": []
+          "cables": [],
+          "priority": "normal"
         },
         {
           "id": 2,
@@ -374,7 +407,8 @@ export const messages = [
               "connections": 4,
               "uploads": false
             }
-          ]
+          ],
+          "priority": "normal"
         },
         {
           "id": 3,
@@ -387,7 +421,8 @@ export const messages = [
           "up_bps": 0,
           "peers": 0,
           "note": null,
-          "cables": []
+          "cables": [],
+          "priority": "normal"
         },
         {
           "id": 4,
@@ -400,7 +435,8 @@ export const messages = [
           "up_bps": 0,
           "peers": 0,
           "note": null,
-          "cables": []
+          "cables": [],
+          "priority": "normal"
         },
         {
           "id": 5,
@@ -413,7 +449,8 @@ export const messages = [
           "up_bps": 0,
           "peers": 0,
           "note": "the disk is full",
-          "cables": []
+          "cables": [],
+          "priority": "normal"
         }
       ],
       "udp_cable": "Wi-Fi",
@@ -422,6 +459,28 @@ export const messages = [
         "cable": "Wi-Fi",
         "why": "no peer called in within 10 minutes; this PC cannot be reached from outside on Wi-Fi"
       }
+    }
+  },
+  {
+    "type": "queue",
+    "queue": {
+      "limit": 3,
+      "most": 20,
+      "holding": 3,
+      "places": [
+        {
+          "kind": "web",
+          "id": 9,
+          "place": 1
+        },
+        {
+          "kind": "torrent",
+          "id": 7,
+          "place": 2
+        }
+      ],
+      "notice": "The saved list could not be read, so the engine started with an empty one. It was kept as state.broken-1700000000.json.",
+      "used_since": 1700000000
     }
   },
   {

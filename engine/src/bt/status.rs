@@ -4,6 +4,7 @@
 use std::fmt;
 
 use super::listen::Listening;
+use crate::record::Priority;
 
 /// A torrent's id, from 1 in the order torrents were added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -18,6 +19,8 @@ impl TorrentId {
 /// Where a torrent is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentPhase {
+    /// In line for a place: no session has been told to run it.
+    Queued,
     /// Fetching its metadata (a magnet link), before its files are known.
     Finding,
     Downloading,
@@ -49,6 +52,9 @@ pub struct TorrentStatus {
     /// Why it failed, or what to know about it, in the engine's words.
     pub note: Option<String>,
     pub cables: Vec<TorrentCable>,
+    /// Its place in the order of adding, across downloads and torrents.
+    pub seq: u64,
+    pub priority: Priority,
 }
 
 /// One cable's part in a torrent.
@@ -78,10 +84,14 @@ pub struct Swarm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorrentControlError {
     NoSuchTorrent,
-    /// Stopping: it is not finding or downloading.
+    /// Stopping: it is not queued, finding or downloading.
     NotRunning,
     /// Resuming: it is not stopped.
     NotStopped,
+    /// Releasing: it is not queued.
+    NotQueued,
+    /// Changing a priority: it is done or has failed.
+    Finished,
 }
 
 impl fmt::Display for TorrentControlError {
@@ -90,6 +100,8 @@ impl fmt::Display for TorrentControlError {
             Self::NoSuchTorrent => f.write_str("no such torrent"),
             Self::NotRunning => f.write_str("it is not running, so there is nothing to stop"),
             Self::NotStopped => f.write_str("it is not stopped, so there is nothing to resume"),
+            Self::NotQueued => f.write_str("it is not queued, so there is nothing to start"),
+            Self::Finished => f.write_str("it has ended, so it has no place in line to change"),
         }
     }
 }

@@ -5,6 +5,7 @@
 //! its connections with it. Every peer is a local session on 127.0.0.1.
 
 mod fake;
+mod scratch;
 mod torrent;
 
 use std::net::SocketAddr;
@@ -75,6 +76,7 @@ async fn torrents(
         try_for: barrage::bt::listen::TRY_FOR,
         tick: ms(50),
         peers,
+        ..TorrentConfig::default()
     };
     let torrents = Torrents::start(links.table(), dir.clone(), Arc::clone(&usage), config)
         .await

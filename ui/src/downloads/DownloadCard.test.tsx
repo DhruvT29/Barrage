@@ -11,6 +11,7 @@ function cable(name: string, fields: Partial<CableShare> = {}): CableShare {
 
 function download(fields: Partial<DownloadView> = {}): DownloadView {
   return {
+    priority: 'normal',
     id: 4,
     url: 'https://example.com/releases/ubuntu.iso',
     name: 'ubuntu.iso',

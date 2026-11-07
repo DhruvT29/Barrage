@@ -16,6 +16,7 @@ function cable(name: string, fields: Partial<TorrentCableView> = {}): TorrentCab
 
 function torrent(fields: Partial<TorrentView> = {}): TorrentView {
   return {
+    priority: 'normal',
     id: 7,
     name: 'distro.iso',
     info_hash: HASH,

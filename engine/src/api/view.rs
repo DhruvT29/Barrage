@@ -14,6 +14,9 @@ use crate::bt::{Listening, Swarm, TorrentCable, TorrentPhase, TorrentStatus};
 use crate::fetch::{CableUse, DownloadStatus, LinkShare, Phase};
 use crate::links::render::{cable_speed, cables_in_order, changes, state_word};
 use crate::links::{Link, LinkState, shared_connections, shared_upstreams};
+use crate::queue::{MOST_LIMIT, QueueView};
+use crate::record::Priority;
+use crate::transfer::Key;
 
 /// One link: one address on one interface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -126,6 +129,8 @@ pub struct TorrentView {
     /// Why it failed, or what to know about it, in the engine's words.
     pub note: Option<String>,
     pub cables: Vec<TorrentCableView>,
+    /// "high", "normal" or "low".
+    pub priority: &'static str,
 }
 
 /// One cable's part in a torrent.
@@ -199,6 +204,35 @@ pub struct DownloadView {
     /// Why it failed, or what to know about it.
     pub note: Option<String>,
     pub cables: Vec<CableShare>,
+    /// "high", "normal" or "low".
+    pub priority: &'static str,
+}
+
+/// The line and the limit, on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueueWire {
+    /// How many run at once.
+    pub limit: u32,
+    /// The highest limit the engine takes.
+    pub most: u32,
+    /// How many hold a place now.
+    pub holding: u32,
+    /// The waiting transfers, in line.
+    pub places: Vec<PlaceView>,
+    /// What the user should know about the saved list, if anything.
+    pub notice: Option<String>,
+    /// When the data used was last zeroed, in Unix seconds.
+    pub used_since: u64,
+}
+
+/// One transfer's place in line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlaceView {
+    /// "web" or "torrent".
+    pub kind: &'static str,
+    pub id: u64,
+    /// From 1.
+    pub place: u32,
 }
 
 /// One cable's part in a download: its addresses' shares added up.
@@ -236,6 +270,9 @@ pub enum LiveMessage {
     },
     Torrents {
         torrents: TorrentsView,
+    },
+    Queue {
+        queue: QueueWire,
     },
 }
 
@@ -394,6 +431,40 @@ pub fn downloads_view(all: &[DownloadStatus], used: &[CableUse]) -> DownloadsVie
     }
 }
 
+pub fn queue_view(view: &QueueView) -> QueueWire {
+    QueueWire {
+        limit: view.limit,
+        most: MOST_LIMIT,
+        holding: view.holding,
+        places: view
+            .places
+            .iter()
+            .map(|(key, place)| match key {
+                Key::Web(id) => PlaceView {
+                    kind: "web",
+                    id: id.as_u64(),
+                    place: *place,
+                },
+                Key::Torrent(id) => PlaceView {
+                    kind: "torrent",
+                    id: id.as_u64(),
+                    place: *place,
+                },
+            })
+            .collect(),
+        notice: view.notice.clone(),
+        used_since: view.used_since,
+    }
+}
+
+fn priority_word(priority: Priority) -> &'static str {
+    match priority {
+        Priority::High => "high",
+        Priority::Normal => "normal",
+        Priority::Low => "low",
+    }
+}
+
 pub fn torrents_view(all: &[TorrentStatus], swarm: &Swarm) -> TorrentsView {
     TorrentsView {
         list: all.iter().map(torrent_view).collect(),
@@ -415,6 +486,7 @@ fn torrent_view(status: &TorrentStatus) -> TorrentView {
         peers: status.peers,
         note: status.note.clone(),
         cables: status.cables.iter().map(torrent_cable_view).collect(),
+        priority: priority_word(status.priority),
     }
 }
 
@@ -431,6 +503,7 @@ fn torrent_cable_view(cable: &TorrentCable) -> TorrentCableView {
 
 fn torrent_phase_word(phase: TorrentPhase) -> &'static str {
     match phase {
+        TorrentPhase::Queued => "queued",
         TorrentPhase::Finding => "finding",
         TorrentPhase::Downloading => "downloading",
         TorrentPhase::Done => "done",
@@ -471,11 +544,13 @@ fn download_view(status: &DownloadStatus) -> DownloadView {
         bps: status.bps,
         note: status.note.clone(),
         cables: cable_shares(&status.links),
+        priority: priority_word(status.priority),
     }
 }
 
 fn phase_word(phase: Phase) -> &'static str {
     match phase {
+        Phase::Queued => "queued",
         Phase::Starting => "starting",
         Phase::Waiting => "waiting",
         Phase::Downloading => "downloading",
@@ -531,6 +606,7 @@ mod tests {
     use crate::links::model::{Addr, LinkId};
     use crate::links::render::changes;
     use crate::links::{Link, LinkState};
+    use crate::record::Priority;
 
     fn link(id: u64, name: &str, addr: &str, state: LinkState) -> Link {
         Link {
@@ -987,6 +1063,8 @@ mod tests {
     /// A download whose totals are its links' shares, as the engine sends.
     fn download(id: u64, phase: Phase, links: Vec<LinkShare>) -> DownloadStatus {
         DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(id),
             url: format!("https://example.com/{id}.iso"),
             name: Some(format!("{id}.iso")),
@@ -1225,6 +1303,8 @@ mod tests {
     #[test]
     fn a_download_becomes_the_json_the_ui_reads() {
         let starting = DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(7),
             url: "https://example.com/a.iso".to_string(),
             name: None,
@@ -1248,12 +1328,13 @@ mod tests {
                     {
                         "id": 7, "url": "https://example.com/a.iso", "name": null,
                         "state": "starting", "length": null, "done": 0, "bps": 0,
-                        "note": null, "cables": []
+                        "note": null, "cables": [], "priority": "normal"
                     },
                     {
                         "id": 8, "url": "https://example.com/8.iso", "name": "8.iso",
                         "state": "done", "length": 400000000, "done": 400000000, "bps": 0,
                         "note": null,
+                        "priority": "normal",
                         "cables": [{
                             "name": "Wi-Fi", "bytes": 400000000, "bps": 0,
                             "connections": 0, "wanted": 0, "notes": []
@@ -1267,6 +1348,8 @@ mod tests {
 
     fn torrent(id: u64, phase: TorrentPhase) -> TorrentStatus {
         TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             id: TorrentId(id),
             name: Some("debian-13.iso".to_string()),
             info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1530,6 +1613,8 @@ mod tests {
         (failed.name, failed.length, failed.note) = (None, None, Some(not_found.clone()));
 
         let waiting = DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(4),
             url: "https://example.com/files/notes.pdf".to_string(),
             name: None,
@@ -1541,6 +1626,8 @@ mod tests {
             note: None,
         };
         let starting = DownloadStatus {
+            seq: 0,
+            priority: Priority::default(),
             id: DownloadId::new(5),
             url: "https://example.com/files/video.mp4".to_string(),
             phase: Phase::Starting,
@@ -1559,13 +1646,44 @@ mod tests {
         stopped.name = Some("installer.exe".to_string());
         stopped.length = Some(1_302_200_000);
         stopped.note = Some("stopped; resuming carries on from here".to_string());
-        vec![downloading, done, failed, waiting, starting, stopped]
+        let queued = DownloadStatus {
+            url: "https://example.com/files/next.iso".to_string(),
+            priority: Priority::High,
+            ..download(9, Phase::Queued, vec![])
+        };
+        vec![
+            downloading,
+            done,
+            failed,
+            waiting,
+            starting,
+            stopped,
+            queued,
+        ]
     }
 
     /// What the sample's cables received: a little over what they wrote, as
     /// bytes past a cut count.
     /// One torrent in each phase: a cable that may not upload, and the port
     /// closed, which has the most to say.
+    /// A transfer of each kind in line, and a notice.
+    fn contract_queue() -> QueueWire {
+        queue_view(&QueueView {
+            limit: 3,
+            holding: 3,
+            places: vec![
+                (Key::Web(DownloadId::new(9)), 1),
+                (Key::Torrent(TorrentId(7)), 2),
+            ],
+            notice: Some(
+                "The saved list could not be read, so the engine started with an empty one. It \
+                 was kept as state.broken-1700000000.json."
+                    .to_string(),
+            ),
+            used_since: 1_700_000_000,
+        })
+    }
+
     fn contract_torrents() -> (Vec<TorrentStatus>, Swarm) {
         let hash = |c: &str| c.repeat(40);
         let cable = |name: &str, received, sent, bps, connections, uploads| TorrentCable {
@@ -1577,13 +1695,23 @@ mod tests {
             uploads,
         };
         let finding = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: None,
             info_hash: hash("a"),
             length: None,
             done: 0,
             ..torrent(1, TorrentPhase::Finding)
         };
+        let queued = TorrentStatus {
+            name: Some("queued.iso".to_string()),
+            info_hash: hash("9"),
+            priority: Priority::Low,
+            ..torrent(7, TorrentPhase::Queued)
+        };
         let downloading = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("linux-mint-22.iso".to_string()),
             info_hash: hash("b"),
             down_bps: 48_000_000,
@@ -1596,17 +1724,23 @@ mod tests {
             ..torrent(2, TorrentPhase::Downloading)
         };
         let done = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("fedora-41.iso".to_string()),
             info_hash: hash("c"),
             done: 700_000_000,
             ..torrent(3, TorrentPhase::Done)
         };
         let stopped = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("open-movie.mkv".to_string()),
             info_hash: hash("d"),
             ..torrent(4, TorrentPhase::Stopped)
         };
         let failed = TorrentStatus {
+            seq: 0,
+            priority: crate::record::Priority::default(),
             name: Some("archive.tar".to_string()),
             info_hash: hash("e"),
             note: Some("the disk is full".to_string()),
@@ -1621,7 +1755,10 @@ mod tests {
                     .to_string(),
             },
         };
-        (vec![finding, downloading, done, stopped, failed], swarm)
+        (
+            vec![queued, finding, downloading, done, stopped, failed],
+            swarm,
+        )
     }
 
     fn contract_used() -> Vec<CableUse> {
@@ -1655,6 +1792,9 @@ mod tests {
             },
             LiveMessage::Torrents {
                 torrents: torrents_view(&list, &swarm),
+            },
+            LiveMessage::Queue {
+                queue: contract_queue(),
             },
             change_message(&before, &after),
         ];

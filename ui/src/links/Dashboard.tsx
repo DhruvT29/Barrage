@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 
 import { EMPTY_HISTORY, type SpeedHistory } from '../api/history'
 import type { FeedLine, Status } from '../api/useLive'
-import type { DownloadsView, TableView, TorrentsView } from '../api/types'
+import type { DownloadsView, QueueView, TableView, TorrentsView } from '../api/types'
 import { TransferQueue } from '../downloads/TransferQueue'
 import { AddModal } from '../overview/AddModal'
 import { Hero } from '../overview/Hero'
@@ -19,6 +19,7 @@ export type PageProps = {
   feed: FeedLine[]
   downloads: DownloadsView | null
   torrents?: TorrentsView | null
+  queue?: QueueView | null
   history: SpeedHistory
   /** Each cable's colour by name, in the table's order (palette.ts). */
   colors: Record<string, string>
@@ -37,6 +38,7 @@ export function Dashboard({
   feed,
   downloads,
   torrents = null,
+  queue = null,
   history = EMPTY_HISTORY,
   tab,
   onTab,
@@ -50,7 +52,7 @@ export function Dashboard({
 
   // Disconnected with a table: the last one stays, dimmed, so it reads as old.
   const stale = status === 'disconnected' && table !== null
-  const page: PageProps = { status, table, feed, downloads, torrents, history, colors }
+  const page: PageProps = { status, table, feed, downloads, torrents, queue, history, colors }
 
   return (
     <>

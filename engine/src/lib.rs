@@ -14,8 +14,15 @@
 pub mod api;
 pub mod bt;
 pub mod fetch;
+pub mod keeper;
 pub mod links;
 pub mod logging;
+pub mod queue;
+pub mod record;
 pub mod transfer;
 
 pub use links::LinkHandle;
+
+#[cfg(test)]
+#[path = "../tests/scratch/mod.rs"]
+mod scratch;
