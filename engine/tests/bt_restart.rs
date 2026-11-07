@@ -723,3 +723,69 @@ async fn an_engine_that_did_not_close_has_its_torrents_checked_in_full() {
     assert!(bitfield.exists(), "after a normal close it is kept");
     again.close().await;
 }
+
+/// A torrent's pieces reach the disk when its engine shuts the torrents
+/// down. An engine that closed without doing so did not end cleanly.
+#[tokio::test]
+async fn a_close_that_skips_the_torrents_leaves_the_marker() {
+    let seeds = quick_seeds("r-unsynced").await;
+    let cables = one_cable().await;
+    let (state, dir) = (fresh_dir("r-unsynced-state"), fresh_dir("r-unsynced"));
+
+    let first = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    let id = first
+        .torrents
+        .add(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+    wait_for(&first.torrents, id, 30, "done", |t| {
+        t.phase == TorrentPhase::Done
+    })
+    .await;
+    let ran = first.keeper.running();
+    first.downloads.shutdown().await;
+    first.keeper.finish(&ran);
+    assert!(state.join("running").exists(), "the marker was taken up");
+    first.torrents.shutdown().await;
+
+    let next = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    next.close().await;
+    assert!(
+        !state.join("running").exists(),
+        "a normal close takes it up"
+    );
+}
+
+/// A finished torrent's row says done only once its files are synced, and a
+/// normal close syncs them, so it comes back done.
+#[tokio::test]
+async fn a_finished_torrent_is_saved_done_once_its_files_are_synced() {
+    let seeds = quick_seeds("r-synced").await;
+    let cables = one_cable().await;
+    let (state, dir) = (fresh_dir("r-synced-state"), fresh_dir("r-synced"));
+
+    let first = open(&cables, &state, &dir, seeds.addrs.clone()).await;
+    let id = first
+        .torrents
+        .add(Source::File(seeds.torrent.clone()))
+        .await
+        .unwrap();
+    wait_for(&first.torrents, id, 30, "done", |t| {
+        t.phase == TorrentPhase::Done
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = first_saved(&state);
+        if row.as_ref().is_some_and(|r| r["state"] == "done") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never saved done: {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    first.close().await;
+    assert_eq!(first_saved(&state).unwrap()["state"], "done");
+}

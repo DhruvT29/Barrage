@@ -297,6 +297,8 @@ struct Member {
     note: Option<String>,
     /// Its speed in this download, from `written`.
     rate: Rate,
+    /// The speed the page was last shown for it (`publish`).
+    shown_bps: u64,
     /// Since when it has had a speed: once for a `rebalance_every`, what it
     /// carries weighs its path rather than its speed test.
     carrying_since: Option<Instant>,
@@ -717,6 +719,7 @@ impl Download {
                         stop: watch::channel(false).0,
                         note: None,
                         rate: Rate::default(),
+                        shown_bps: 0,
                         carrying_since: None,
                         target: 0,
                         wanted: 0,
@@ -1833,9 +1836,36 @@ impl Download {
         self.members.iter_mut().find(|m| m.id == link)
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
         let phase = self.phase();
         let moving = phase == Phase::Downloading;
+        // Its speed, or while that starts afresh (`start_afresh`), what its
+        // connections each carry, so the page does not show it stopped for
+        // the moment the scheduler forgets. Trusted again, its connections
+        // can all be too new to have a speed: the last figure stands until
+        // one has, for as long as it holds any.
+        let seen: Vec<Option<u64>> = self
+            .members
+            .iter()
+            .map(|m| {
+                m.rate.bps().or_else(|| {
+                    let each: Vec<u64> = self
+                        .seats
+                        .values()
+                        .filter(|s| s.link == m.id)
+                        .filter_map(|s| s.rate.bps())
+                        .collect();
+                    (!each.is_empty()).then(|| each.iter().sum())
+                })
+            })
+            .collect();
+        for (m, seen) in self.members.iter_mut().zip(seen) {
+            m.shown_bps = match seen {
+                Some(bps) => bps,
+                None if m.workers > 0 => m.shown_bps,
+                None => 0,
+            };
+        }
         let links: Vec<LinkShare> = self
             .members
             .iter()
@@ -1843,20 +1873,7 @@ impl Download {
                 link: m.id,
                 name: m.name.clone(),
                 bytes: m.written.load(Ordering::SeqCst),
-                // Its speed, or while that starts afresh (`start_afresh`),
-                // what its connections each carry, so the page does not
-                // show it stopped for the moment the scheduler forgets.
-                bps: if moving {
-                    m.rate.bps().unwrap_or_else(|| {
-                        self.seats
-                            .values()
-                            .filter(|s| s.link == m.id)
-                            .filter_map(|s| s.rate.bps())
-                            .sum()
-                    })
-                } else {
-                    0
-                },
+                bps: if moving { m.shown_bps } else { 0 },
                 connections: m.workers,
                 wanted: m.wanted,
                 note: m.note.clone(),

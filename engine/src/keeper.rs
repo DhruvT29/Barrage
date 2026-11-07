@@ -98,7 +98,13 @@ impl Keeper {
             if let Err(e) = store.save(&record) {
                 tracing::warn!("the saved list could not be saved at the end: {e}");
             }
-            store.close();
+            if self.inner.engines.torrents.on_disk() {
+                store.close();
+            } else {
+                tracing::warn!(
+                    "the torrents' files are not all synced: the next start checks them"
+                );
+            }
         }
     }
 
