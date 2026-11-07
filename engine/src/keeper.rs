@@ -94,10 +94,11 @@ impl Keeper {
                 kept.state = KeptState::Run;
             }
         }
-        if let Some(store) = self.inner.store.lock().unwrap().take()
-            && let Err(e) = store.save(&record)
-        {
-            tracing::warn!("the saved list could not be saved at the end: {e}");
+        if let Some(store) = self.inner.store.lock().unwrap().take() {
+            if let Err(e) = store.save(&record) {
+                tracing::warn!("the saved list could not be saved at the end: {e}");
+            }
+            store.close();
         }
     }
 

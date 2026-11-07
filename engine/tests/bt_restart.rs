@@ -654,3 +654,29 @@ async fn a_failed_torrent_can_be_removed_and_added_again() {
     })
     .await;
 }
+
+/// The fork never syncs pieces, so after a kill or a power cut its saved
+/// bitfield may be ahead of the disk: the next engine drops it.
+#[tokio::test]
+async fn an_engine_that_did_not_close_has_its_torrents_checked_in_full() {
+    let cables = one_cable().await;
+    let (state, dir) = (fresh_dir("r-unclean-state"), fresh_dir("r-unclean"));
+    let hash = "ab".repeat(20);
+    left_behind(
+        &state,
+        vec![row(1, &hash, dir.clone(), KeptState::Stopped, None)],
+    );
+    let bitfield = state.join("resume").join(format!("{hash}.bitv"));
+    std::fs::create_dir_all(bitfield.parent().unwrap()).unwrap();
+    std::fs::write(&bitfield, [0xff]).unwrap();
+
+    // left_behind dropped its store without closing it.
+    let next = open(&cables, &state, &dir, Vec::new()).await;
+    assert!(!bitfield.exists(), "the saved bitfield was trusted");
+    next.close().await;
+
+    std::fs::write(&bitfield, [0xff]).unwrap();
+    let again = open(&cables, &state, &dir, Vec::new()).await;
+    assert!(bitfield.exists(), "after a normal close it is kept");
+    again.close().await;
+}

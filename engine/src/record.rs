@@ -15,6 +15,14 @@
 //! the lock however a program ends, so a killed engine never blocks the next,
 //! and a second engine on one folder stops at the start rather than the two
 //! writing over each other.
+//!
+//! `running` is put down at the start and taken up by [`Store::close`], so
+//! finding it at the start means the last engine did not end cleanly. The
+//! fork flushes a torrent's saved bitfield every two seconds but never syncs
+//! the pieces, so after a power cut or a crash the bitfield can name pieces
+//! that never reached the disk. Then the bitfield of each torrent still to
+//! run is deleted, and its session checks every piece. A killed engine
+//! counts too: the marker cannot tell it from a power cut.
 
 use std::fs::{self, File};
 use std::io;
@@ -24,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+use crate::bt::fastresume_file;
 use crate::fetch::replace;
 
 /// The record this engine writes, and the newest it can read.
@@ -34,6 +43,7 @@ pub const DEFAULT_LIMIT: u32 = 3;
 
 const FILE: &str = "state.json";
 const LOCK: &str = "state.lock";
+const RUNNING: &str = "running";
 
 /// Who goes next: high first, then the earliest added.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -145,6 +155,8 @@ pub struct Store {
     path: PathBuf,
     /// Keeps `state.lock` locked; dropping it lets the next engine in.
     _lock: File,
+    /// Whether `running` was there at the start.
+    unclean: bool,
 }
 
 impl Store {
@@ -171,7 +183,37 @@ impl Store {
         })?;
         let path = dir.join(FILE);
         let (record, note) = read(&path)?;
-        Ok((Store { path, _lock: lock }, record, note))
+        let unclean = dir.join(RUNNING).exists();
+        if unclean {
+            forget_saved_bitfields(dir, &record);
+        }
+        mark_running(&dir.join(RUNNING))
+            .with_context(|| format!("cannot use the state folder {}", dir.display()))?;
+        Ok((
+            Store {
+                path,
+                _lock: lock,
+                unclean,
+            },
+            record,
+            note,
+        ))
+    }
+
+    /// Whether the engine before this one did not end cleanly. The saved
+    /// bitfields of the torrents still to run have been deleted if so.
+    pub fn after_unclean_end(&self) -> bool {
+        self.unclean
+    }
+
+    /// The engine has stopped: the next one finds no sign of a bad end. Call
+    /// it after the torrents have shut down.
+    pub fn close(self) {
+        if let Err(e) = fs::remove_file(self.folder().join(RUNNING))
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!("cannot take up the running marker: {e}");
+        }
     }
 
     /// Replace the record with `record`, whole.
@@ -183,6 +225,28 @@ impl Store {
     /// The folder this store holds.
     pub fn folder(&self) -> &Path {
         self.path.parent().expect("the record is in a folder")
+    }
+}
+
+/// Put `running` down and sync it, so it is on the disk before any download
+/// starts.
+fn mark_running(path: &Path) -> io::Result<()> {
+    let file = File::create(path)?;
+    file.sync_all()
+}
+
+/// Delete the saved bitfield of each torrent in `record` that will be given
+/// to a session again: one to run, or stopped. A done torrent is never given
+/// to one, so its pieces are not checked either way, and a failed one is
+/// removed or added again by the user, which clears its bitfield.
+fn forget_saved_bitfields(dir: &Path, record: &Record) {
+    for kept in &record.transfers {
+        if let What::Torrent { info_hash, .. } = &kept.what
+            && matches!(kept.state, KeptState::Run | KeptState::Stopped)
+            && let Some(bitfield) = fastresume_file(dir, info_hash)
+        {
+            let _ = fs::remove_file(bitfield);
+        }
     }
 }
 
@@ -311,7 +375,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(names.len(), 2, "the record and its lock: {names:?}");
+        assert_eq!(
+            names.len(),
+            3,
+            "the record, its lock and the marker: {names:?}"
+        );
     }
 
     #[test]
@@ -433,5 +501,110 @@ mod tests {
         assert!(refused.contains(&dir.display().to_string()), "{refused}");
         drop(first);
         Store::open(&dir).expect("free again once the first has gone");
+    }
+
+    /// A torrent's row, with the fast resume file it would have on disk.
+    fn with_resume(dir: &Path, id: u64, state: KeptState) -> (Kept, PathBuf) {
+        let hash = format!("{id:02x}").repeat(20);
+        let file = dir.join("resume").join(format!("{hash}.bitv"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, [0xff]).unwrap();
+        let kept = Kept {
+            seq: id,
+            priority: Priority::Normal,
+            state,
+            dir: PathBuf::from("D:/Downloads"),
+            name: None,
+            length: None,
+            done: 0,
+            note: None,
+            what: What::Torrent {
+                id,
+                info_hash: hash,
+                magnet: None,
+                output: None,
+            },
+        };
+        (kept, file)
+    }
+
+    #[test]
+    fn after_an_unclean_end_the_fast_resume_data_of_torrents_still_to_run_goes() {
+        let dir = folder("unclean");
+        let (store, _, _) = Store::open(&dir).unwrap();
+        let (run, run_file) = with_resume(&dir, 1, KeptState::Run);
+        let (stopped, stopped_file) = with_resume(&dir, 2, KeptState::Stopped);
+        let (done, done_file) = with_resume(&dir, 3, KeptState::Done);
+        store
+            .save(&Record {
+                transfers: vec![run, stopped, done],
+                ..Record::default()
+            })
+            .unwrap();
+        // Not closed: the engine was killed, or the machine lost power.
+        drop(store);
+
+        let (store, _, _) = Store::open(&dir).unwrap();
+
+        assert!(store.after_unclean_end());
+        assert!(!run_file.exists(), "a running torrent is checked in full");
+        assert!(!stopped_file.exists(), "and so is a stopped one");
+        assert!(
+            done_file.exists(),
+            "a done torrent is never given to a session"
+        );
+    }
+
+    #[test]
+    fn after_a_clean_end_the_fast_resume_data_stays() {
+        let dir = folder("clean");
+        let (store, _, _) = Store::open(&dir).unwrap();
+        let (run, run_file) = with_resume(&dir, 1, KeptState::Run);
+        store
+            .save(&Record {
+                transfers: vec![run],
+                ..Record::default()
+            })
+            .unwrap();
+        store.close();
+
+        let (store, _, _) = Store::open(&dir).unwrap();
+
+        assert!(!store.after_unclean_end());
+        assert!(run_file.exists());
+    }
+
+    #[test]
+    fn a_new_folder_is_not_an_unclean_end() {
+        let dir = folder("new-folder");
+
+        let (store, _, _) = Store::open(&dir).unwrap();
+
+        assert!(!store.after_unclean_end());
+        assert!(dir.join("running").exists(), "the marker is down at once");
+    }
+
+    #[test]
+    fn a_hash_that_is_not_a_hash_deletes_nothing_outside_the_resume_folder() {
+        let dir = folder("bad-hash");
+        let (store, _, _) = Store::open(&dir).unwrap();
+        let (mut run, _) = with_resume(&dir, 1, KeptState::Run);
+        if let What::Torrent { info_hash, .. } = &mut run.what {
+            *info_hash = "../outside".into();
+        }
+        let outside = dir.join("outside.bitv");
+        fs::write(&outside, [0xff]).unwrap();
+        store
+            .save(&Record {
+                transfers: vec![run],
+                ..Record::default()
+            })
+            .unwrap();
+        drop(store);
+
+        let (store, _, _) = Store::open(&dir).unwrap();
+
+        assert!(store.after_unclean_end());
+        assert!(outside.exists(), "a file outside resume was deleted");
     }
 }

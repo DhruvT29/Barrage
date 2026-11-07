@@ -394,7 +394,7 @@ fn session_options(
         udp_bind_ip: Some(place.map_or(NO_CABLE, |on| on.ip)),
         disable_local_service_discovery: true,
         fastresume: false,
-        fastresume_folder: config.state.as_ref().map(|state| state.join("resume")),
+        fastresume_folder: config.state.as_deref().map(fastresume_folder),
         persistence: None,
         listen: place.filter(|on| on.listening).map(|on| ListenerOptions {
             mode: ListenerMode::TcpAndUtp,
@@ -687,6 +687,19 @@ fn torrent_file(state: &Path, hash: &str) -> PathBuf {
     state.join("torrents").join(format!("{hash}.torrent"))
 }
 
+/// Where the fork keeps the fast resume data of every torrent in `state`.
+pub(crate) fn fastresume_folder(state: &Path) -> PathBuf {
+    state.join("resume")
+}
+
+/// Where the fork keeps the saved bitfield of the torrent named `hash`, or
+/// `None` if `hash` is not 40 hex digits: the record is a file anyone can
+/// edit, and a name with `..` or a drive in it must not reach outside.
+pub(crate) fn fastresume_file(state: &Path, hash: &str) -> Option<PathBuf> {
+    let plain = hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    plain.then(|| fastresume_folder(state).join(format!("{hash}.bitv")))
+}
+
 /// The phase of a torrent its session is not running, from what the user
 /// asked.
 fn phase_asked(wanted: Wanted) -> TorrentPhase {
@@ -846,8 +859,9 @@ impl TransferEngine for Torrents {
         }
         if let Some(state) = inner.config.state.as_deref() {
             let _ = std::fs::remove_file(torrent_file(state, &entry.info_hash));
-            let bitfield = format!("{}.bitv", entry.info_hash);
-            let _ = std::fs::remove_file(state.join("resume").join(bitfield));
+            if let Some(bitfield) = fastresume_file(state, &entry.info_hash) {
+                let _ = std::fs::remove_file(bitfield);
+            }
         }
         inner.publish().await;
         Ok(())

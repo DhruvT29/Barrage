@@ -16,4 +16,5 @@ pub use source::{Source, TorrentAddError};
 pub use status::{
     Swarm, TorrentCable, TorrentControlError, TorrentId, TorrentPhase, TorrentStatus,
 };
+pub(crate) use torrents::fastresume_file;
 pub use torrents::{TorrentConfig, Torrents};
