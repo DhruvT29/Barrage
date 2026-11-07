@@ -226,6 +226,10 @@ async fn a_torrent_cut_by_a_restart_finishes_every_piece_checked() {
     })
     .await;
     let received = first.received();
+    assert!(
+        received >= LEN as u64 / 4,
+        "a quarter had arrived before the close, not only been read: {received}"
+    );
     first.close().await;
 
     let next = open(&cables, &state, &dir, seeds.addrs.clone()).await;

@@ -335,3 +335,50 @@ async fn multi_file_torrents_keep_to_a_folder_of_their_own() {
         "loose in the download folder"
     );
 }
+
+/// What a torrent has done is what has passed its piece's check, never how
+/// far the check has read. A file of the right length already in the folder,
+/// all wrong, is read in full, and the torrent has nothing until a peer sends
+/// it. On a runtime of many threads, as the engine's, the status is published
+/// while the check reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_a_file_already_there_is_not_progress() {
+    // No seed: nothing can arrive, so anything shown done is wrong.
+    let len = 64 << 20;
+    let made = seeds_with("t-check", 0, &pattern(len), 64 << 10, || {
+        listening_on("127.0.0.1")
+    })
+    .await;
+    let cables = one_cable().await;
+    let dir = fresh_dir("t-check-leech");
+    std::fs::write(dir.join(FILE), vec![0u8; len]).unwrap();
+    // Published every millisecond, so the check cannot slip between two.
+    let config = TorrentConfig {
+        network: false,
+        listen: false,
+        tick: Duration::from_millis(1),
+        ..TorrentConfig::default()
+    };
+    let usage = Usage::counting_speed_tests(cables.table());
+    let torrents = Torrents::start(cables.table(), dir, usage, config)
+        .await
+        .unwrap();
+    let mut shown = torrents.status();
+
+    let id = torrents
+        .add(Source::File(made.torrent.clone()))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut seen = 0;
+    while tokio::time::timeout_at(deadline, shown.changed())
+        .await
+        .is_ok()
+    {
+        let now = status(&torrents, id);
+        assert_eq!(now.done, 0, "nothing has arrived: {now:?}");
+        seen += 1;
+    }
+    assert!(seen > 0, "its status was never published");
+    torrents.shutdown().await;
+}

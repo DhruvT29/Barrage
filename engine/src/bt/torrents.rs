@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig,
-    ListenerMode, ListenerOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
+    ListenerMode, ListenerOptions, ManagedTorrent, Session, SessionOptions, TorrentStats,
+    TorrentStatsState,
 };
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -608,7 +609,7 @@ impl Inner {
                     e.name = handle.name().or(e.name.take());
                     e.kept = Some(Kept {
                         length: Some(stats.total_bytes),
-                        done: stats.progress_bytes.max(e.kept.map_or(0, |k| k.done)),
+                        done: have(&stats).max(e.kept.map_or(0, |k| k.done)),
                     });
                     if let Ok(bytes) = handle.with_metadata(|m| m.torrent_bytes.to_vec()) {
                         e.source = Source::File(bytes);
@@ -701,6 +702,16 @@ pub(crate) fn fastresume_file(state: &Path, hash: &str) -> Option<PathBuf> {
     plain.then(|| fastresume_folder(state).join(format!("{hash}.bitv")))
 }
 
+/// The bytes a torrent has, checked. While librqbit checks its files, its
+/// progress is how far the check has read, right or wrong, so none are known
+/// yet: what it had before (`Kept`) shows meanwhile.
+fn have(stats: &TorrentStats) -> u64 {
+    match stats.state {
+        TorrentStatsState::Initializing { .. } => 0,
+        _ => stats.progress_bytes,
+    }
+}
+
 /// The phase of a torrent its session is not running, from what the user
 /// asked.
 fn phase_asked(wanted: Wanted) -> TorrentPhase {
@@ -744,7 +755,7 @@ fn status_of(entry: &Entry, cables: Vec<TorrentCable>) -> TorrentStatus {
     let stats = handle.stats();
     status.name = handle.name().or(status.name);
     status.length = Some(stats.total_bytes);
-    status.done = stats.progress_bytes.max(status.done);
+    status.done = have(&stats).max(status.done);
     if let Some(error) = stats.error {
         status.phase = TorrentPhase::Failed;
         status.note = Some(error);
