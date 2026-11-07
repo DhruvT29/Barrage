@@ -20,9 +20,11 @@
                     a sample, so this starts an engine with an empty state
                     folder over the same files: done, with nothing fetched,
                     means every piece passed.
-      Resume        -LongTorrent, large and part-fetched, killed and started
-                    again: how long it takes to come back, beside how long a
-                    full check of it takes.
+      Resume        -LongTorrent, large and part-fetched, stopped cleanly and
+                    started again: how long it takes to come back, beside how
+                    long a full check of it takes. Stopped cleanly because a
+                    kill leaves the running marker, and the next start then
+                    deletes the bitfield and does a full check.
       Damaged       No network: state.json overwritten with rubbish. The engine
                     starts with an empty list, keeps the file aside, and the
                     page says so.
@@ -317,8 +319,11 @@ function Test-Resume {
         $t = @(Get-Swarm)[-1]
         $t.length -gt 0 -and $t.done / $t.length -gt 0.3
     } | Out-Null
-    Stop-Engine $script:Proc
-    $script:Proc.WaitForExit()
+    # Closed cleanly: a kill leaves the running marker, so the next start
+    # would delete the bitfield and check every piece.
+    if ($Unattended) { Send-CtrlC $script:Proc.Id }
+    else { Write-Output "   Press Ctrl+C in the engine's window now." }
+    Wait-For "the engine closing" { $script:Proc.HasExited } 300 | Out-Null
     $started = Get-Date
     $script:Proc = Start-Engine
     Wait-For "it back and running" {
@@ -339,7 +344,7 @@ function Test-Resume {
         $t -and $t.phase -eq "downloading" -and $t.peers -gt 0
     } | Out-Null
     $full = [int]((Get-Date) - $started).TotalSeconds
-    Write-Output "   Back in $back s with fast resume; $full s with a full check."
+    Write-Output "   Back in $back s with fast resume (after a clean stop); $full s with a full check."
 }
 
 function Test-Damaged {
@@ -365,7 +370,7 @@ try {
         CleanRestart = "keep transfers mid-way; you will press Ctrl+C in the engine's window."
         Kill         = "keep transfers mid-way; the engine is killed outright."
         Check        = "this waits for everything to finish, then checks every file."
-        Resume       = "a large torrent is fetched to 30%, killed, and timed coming back."
+        Resume       = "a large torrent is fetched to 30%, stopped cleanly with Ctrl+C, and timed coming back."
         Damaged      = "no network needed: the saved list is overwritten with rubbish."
     }
     foreach ($row in $Rows) {
