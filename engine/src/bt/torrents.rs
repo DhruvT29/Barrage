@@ -136,6 +136,10 @@ struct Entry {
     kept: Option<Kept>,
     wanted: Wanted,
     failed: Option<String>,
+    /// Finished, but its files not yet synced to the disk: until they are,
+    /// it is saved as still to run, so a power cut meanwhile brings it back
+    /// to be checked rather than done with pieces the disk never got.
+    unsynced: bool,
 }
 
 struct Inner {
@@ -157,6 +161,9 @@ struct Inner {
     connector: Arc<Connector>,
     /// Data used, shared with the downloads.
     usage: Arc<Usage>,
+    /// Set once the torrents have shut down and every file they wrote is
+    /// synced to the disk.
+    synced: AtomicBool,
 }
 
 #[derive(Default)]
@@ -227,6 +234,7 @@ impl Torrents {
                 table,
                 connector,
                 usage,
+                synced: AtomicBool::new(false),
             }),
         };
         let ticking = Arc::downgrade(&torrents.inner);
@@ -322,6 +330,7 @@ impl Torrents {
                     _ if lost => Some(LOST_FILE.to_string()),
                     _ => None,
                 },
+                unsynced: false,
             });
         }
         inner.publish().await;
@@ -337,12 +346,7 @@ impl Torrents {
                 Some(record::Kept {
                     seq: e.seq,
                     priority: e.priority,
-                    state: match (s.phase, e.wanted) {
-                        (TorrentPhase::Failed, _) => KeptState::Failed,
-                        (_, Wanted::Stopped) => KeptState::Stopped,
-                        (TorrentPhase::Done, _) | (_, Wanted::Done) => KeptState::Done,
-                        _ => KeptState::Run,
-                    },
+                    state: kept_state(s.phase, e.wanted, e.unsynced),
                     dir: e.dir.clone(),
                     name: s.name.clone(),
                     length: s.length,
@@ -360,6 +364,21 @@ impl Torrents {
                 })
             })
             .collect()
+    }
+
+    /// Whether every file the torrents wrote is on the disk: they have shut
+    /// down and been synced, or none was ever given to a session. Until
+    /// then a clean end cannot be claimed, since a saved bitfield may name
+    /// pieces only in Windows' cache.
+    pub fn on_disk(&self) -> bool {
+        self.inner.synced.load(Ordering::SeqCst)
+            || self
+                .inner
+                .list
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e.handle.is_none())
     }
 
     /// The highest id given so far.
@@ -633,9 +652,62 @@ impl Inner {
         }
     }
 
+    /// Sync the files of torrent `id`, just finished, so it can be saved
+    /// done. If they cannot be, it stays saved as still to run, and shutting
+    /// down tries again.
+    async fn sync_finished(self: Arc<Self>, id: TorrentId, handle: Arc<ManagedTorrent>) {
+        let Some((folder, files)) = files_of(&handle) else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || sync_files(&folder, &files)).await {
+            Ok(Ok(())) => {
+                self.entry(id, |e| e.unsynced = false);
+            }
+            Ok(Err(e)) => tracing::warn!("torrent {}: cannot sync its files: {e}", id.as_u64()),
+            Err(e) => tracing::warn!("torrent {}: syncing its files stopped: {e}", id.as_u64()),
+        }
+    }
+
+    /// Sync the files of every torrent given to a session, once it has
+    /// stopped, so a clean stop leaves no piece only in Windows' cache.
+    async fn sync_all(&self) {
+        let given: Vec<(TorrentId, PathBuf, Vec<PathBuf>)> = {
+            let list = self.list.lock().unwrap();
+            list.iter()
+                .filter_map(|e| {
+                    let (folder, files) = files_of(e.handle.as_ref()?)?;
+                    Some((e.id, folder, files))
+                })
+                .collect()
+        };
+        let syncing = tokio::task::spawn_blocking(move || {
+            let mut synced = Vec::new();
+            let mut all = true;
+            for (id, folder, files) in given {
+                match sync_files(&folder, &files) {
+                    Ok(()) => synced.push(id),
+                    Err(e) => {
+                        tracing::warn!("torrent {}: cannot sync its files: {e}", id.as_u64());
+                        all = false;
+                    }
+                }
+            }
+            (synced, all)
+        });
+        let Ok((synced, all)) = syncing.await else {
+            return;
+        };
+        for e in self.list.lock().unwrap().iter_mut() {
+            if synced.contains(&e.id) {
+                e.unsynced = false;
+            }
+        }
+        self.synced.store(all, Ordering::SeqCst);
+    }
+
     /// librqbit's state for every torrent, as BARRAGE's status; a torrent
     /// that has just finished is paused here.
-    async fn publish(&self) {
+    async fn publish(self: &Arc<Self>) {
         let links = self.table.snapshot();
         self.connector.refresh(&links);
         self.usage.publish();
@@ -657,7 +729,8 @@ impl Inner {
                     if entry.wanted == Wanted::Running && status.phase == TorrentPhase::Done {
                         entry.wanted = Wanted::Done;
                         if let Some(handle) = &entry.handle {
-                            finished.push(Arc::clone(handle));
+                            entry.unsynced = true;
+                            finished.push((entry.id, Arc::clone(handle)));
                         }
                     }
                     let checked = entry.handle.as_ref().is_some_and(|h| {
@@ -671,8 +744,9 @@ impl Inner {
                 .collect()
         };
         let session = self.session();
-        for handle in finished {
+        for (id, handle) in finished {
             let _ = session.pause(&handle).await;
+            tokio::spawn(Arc::clone(self).sync_finished(id, handle));
         }
         self.status.send_if_modified(|shown| {
             if *shown == statuses {
@@ -682,6 +756,50 @@ impl Inner {
             true
         });
     }
+}
+
+/// How a torrent is saved: done only once its files are on the disk.
+fn kept_state(phase: TorrentPhase, wanted: Wanted, unsynced: bool) -> KeptState {
+    match (phase, wanted) {
+        (TorrentPhase::Failed, _) => KeptState::Failed,
+        (_, Wanted::Stopped) => KeptState::Stopped,
+        (TorrentPhase::Done, _) | (_, Wanted::Done) if !unsynced => KeptState::Done,
+        _ => KeptState::Run,
+    }
+}
+
+/// The folder a torrent's files are under and each file's name in it,
+/// padding left out. `None` until its metadata is known: nothing is written
+/// before then.
+fn files_of(handle: &ManagedTorrent) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let files = handle
+        .with_metadata(|m| {
+            m.file_infos
+                .iter()
+                .filter(|f| !f.attrs.padding)
+                .map(|f| f.relative_filename.clone())
+                .collect::<Vec<_>>()
+        })
+        .ok()?;
+    Some((handle.output_folder().to_path_buf(), files))
+}
+
+/// Sync each of `files` in `folder` to the disk. librqbit writes through
+/// handles of its own, shared for writing, and Windows flushes a file's
+/// cached data whichever handle asks. A file not there was not chosen, and
+/// none is made.
+fn sync_files(folder: &Path, files: &[PathBuf]) -> std::io::Result<()> {
+    for name in files {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .open(folder.join(name))
+        {
+            Ok(file) => file.sync_all()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Where the `.torrent` of the torrent named `hash` is kept in `state`.
@@ -827,6 +945,7 @@ impl TransferEngine for Torrents {
                 kept: None,
                 wanted: Wanted::Queued,
                 failed: None,
+                unsynced: false,
             });
             id
         };
@@ -952,5 +1071,47 @@ impl TransferEngine for Torrents {
     async fn shutdown(&self) {
         self.inner.stopping.store(true, Ordering::SeqCst);
         self.inner.session().stop().await;
+        self.inner.sync_all().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_torrent_is_saved_to_run_until_its_files_are_synced() {
+        use KeptState::*;
+        let done = TorrentPhase::Done;
+        assert_eq!(kept_state(done, Wanted::Done, true), Run);
+        assert_eq!(kept_state(done, Wanted::Done, false), Done);
+        assert_eq!(kept_state(done, Wanted::Running, false), Done);
+        assert_eq!(kept_state(TorrentPhase::Failed, Wanted::Done, true), Failed);
+        assert_eq!(
+            kept_state(TorrentPhase::Stopped, Wanted::Stopped, false),
+            Stopped
+        );
+        let running = TorrentPhase::Downloading;
+        assert_eq!(kept_state(running, Wanted::Running, false), Run);
+    }
+
+    #[test]
+    fn syncing_passes_over_a_file_not_there_and_syncs_the_rest() {
+        let dir = crate::scratch::folder("bt-sync");
+        std::fs::write(dir.join("a.bin"), b"pieces").unwrap();
+        let files = vec![PathBuf::from("a.bin"), PathBuf::from("not chosen.bin")];
+
+        sync_files(&dir, &files).unwrap();
+
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), b"pieces");
+        assert!(!dir.join("not chosen.bin").exists(), "nothing is made");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_synced_is_an_error() {
+        let dir = crate::scratch::folder("bt-sync-bad");
+        std::fs::create_dir(dir.join("a folder")).unwrap();
+
+        assert!(sync_files(&dir, &[PathBuf::from("a folder")]).is_err());
     }
 }

@@ -23,6 +23,11 @@
 //! that never reached the disk. Then the bitfield of each torrent still to
 //! run is deleted, and its session checks every piece. A killed engine
 //! counts too: the marker cannot tell it from a power cut.
+//!
+//! The engine syncs a torrent's files itself, twice: when it finishes, and
+//! it is saved done only after that, and when the torrents shut down, and
+//! the marker is taken up only after that (`Keeper::finish`). So a done row
+//! is on the disk, and a clean end leaves no piece only in Windows' cache.
 
 use std::fs::{self, File};
 use std::io;
